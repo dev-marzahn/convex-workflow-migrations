@@ -1,0 +1,14 @@
+{
+  // File-per-module output, like upstream: Convex bundles a component from the
+  // directory its convex.config.js is in, so vp pack's single bundle won't do.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": "dist",
+    "rootDir": "src",
+    "declaration": true,
+    "allowImportingTsExtensions": false,
+    "rewriteRelativeImportExtensions": true
+  },
+  "include": ["src"]
+}

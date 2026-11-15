@@ -1,0 +1,90 @@
+# Pushing a tag v<version> releases that version: CI runs first, then the
+# package goes to npm.
+#
+# The npm job runs in the `release` environment, which only accepts runs from
+# v* tags and main. Only people with write access can push a tag or start a run
+# by hand. npm publishes through trusted publishing (OIDC): the package's npm
+# settings name this workflow and that environment, so no token is stored
+# anywhere. The workflow only stages the version: it goes live when a
+# maintainer approves it with 2FA.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  # Re-runs a tag's release with this branch's workflow, for when the tag's own
+  # run failed in the workflow itself. Every job still builds the tag's code.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The release tag, like v100.0.0
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  version:
+    name: Tag matches the package version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - id: version
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          version=$(node -p "require('./packages/convex-workflow-patches/package.json').version")
+          if [ "v$version" != "$TAG" ]; then
+            echo "::error::Tag $TAG doesn't match packages/convex-workflow-patches/package.json version $version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  ci:
+    needs: version
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ inputs.tag || github.ref }}
+
+  npm:
+    name: npm
+    needs: [version, ci]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write # trusted publishing and provenance
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.4
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - run: bun install --frozen-lockfile
+      - run: bun run build
+      # bun pm pack replaces the catalog: ranges with real ones; npm publish wouldn't.
+      - name: Pack
+        working-directory: packages/convex-workflow-patches
+        run: bun pm pack --destination "$RUNNER_TEMP" --quiet
+      # Outside the repo: its devEngines names Bun, and npm refuses to run under it.
+      # npm only accepts provenance from public repos.
+      - name: Publish
+        working-directory: ${{ runner.temp }}
+        env:
+          PROVENANCE: ${{ github.event.repository.private && '--no-provenance' || '--provenance' }}
+        # Stages the version; it goes live once a maintainer approves it with 2FA
+        # under Staged Packages on npmjs.com, or with `npm stage approve <id>`.
+        run: npm stage publish ./*.tgz "$PROVENANCE" --access public

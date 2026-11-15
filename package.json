@@ -1,0 +1,50 @@
+{
+  "name": "convex-workflow-patches-monorepo",
+  "private": true,
+  "license": "MPL-2.0",
+  "workspaces": [
+    "packages/*",
+    "examples/*",
+    "e2e/apps/*"
+  ],
+  "type": "module",
+  "scripts": {
+    "ready": "vp run -r build && vp check && vp run -r test",
+    "build": "vp run -r build",
+    "test": "vp run -r test",
+    "e2e": "node e2e/run.ts",
+    "codegen": "node scripts/codegen.ts"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:",
+    "typescript": "catalog:",
+    "vite": "catalog:",
+    "vite-plus": "catalog:"
+  },
+  "overrides": {
+    "vite": "catalog:"
+  },
+  "devEngines": {
+    "packageManager": {
+      "name": "bun",
+      "version": "1.4.4",
+      "onFail": "download"
+    }
+  },
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "catalog": {
+    "@convex-dev/workflow": "0.4.10",
+    "@convex-dev/workpool": "0.4.16",
+    "@edge-runtime/vm": "5.0.0",
+    "@types/node": "^26.6.6",
+    "async-channel": "^0.2.0",
+    "convex": "^1.50.0",
+    "convex-helpers": "^0.1.135",
+    "convex-test": "^0.0.69",
+    "typescript": "^7.0.2",
+    "vite": "npm:@voidzero-dev/vite-plus-core@1.6.0",
+    "vite-plus": "1.6.0"
+  }
+}

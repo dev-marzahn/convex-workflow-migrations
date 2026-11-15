@@ -1,0 +1,12 @@
+# Keeps the workflows' actions current. Package and backend updates are done by
+# hand: @convex-dev/workflow changes together with the vendored client (see
+# CONTRIBUTING.md), and BACKEND_IMAGE in e2e/backend.ts with a `bun run e2e` run.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ['*']

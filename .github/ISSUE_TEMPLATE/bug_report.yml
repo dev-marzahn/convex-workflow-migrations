@@ -1,0 +1,44 @@
+name: Bug report
+description: A patched workflow doesn't replay the way the README says.
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you deployed, what you expected the running workflows to do, and what they did instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: The smallest workflow, before and after the change, that shows it. A convex-test case with `simulateDeploy` is ideal.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Output
+      description: The workflow's error (e.g. `Journal entry mismatch`) and its steps from `workflow.listSteps`, if you have them.
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: convex-workflow-patches and @convex-dev/workflow versions
+      placeholder: 100.0.0, 0.4.10
+    validations:
+      required: true
+  - type: dropdown
+    id: where
+    attributes:
+      label: Where it runs
+      options:
+        - Convex Cloud
+        - Self-hosted backend
+        - convex-test
+    validations:
+      required: true
+  - type: input
+    id: env
+    attributes:
+      label: Package manager, convex version, OS
+      placeholder: bun 1.4, convex 1.50.0, Ubuntu 24.04
