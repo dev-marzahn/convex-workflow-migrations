@@ -2,8 +2,8 @@ import { convexTest } from 'convex-test';
 import { anyApi, componentsGeneric, defineSchema, type FunctionReference, internalMutationGeneric } from 'convex/server';
 import { afterEach, beforeEach, expect, test, vi } from 'vite-plus/test';
 
-import { evaluate, type RunInput } from '../src/check.ts';
 import { type DeclaredPatches, type PatchesComponent, type WorkflowComponent, type WorkflowId, WorkflowManager } from '../src/index.ts';
+import { check as predeployCheck, COMPONENT_NOT_DEPLOYED, DEFAULT_COMPONENT_PATHS, type Facts, inspect, type Query } from '../src/predeploy.ts';
 import patchesTest, { simulateDeploy } from '../src/test.ts';
 
 const components = componentsGeneric() as unknown as { workflow: WorkflowComponent; workflowPatches: PatchesComponent };
@@ -53,15 +53,22 @@ async function send(t: T, workflowId: WorkflowId, name: 'first' | 'second') {
   await settle(t);
 }
 
-/** What `convex-workflow-patches check` computes, from the same component queries. */
-const check = (t: T, declared: DeclaredPatches) =>
-  t.run(async (ctx) => {
-    const page = await ctx.runQuery(components.workflow.workflow.list, { order: 'asc', paginationOpts: { cursor: null, numItems: 100 } });
-    const ids = page.page.filter((run) => run.runResult === undefined).map((run) => run.workflowId);
-    const running: RunInput[] = await ctx.runQuery(components.workflowPatches.runs.lookup, { workflowIds: ids });
-    const deployed = Object.fromEntries((await ctx.runQuery(components.workflowPatches.runs.deployed, {})).map((r) => [r.workflow, r.declared]));
-    return evaluate(declared, deployed, running);
-  });
+/**
+ * The deployment as the check module sees it: `query` as convex-release and
+ * the CLI give it, here calling the components in convex-test.
+ */
+const queryOf =
+  (t: T, deployedComponents = ['workflow', 'workflowPatches']): Query =>
+  async <R>({ componentPath, path }: { componentPath?: string; path: string }, args: object = {}) => {
+    if (!componentPath || !deployedComponents.includes(componentPath)) {
+      throw Object.assign(new Error(`${componentPath} isn't deployed`), { code: COMPONENT_NOT_DEPLOYED });
+    }
+    const [module, fn] = path.split(':') as [string, string];
+    const ref = (components as unknown as Record<string, Record<string, Record<string, FunctionReference<'query', 'internal'>>>>)[componentPath]![module]![fn]!;
+    return (await t.run((ctx) => ctx.runQuery(ref, args))) as R;
+  };
+const facts = (declared: DeclaredPatches): Facts => ({ declared, componentPaths: DEFAULT_COMPONENT_PATHS });
+const check = async (t: T, declared: DeclaredPatches, pageSize?: number) => (await inspect(facts(declared), queryOf(t), pageSize))!;
 const removingNotify = { 'checked:pipeline': [] };
 
 beforeEach(() => {
@@ -115,4 +122,40 @@ test('a patch the deployed release already removed is not removed again', async 
   await start(t);
 
   expect(await check(t, removingNotify)).toEqual({ removed: {}, blockers: [] });
+});
+
+test('reads every page of running workflows', async () => {
+  const t = setup();
+  simulateDeploy({ without: ['notify'] });
+  const waiting = [await start(t), await start(t), await start(t)];
+  simulateDeploy();
+  await start(t);
+
+  const { blockers } = await check(t, removingNotify, 1);
+  expect(blockers.map((b) => b.workflowId).sort()).toEqual([...waiting].sort());
+});
+
+test("convex-release's check() refuses with one detail per blocking run, and logs what is removed", async () => {
+  const t = setup();
+  simulateDeploy({ without: ['notify'] });
+  const waiting = await start(t);
+  simulateDeploy();
+  await start(t);
+
+  const logs: string[] = [];
+  expect(await predeployCheck({ facts: facts(removingNotify), query: queryOf(t), log: (line) => logs.push(line) })).toEqual({
+    ok: false,
+    message: '1 running workflow still needs code this release removes',
+    details: [`${waiting} (checked:pipeline) has been waiting since before "notify" shipped`],
+  });
+  expect(logs).toEqual(['checked:pipeline removes "notify".']);
+  expect(await predeployCheck({ facts: facts({ 'checked:pipeline': ['notify'] }), query: queryOf(t), log: () => {} })).toEqual({ ok: true });
+});
+
+test('passes on the release that adopts the package, before its component is deployed', async () => {
+  const t = setup();
+  const logs: string[] = [];
+  const result = await predeployCheck({ facts: facts(removingNotify), query: queryOf(t, ['workflow']), log: (line) => logs.push(line) });
+  expect(result).toEqual({ ok: true });
+  expect(logs).toEqual(['The deployment has no workflowPatches component yet, so no running workflow can need a removed patch.']);
 });

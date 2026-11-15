@@ -31,7 +31,7 @@ Say this ships while a run is waiting for its download. That run passed `notify-
 - **Same API otherwise.** `WorkflowManager` is `@convex-dev/workflow`'s, with `patched()` and `deprecatePatch()` on the step context. `start`, `sendEvent`, `restart`, `cancel`, `status` and the rest are upstream's.
 - **Upstream's component.** Your workflows, journals and events stay in the `@convex-dev/workflow` component. This package adds a small component for what each run did at its patches.
 - **Markers in the same transaction.** A marker is written in the same transaction as the step it precedes, so they're saved together or not at all.
-- **A check before you deploy.** `convex-workflow-patches check` refuses a release that removes code a running workflow still needs.
+- **A check before you deploy.** A release that removes code a running workflow still needs is refused: by [convex-release](https://github.com/dev-marzahn/convex-release) on every deploy, or by `convex-workflow-patches check` in your deploy script.
 - **Tests without a deploy.** `simulateDeploy({ without: [...] })` makes convex-test runs behave like a release that didn't have those patches.
 
 ## Contents
@@ -129,12 +129,29 @@ A run that can't replay ends as `failed`, and your `onComplete` handler runs; se
 
 ## Checking before you deploy
 
-`convex-workflow-patches check` compares the patches your checkout declares with the ones the deployed release declares. For each patch your checkout removes, it lists the running workflows that may still need its old branch, and exits 1 if there are any:
+The check compares the patches the release you're deploying declares with the ones the deployed release declares. For each patch the new release removes, it lists the running workflows that may still need its old branch, and refuses the release if there are any.
+
+### With convex-release
+
+[convex-release](https://github.com/dev-marzahn/convex-release) 100.1.0 or later runs the check by itself, as a [predeploy check](https://github.com/dev-marzahn/convex-release#predeploy-checks): `convex-release dev`, `deploy` and `check`, and both of its images, before they push anything. Installing this package as a direct dependency of your app is enough:
+
+```text
+A predeploy check refused this release; nothing was pushed.
+@dev-marzahn/convex-workflow-patches: 1 running workflow still needs code this release removes
+  - m57d3c1b8e5f2a9... (pipeline:run) has been waiting since before "notify-after-grab" shipped
+Skip a check with --skip-check <package> only if you've confirmed the release is safe.
+```
+
+The images read `convex/patches.ts` when they're built, and check against the deployment when they start. That covers installations that upgrade themselves.
+
+### Without convex-release
+
+`convex-workflow-patches check` runs the same check through `convex run`, and exits 1 if runs block:
 
 ```sh
 npx convex-workflow-patches check
 # pipeline:run removes "notify-after-grab".
-# 1 running workflow(s) still need code this release removes:
+# 1 running workflow still needs code this release removes:
 #   m57d3c1b8e5f2a9... (pipeline:run) has been waiting since before "notify-after-grab" shipped
 ```
 
@@ -144,19 +161,27 @@ Run it from your app's directory, where `convex` is installed, against the deplo
 { "scripts": { "deploy": "convex-workflow-patches check && convex deploy" } }
 ```
 
+It exits 0 when nothing blocks (including a deployment that doesn't have the patches component yet), 1 when runs block, and 2 on a usage or deployment error. Options after `--` go to `convex run`, for example `-- --prod`.
+
+### What blocks a release
+
 A running workflow blocks the removal of a patch when it:
 
 - **passed the patch point without the patch**: it replayed past `patched(id)` and got `false`;
 - **has been waiting since before the patch shipped**: it hasn't run on code that declares the patch, so it may have passed the point on older code;
 - **hasn't run since this package was adopted**: nothing is recorded about it yet.
 
-Runs that haven't reached a patch point don't block, because they'll take the new path. The last two kinds stop blocking as soon as the run takes its next step. The check exits 0 when nothing blocks (including a deployment that doesn't have the patches component yet), 1 when runs block, and 2 on a usage or deployment error.
+Runs that haven't reached a patch point don't block, because they'll take the new path. The last two kinds stop blocking as soon as the run takes its next step. A deployment without the patches component yet passes: nothing it runs can need a removed patch.
 
-- **What it reads.** Every workflow in the workflow component, 100 per `convex run` (`--page-size` changes that), running or not, because upstream keeps finished workflows until you call `workflow.cleanup`. Cleaning up finished workflows keeps the check fast.
+- **What it reads.** Every workflow in the workflow component, 100 per query (the CLI's `--page-size` changes that), running or not, because upstream keeps finished workflows until you call `workflow.cleanup`. Cleaning up finished workflows keeps the check fast. When the release removes no patch, it reads only what the deployed release declares.
 - **Finished runs aren't checked.** After you remove a patch's old branch, restart a finished run only with `from` set before the patch point. A restart without `from` replays the run's history, and a run that passed the point without the patch fails.
-- **Options.** `--workflow-component` and `--patches-component` name where the components are mounted, if not `workflow` and `workflowPatches`. Options after `--` go to `convex run`, for example `-- --prod`.
+- **Components mounted elsewhere.** If you mount the components under other names than `workflow` and `workflowPatches`, say so in `convex/patches.ts`, or the check finds no patches component and passes:
 
-[convex-release](https://github.com/dev-marzahn/convex-release) can run the same check before every deploy and in its images, once it supports predeploy checks. That covers installations that upgrade themselves.
+  ```ts
+  export const componentPaths = { workflow: 'workflow', patches: 'wfPatches' };
+  ```
+
+  The CLI's `--workflow-component` and `--patches-component` override it.
 
 ## Testing
 
@@ -241,6 +266,7 @@ Fixes to upstream's client code arrive when this package updates its copy. Fixes
 | `step.patched(id): boolean`                                           | Whether this run takes patch `id`'s new path. See [How it works](#how-it-works).                                                                                                                                                                                                                                       |
 | `step.deprecatePatch(id): void`                                       | Records the patch for this run like `patched()`. Throws if this run passed the point without it.                                                                                                                                                                                                                       |
 | `convex-workflow-patches check`                                       | The deploy check. See [Checking before you deploy](#checking-before-you-deploy).                                                                                                                                                                                                                                       |
+| `dist/predeploy.js`                                                   | The same check as convex-release's predeploy check module, declared under `convex-release.predeploy` in this package's `package.json`. convex-release finds and runs it; you don't import it.                                                                                                                          |
 | `register(t, names?)` from `/test`                                    | Registers `@convex-dev/workflow` (its workpool at `<workflow>/workpool`) and the patches component with convex-test. `names` defaults to `{ workflow: 'workflow', patches: 'workflowPatches' }`; set it if you mounted them under other names.                                                                         |
 | `simulateDeploy({ without })` from `/test`                            | Makes later handler runs behave like a release without those patches. `simulateDeploy()` restores the current code.                                                                                                                                                                                                    |
 | Types                                                                 | `WorkflowCtx`, `WorkflowHandler`, `WorkflowArgs` (this package's), `DeclaredPatches`, `PatchesComponent`, and upstream's `WorkflowId`, `EventId`, `WorkflowStep`, `RunResult`, `RunOptions`, `StepDefaults`, `WorkflowComponent`, `WorkflowDefinition`, `WorkflowMutationResult`, `WorkflowStatus`, `CallbackOptions`. |
@@ -265,7 +291,7 @@ Records of child workflows that upstream cleans up with their parent are left be
 
 - **Pinned upstream version.** See [versions](#convex-devworkflow-versions).
 - **A run that can't replay ends.** This happens after a rollback below a recorded patch, an unguarded change, or a removed old branch the run still needs. The run is marked `failed` and your `onComplete` handler runs. Temporal, by contrast, keeps retrying until you deploy a fix. `restart()` can resume the run after a fix, but it doesn't undo what `onComplete` did. To treat these differently from real failures, check the error: it starts with `Journal entry mismatch`, `deprecatePatch(` or `Workflow patch`.
-- **Who the check protects.** `convex-workflow-patches check` covers deploys that run it. Installations that upgrade themselves will be covered by convex-release's predeploy checks once it has them. Elsewhere, a run that needs a removed old branch fails with an error naming the patch. Until then, keep old branches until every supported upgrade path has passed through a release that checked them.
+- **Who the check protects.** Deploys through convex-release, and deploys whose script runs `convex-workflow-patches check`. A plain `convex deploy`, or a skipped check, isn't checked: a run that needs a removed old branch then fails with an error naming the patch. `convex-release dev` checks only its first push, not the ones `convex dev` makes while it watches.
 - **Unguarded changes** still fail runs. Removing a step followed by an identical call (same name and arguments) still shifts replay silently. Patching is a discipline; the [e2e pattern](#testing) catches what it misses.
 - **Workflow function renames** aren't supported.
 

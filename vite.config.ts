@@ -2,7 +2,7 @@ import { defineConfig } from 'vite-plus';
 
 // Generated code keeps the style of whatever generates it. Vendored code keeps
 // upstream's style, so it can be diffed against upstream.
-const generated = ['**/_generated/**', '**/vendor/**'];
+const generated = ['**/_generated/**', '**/_generated.ts', '**/vendor/**'];
 
 export default defineConfig({
   fmt: {

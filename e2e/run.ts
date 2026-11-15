@@ -7,7 +7,8 @@
 //
 // Needs Docker. Builds the package first.
 import { spawnSync, type SpawnSyncOptions } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
@@ -73,11 +74,67 @@ function runCheck(app: string, backend: Backend): { status: number | null; outpu
   return { status: result.status, output: `${result.stdout}\n${result.stderr}` };
 }
 
-function expectCheck(app: string, backend: Backend, status: number, what: string, { lists = [], omits = [] }: { lists?: string[]; omits?: string[] } = {}) {
-  const result = runCheck(app, backend);
-  if (result.status !== status) throw new Error(`check from ${app} ${what}: expected exit ${status}, got ${result.status}:\n${result.output}`);
-  for (const text of lists) if (!result.output.includes(text)) throw new Error(`check from ${app} ${what} didn't list ${text}:\n${result.output}`);
-  for (const text of omits) if (result.output.includes(text)) throw new Error(`check from ${app} ${what} listed ${text}:\n${result.output}`);
+type Expected = { lists?: string[]; omits?: string[] };
+
+/** Throws unless the command exited with `status` and its output has every `lists` text and no `omits` text. */
+function expectRun(label: string, result: { status: number | null; output: string }, status: number, { lists = [], omits = [] }: Expected = {}) {
+  if (result.status !== status) throw new Error(`${label}: expected exit ${status}, got ${result.status}:\n${result.output}`);
+  for (const text of lists) if (!result.output.includes(text)) throw new Error(`${label} didn't print ${text}:\n${result.output}`);
+  for (const text of omits) if (result.output.includes(text)) throw new Error(`${label} printed ${text}:\n${result.output}`);
+}
+
+const expectCheck = (app: string, backend: Backend, status: number, what: string, expected?: Expected) =>
+  expectRun(`check from ${app} ${what}`, runCheck(app, backend), status, expected);
+
+// --------------------------------------------------------- convex-release ---
+
+const PACKAGE = '@dev-marzahn/convex-workflow-patches';
+const REFUSED = 'A predeploy check refused this release; nothing was pushed.';
+
+/** `convex-release deploy` from an app's checkout. Doesn't throw on a non-zero exit. */
+function releaseDeploy(app: string, backend: Backend) {
+  log(`  convex-release deploy ${app}`);
+  const result = spawnSync(join(appDir(app), 'node_modules/.bin/convex-release'), ['deploy'], { cwd: appDir(app), env: backend.env, encoding: 'utf8' });
+  return { status: result.status, output: `${result.stdout}\n${result.stderr}` };
+}
+
+/**
+ * Bundles an app as an image build would, then applies it with
+ * convex-release's one-shot image, which runs the bundled predeploy checks
+ * without the app's node_modules. Doesn't throw on a non-zero exit.
+ */
+function releaseImage(app: string, backend: Backend) {
+  log(`  convex-release one-shot image ${app}`);
+  const bundle = mkdtempSync(join(tmpdir(), `${PREFIX}-bundle-`));
+  try {
+    sh(join(appDir(app), 'node_modules/.bin/convex-release'), ['bundle', bundle], { cwd: appDir(app) });
+    const { version } = JSON.parse(readFileSync(join(appDir(app), 'node_modules/@dev-marzahn/convex-release/package.json'), 'utf8')) as { version: string };
+    // The image's version must match the app's convex-release, as its build checks.
+    const image = `ghcr.io/dev-marzahn/convex-release-oneshot:${version}-runtime`;
+    const result = spawnSync(
+      'docker',
+      [
+        'run',
+        '--rm',
+        // The backend's network namespace, so 127.0.0.1:3210 is the backend.
+        '--network',
+        `container:${backend.container}`,
+        '-v',
+        `${bundle}:/convex/app`,
+        '-e',
+        'CONVEX_URL=http://127.0.0.1:3210',
+        '-e',
+        `INSTANCE_NAME=${backend.instance.name}`,
+        '-e',
+        `INSTANCE_SECRET=${backend.instance.secret}`,
+        image,
+      ],
+      { encoding: 'utf8' },
+    );
+    return { status: result.status, output: `${result.stdout}\n${result.stderr}` };
+  } finally {
+    rmSync(bundle, { recursive: true, force: true });
+  }
 }
 
 /** Release 1 starts a run and leaves it waiting for its download. */
@@ -132,6 +189,44 @@ const scenarios: Record<string, (backend: Backend) => Promise<void>> = {
 
     // The release 2 run took notify-after-grab, so it replays on release 3.
     deploy('v3', backend);
+    call('v3', backend, 'pipeline:downloadDone', { workflowId: fresh.workflowId });
+    expectEqual(
+      await until('v3', backend, fresh.grabId, (g) => g.status !== 'inProgress'),
+      { log: ['grab', 'notify', 'import', 'prepare', 'publish'], status: 'completed' },
+      'the run started on release 2, finished on release 3',
+    );
+  },
+
+  /**
+   * convex-release runs the same check as its predeploy check, before it
+   * pushes anything: from a checkout with `convex-release deploy`, and in its
+   * one-shot image from the bundled module.
+   */
+  async release(backend) {
+    const old = await startWaitingRun(backend);
+    expectRun('convex-release deploy v2, adopting the package', releaseDeploy('v2', backend), 0, {
+      lists: ['The deployment has no workflowPatches component yet'],
+    });
+    const fresh = call<Ids>('v2', backend, 'pipeline:startGrab', { title: 'started on release 2' });
+    await until('v2', backend, fresh.grabId, (g) => g.log.length === 2);
+
+    // Release 3 removes notify-after-grab's old branch; the release 1 run may need it.
+    const refusal = { lists: [REFUSED, `${PACKAGE}: 1 running workflow still needs code this release removes`, old.workflowId], omits: [fresh.workflowId] };
+    expectRun('convex-release deploy v3 while the release 1 run is waiting', releaseDeploy('v3', backend), 1, refusal);
+    expectRun('the one-shot image of v3 while the release 1 run is waiting', releaseImage('v3', backend), 1, refusal);
+
+    // Nothing was pushed: on release 3's code, the run would fail on the removed patch.
+    call('v2', backend, 'pipeline:downloadDone', { workflowId: old.workflowId });
+    expectEqual(
+      await until('v2', backend, old.grabId, (g) => g.status !== 'inProgress'),
+      { log: ['grab', 'import', 'prepare', 'publish'], status: 'completed' },
+      'the run started on release 1',
+    );
+
+    expectRun('the one-shot image of v3 once the release 1 run finished', releaseImage('v3', backend), 0, {
+      lists: [`[${PACKAGE}] pipeline:run removes "notify-after-grab".`],
+      omits: [REFUSED],
+    });
     call('v3', backend, 'pipeline:downloadDone', { workflowId: fresh.workflowId });
     expectEqual(
       await until('v3', backend, fresh.grabId, (g) => g.status !== 'inProgress'),

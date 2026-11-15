@@ -1,12 +1,14 @@
 // Rewrites the Convex `_generated/` folders: the marker component's, the
-// example app's and the e2e fixture apps'. Commit them like any Convex project.
+// example app's and the e2e fixture apps', and convex-release's
+// `migrations/_generated.ts` in the apps that use it. Commit them like any
+// Convex project.
 //
 // Component codegen pulls deployment state, so this runs against a throwaway
 // backend (e2e/backend.ts). Nothing is deployed there; it's removed after.
 //
 //   bun run codegen
 import { spawnSync } from 'node:child_process';
-import { readdirSync } from 'node:fs';
+import { existsSync, readdirSync } from 'node:fs';
 import { dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -25,7 +27,15 @@ function codegen(cwd: string, env: NodeJS.ProcessEnv, args: string[] = []): void
 const backend = await startBackend('convex-workflow-patches-codegen');
 try {
   codegen(APPS[0]!, backend.env, ['--component-dir', relative(APPS[0]!, COMPONENT)]);
-  for (const app of APPS) codegen(app, backend.env);
+  for (const app of APPS) {
+    const release = join(app, 'node_modules/.bin/convex-release');
+    if (existsSync(release)) {
+      console.log(`convex-release codegen ${relative(ROOT, app)}`);
+      const result = spawnSync(release, ['codegen'], { cwd: app, encoding: 'utf8' });
+      if (result.status !== 0) throw new Error(`convex-release codegen failed in ${relative(ROOT, app)}:\n${result.stdout}\n${result.stderr}`);
+    }
+    codegen(app, backend.env);
+  }
 } finally {
   backend.stop();
 }

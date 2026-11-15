@@ -14,6 +14,9 @@ export type Backend = {
   url: string;
   /** Environment for the Convex CLI: this backend, and no other deployment config. */
   env: NodeJS.ProcessEnv;
+  /** The container's name, and the variables another container needs to derive its admin key. */
+  container: string;
+  instance: { name: string; secret: string };
   stop: () => void;
 };
 
@@ -21,7 +24,20 @@ const docker = (args: string[]) => execFileSync('docker', args, { encoding: 'utf
 
 export async function startBackend(name: string, timeoutMs = 120_000): Promise<Backend> {
   spawnSync('docker', ['rm', '-f', name], { stdio: 'ignore' });
-  docker(['run', '-d', '--name', name, '-p', '127.0.0.1::3210', '-e', `INSTANCE_SECRET=${randomBytes(32).toString('hex')}`, BACKEND_IMAGE]);
+  const instance = { name: 'e2e', secret: randomBytes(32).toString('hex') };
+  docker([
+    'run',
+    '-d',
+    '--name',
+    name,
+    '-p',
+    '127.0.0.1::3210',
+    '-e',
+    `INSTANCE_NAME=${instance.name}`,
+    '-e',
+    `INSTANCE_SECRET=${instance.secret}`,
+    BACKEND_IMAGE,
+  ]);
   const stop = () => void spawnSync('docker', ['rm', '-f', name], { stdio: 'ignore' });
   try {
     const port = docker(['port', name, '3210/tcp']).trim().split('\n')[0]!.split(':').at(-1);
@@ -38,7 +54,7 @@ export async function startBackend(name: string, timeoutMs = 120_000): Promise<B
     }
     const adminKey = docker(['exec', name, './generate_admin_key.sh']).trim().split('\n').at(-1)!;
     const env = { ...process.env, CONVEX_SELF_HOSTED_URL: url, CONVEX_SELF_HOSTED_ADMIN_KEY: adminKey, CONVEX_DEPLOYMENT: '', CONVEX_DEPLOY_KEY: '' };
-    return { url, env, stop };
+    return { url, env, container: name, instance, stop };
   } catch (error) {
     stop();
     throw error;

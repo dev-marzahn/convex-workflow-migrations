@@ -1,11 +1,11 @@
 // @vitest-environment node
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { afterEach, expect, test } from 'vite-plus/test';
 
-import { collect } from '../src/check.ts';
+import { collect, convexDirOf, DEFAULT_COMPONENT_PATHS } from '../src/predeploy.ts';
 
 const dirs: string[] = [];
 function project(files: Record<string, string>): string {
@@ -20,22 +20,37 @@ function project(files: Record<string, string>): string {
 afterEach(() => {
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
+const collectFrom = (root: string) => collect({ projectRoot: root, convexDir: convexDirOf(root) });
 
 test('reads the default export of convex/patches.ts', async () => {
   const root = project({ 'convex/patches.ts': "export default { 'pipeline:run': ['notify'] } satisfies Record<string, readonly string[]>;\n" });
-  expect(await collect(root)).toEqual({ 'pipeline:run': ['notify'] });
+  expect(await collectFrom(root)).toEqual({ declared: { 'pipeline:run': ['notify'] }, componentPaths: DEFAULT_COMPONENT_PATHS });
+});
+
+test('reads where the components are mounted from componentPaths', async () => {
+  const root = project({ 'convex/patches.ts': "export const componentPaths = { patches: 'wfPatches' };\nexport default {};\n" });
+  expect((await collectFrom(root)).componentPaths).toEqual({ workflow: 'workflow', patches: 'wfPatches' });
 });
 
 test("follows convex.json's functions directory", async () => {
   const root = project({ 'convex.json': '{ "functions": "src/convex" }', 'src/convex/patches.ts': "export default { 'a:b': [] };\n" });
-  expect(await collect(root)).toEqual({ 'a:b': [] });
+  expect((await collectFrom(root)).declared).toEqual({ 'a:b': [] });
 });
 
 test('declares nothing without the file', async () => {
-  expect(await collect(project({ 'convex/schema.ts': 'export default {};\n' }))).toEqual({});
+  expect(await collectFrom(project({ 'convex/schema.ts': 'export default {};\n' }))).toEqual({ declared: {}, componentPaths: DEFAULT_COMPONENT_PATHS });
 });
 
 test('rejects a malformed file', async () => {
-  const root = project({ 'convex/patches.ts': "export default { 'pipeline:run': 'notify' };\n" });
-  await expect(collect(root)).rejects.toThrow('must export default an object of workflow names to arrays of patch ids');
+  const declared = project({ 'convex/patches.ts': "export default { 'pipeline:run': 'notify' };\n" });
+  await expect(collectFrom(declared)).rejects.toThrow('must export default an object of workflow names to arrays of patch ids');
+  const paths = project({ 'convex/patches.ts': "export const componentPaths = { workpool: 'x' };\nexport default {};\n" });
+  await expect(collectFrom(paths)).rejects.toThrow('may only set "workflow" and "patches"');
+});
+
+test('the check module imports only node: built-ins, so convex-release can run it alone', () => {
+  const source = readFileSync(join(import.meta.dirname, '../src/predeploy.ts'), 'utf8');
+  const imports = [...source.matchAll(/^import (type )?[^;]*? from '([^']+)';$/gms)].filter(([, type]) => !type).map(([, , from]) => from!);
+  expect(imports.length).toBeGreaterThan(0);
+  expect(imports.filter((from) => !from.startsWith('node:'))).toEqual([]);
 });
