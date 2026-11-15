@@ -1,0 +1,30 @@
+# Fails when a newer @convex-dev/workflow is out than the one this package
+# copies, so a maintainer updates the copy (CONTRIBUTING.md, "Updating
+# @convex-dev/workflow"). A failed scheduled run notifies the maintainers.
+name: Upstream release
+
+on:
+  schedule:
+    - cron: '17 6 * * 1' # Mondays
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: '@convex-dev/workflow is current'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24
+      - run: |
+          pinned=$(node -p "require('./packages/convex-workflow-patches/package.json').peerDependencies['@convex-dev/workflow']")
+          latest=$(npm view @convex-dev/workflow version)
+          if [ "$pinned" != "$latest" ]; then
+            echo "::error::@convex-dev/workflow $latest is out; this package copies $pinned. See CONTRIBUTING.md, Updating @convex-dev/workflow."
+            exit 1
+          fi
+          echo "@convex-dev/workflow $pinned is the latest release."

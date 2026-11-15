@@ -8,7 +8,7 @@
  * @module
  */
 
-import type * as markers from "../markers.js";
+import type * as runs from "../runs.js";
 
 import type {
   ApiFromModules,
@@ -18,7 +18,7 @@ import type {
 import { anyApi, componentsGeneric } from "convex/server";
 
 const fullApi: ApiFromModules<{
-  markers: typeof markers;
+  runs: typeof runs;
 }> = anyApi as any;
 
 /**

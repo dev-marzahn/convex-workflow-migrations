@@ -50,5 +50,4 @@ export declare const internal: FilterApi<
 
 export declare const components: {
   workflow: import("@convex-dev/workflow/_generated/component.js").ComponentApi<"workflow">;
-  workflowPatches: import("@dev-marzahn/convex-workflow-patches/_generated/component.js").ComponentApi<"workflowPatches">;
 };

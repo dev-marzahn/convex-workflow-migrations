@@ -20,7 +20,7 @@
 +import { MAX_JOURNAL_SIZE, formatErrorWithStack } from "./shared.js";
 +import type { EventId, SchedulerOptions } from "./publicTypes.js";
  import { pick } from "convex-helpers";
-+import type { PatchesComponent, PatchState } from "../../patchState.js";
++import type { PatchState } from "../../patchState.js";
  
  export type WorkerResult =
    | { type: "handlerDone"; runResult: RunResult }
@@ -34,32 +34,25 @@
  
    resolve: (result: RunResult) => void;
  };
-@@ -70,6 +77,9 @@
+@@ -70,6 +77,8 @@
      private receiver: BaseChannel<StepRequest>,
      private now: number,
      private workpoolOptions: WorkpoolOptions | undefined,
 +    // PATCHES:
-+    private patches: PatchesComponent,
 +    private patchState: PatchState,
    ) {
      this.journalEntrySize = journalEntries.reduce(
        (size, entry) => size + getConvexSize(entry),
-@@ -254,6 +264,18 @@
+@@ -254,6 +263,12 @@
          workpoolOptions: this.workpoolOptions,
        },
      )) as JournalEntry[];
-+    // PATCHES: record a marker before the first step issued after each
-+    // patched() call that was decided at the frontier. Same transaction.
-+    const markers = this.patchState.takeMarkers(
++    // PATCHES: a marker names the first step issued after each patched()
++    // call decided at the frontier. The workflow mutation writes them.
++    this.patchState.takeMarkers(
 +      messages.map((message) => message.seq),
 +      entries.map((entry) => entry._id),
 +    );
-+    if (markers.length > 0) {
-+      await this.ctx.runMutation(this.patches.markers.record, {
-+        workflowId: this.workflowId,
-+        markers,
-+      });
-+    }
      for (const entry of entries) {
        this.journalEntrySize += getConvexSize(entry);
        if (this.journalEntrySize > MAX_JOURNAL_SIZE) {
@@ -129,7 +122,7 @@
  import type {
    RunResult,
    TransactionLimits,
-@@ -186,32 +189,74 @@
+@@ -186,32 +189,75 @@
     * Chaining is supported; later defaults override earlier ones.
     */
    withOptions(defaults: StepDefaults): WorkflowCtx;
@@ -138,10 +131,12 @@
 +   * PATCHES: Whether this run takes the code path added by patch `id`.
 +   *
 +   * The first time a run reaches this call, it returns `true` and records a
-+   * marker before the next step. On replay it returns `true` only if that
-+   * marker is there: a run that passed this point under code without the
-+   * patch gets `false` on every replay. The decision is remembered per run,
-+   * so every call with the same `id` returns the same value.
++   * marker before the next step. On replay it returns `true` only if the run
++   * has that marker: a run that passed this point under code without the
++   * patch gets `false` on every replay, and that is recorded as a skip. The
++   * decision is remembered per run, so every call with the same `id` returns
++   * the same value. `id` must be declared for the workflow in
++   * convex/patches.ts.
 +   *
 +   * ```ts
 +   * if (step.patched("add-prepare")) {
@@ -152,11 +147,10 @@
 +  patched(id: string): boolean;
 +
 +  /**
-+   * PATCHES: Mark patch `id` as applied to every live run: the old branch is
-+   * gone, so this code always takes the new path. Records a marker like
-+   * `patched()`, so code that still calls `patched(id)` replays this run.
-+   * Throws if this run recorded history here without the patch, because
-+   * such a run can no longer replay.
++   * PATCHES: Mark patch `id` as permanent in this code: the old branch is
++   * gone. Records the patch for this run like `patched()`, so code that still
++   * calls `patched(id)` replays it after a rollback. Throws if this run
++   * passed this point without the patch, because it can no longer replay.
 +   */
 +  deprecatePatch(id: string): void;
  };
@@ -210,7 +204,7 @@
          name: name ?? safeFunctionName(workflow),
          target: {
            kind: "workflow",
-@@ -227,7 +272,7 @@
+@@ -227,7 +273,7 @@
      },
  
      sleep: async (duration, opts?) => {
@@ -219,7 +213,7 @@
          name: opts?.name ?? "sleep",
          target: {
            kind: "sleep",
-@@ -242,7 +287,7 @@
+@@ -242,7 +288,7 @@
      },
  
      awaitEvent: async (event) => {
@@ -228,7 +222,7 @@
          name: event.name ?? event.id ?? "Event",
          target: {
            kind: "event",
-@@ -267,7 +312,7 @@
+@@ -267,7 +313,7 @@
      | FunctionReference<FunctionType, FunctionVisibility>
      | FunctionReference_future<FunctionType, FunctionVisibility>,
  >(
@@ -237,7 +231,7 @@
    functionType: FunctionType,
    f: F,
    args: Record<string, unknown> | undefined,
-@@ -298,7 +343,7 @@
+@@ -298,7 +344,7 @@
    if (!inline && transactionLimits) {
      throw new Error("Cannot set transaction limits for non-inline functions.");
    }
@@ -248,7 +242,7 @@
        kind: "function",
 --- upstream/workflowMutation.ts
 +++ vendor/workflowMutation.ts
-@@ -16,20 +16,24 @@
+@@ -16,20 +16,28 @@
    type PropertyValidators,
    type Validator,
  } from "convex/values";
@@ -274,40 +268,76 @@
    type WorkflowMutationResult,
  } from "./types.js";
  import { createWorkflowCtx } from "./workflowContext.js";
-+import { PatchState, type PatchesComponent } from "../../patchState.js";
++import {
++  PatchState,
++  type DeclaredPatches,
++  type PatchesComponent,
++} from "../../patchState.js";
  
  export type WorkflowArgs<V extends PropertyValidators, Context = unknown> = {
    /**
-@@ -108,6 +112,8 @@
+@@ -108,6 +116,8 @@
    ReturnsValidator extends Validator<any, "required", any> | void,
  >(
    component: WorkflowComponent,
-+  // PATCHES: the marker store.
-+  patches: PatchesComponent,
++  // PATCHES: the patches component, and the patch ids each workflow declares.
++  patches: { component: PatchesComponent; declared: DeclaredPatches },
    registered: WorkflowDefinition<ArgsValidator, ReturnsValidator> & {
      handler: WorkflowHandler<ArgsValidator, ReturnsValidator>;
    },
-@@ -227,7 +233,12 @@
+@@ -227,7 +237,18 @@
        const channel = new BaseChannel<StepRequest>(
          workpoolOptions.maxParallelism ?? 10,
        );
 -      const step = createWorkflowCtx(workflowId, channel);
-+      // PATCHES: load this run's markers and track patch decisions.
++      // PATCHES: load this run's records and track patch decisions.
++      const workflowName = (await ctx.meta.getFunctionMetadata()).name;
 +      const patchState = new PatchState(
 +        journalEntries as JournalEntry[],
-+        await ctx.runQuery(patches.markers.list, { workflowId }),
++        await ctx.runQuery(patches.component.runs.load, {
++          workflowId,
++          workflow: workflowName,
++        }),
++        workflowName,
++        patches.declared[workflowName] ?? [],
 +      );
 +      const step = createWorkflowCtx(workflowId, channel, undefined, patchState);
        const executor = new StepExecutor(
          workflowId,
          generationNumber,
-@@ -237,6 +248,9 @@
+@@ -237,6 +258,8 @@
          channel,
          Date.now(),
          workpoolOptions,
 +        // PATCHES:
-+        patches,
 +        patchState,
        );
        const restoreEnvironment = setupEnvironment(
          executor.getGenerationState.bind(executor),
+@@ -285,7 +308,25 @@
+         const executorWorker = async (): Promise<WorkerResult> => {
+           return await executor.run();
+         };
+-        const result = await Promise.race([handlerWorker(), executorWorker()]);
++        // PATCHES: a replay failure in a run that skipped a removed patch
++        // gets the cause in its message. The mutation still fails.
++        let result: WorkerResult;
++        try {
++          result = await Promise.race([handlerWorker(), executorWorker()]);
++        } catch (error) {
++          const removed = patchState.removedSkips();
++          if (removed.length === 0) throw error;
++          throw new Error(
++            `Workflow patch ${removed.map((id) => `"${id}"`).join(", ")} was removed, but ${workflowName} ${workflowId} passed it ` +
++              `without the patch, so it needs the old branch. Deploy a release that still has it, then restart the run. ` +
++              formatErrorWithStack(error),
++          );
++        }
++        // PATCHES: record what this handler run decided, in its transaction.
++        const update = patchState.update();
++        if (update) {
++          await ctx.runMutation(patches.component.runs.save, { workflowId, ...update });
++        }
+         switch (result.type) {
+           case "handlerDone": {
+             await ctx.runMutation(component.workflow.complete, {

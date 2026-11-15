@@ -6,7 +6,8 @@ import type { Id } from './_generated/dataModel';
 import { internalMutation, mutation } from './_generated/server';
 import { workflow } from './workflow';
 
-// One run per grab: grab, wait for the download, import, publish.
+// A media pipeline: one run per grab (a download the app started). Grab, wait
+// for the download, import the files, publish them.
 //
 // Release 1 shipped exactly that. Release 2 adds two steps, each behind a
 // patch, so runs that release 1 started keep replaying:

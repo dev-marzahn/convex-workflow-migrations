@@ -23,7 +23,7 @@ import type { FunctionReference } from "convex/server";
  */
 export type ComponentApi<Name extends string | undefined = string | undefined> =
   {
-    markers: {
+    runs: {
       cleanup: FunctionReference<
         "mutation",
         "internal",
@@ -31,35 +31,48 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         number,
         Name
       >;
-      list: FunctionReference<
+      deployed: FunctionReference<
         "query",
         "internal",
-        { workflowId: string },
-        Array<{ beforeStepId: string; patchId: string }>,
+        {},
+        Array<{ declared: Array<string>; workflow: string }>,
         Name
       >;
-      record: FunctionReference<
+      load: FunctionReference<
+        "query",
+        "internal",
+        { workflow: string; workflowId: string },
+        {
+          deployed: Array<string> | null;
+          markers: Array<{ beforeStepId: string; patchId: string }>;
+          run: { known: Array<string>; workflow: string } | null;
+          skips: Array<string>;
+        },
+        Name
+      >;
+      lookup: FunctionReference<
+        "query",
+        "internal",
+        { workflowIds: Array<string> },
+        Array<{
+          run: { known: Array<string>; workflow: string } | null;
+          skips: Array<string>;
+          workflowId: string;
+        }>,
+        Name
+      >;
+      save: FunctionReference<
         "mutation",
         "internal",
         {
+          deployed?: Array<string>;
           markers: Array<{ beforeStepId: string; patchId: string }>;
+          run: { known: Array<string>; workflow: string };
+          skips: Array<string>;
+          unskip: Array<string>;
           workflowId: string;
         },
         null,
-        Name
-      >;
-      runsWithPatch: FunctionReference<
-        "query",
-        "internal",
-        { patchId: string },
-        Array<string>,
-        Name
-      >;
-      withPatch: FunctionReference<
-        "query",
-        "internal",
-        { patchId: string; workflowIds: Array<string> },
-        Array<string>,
         Name
       >;
     };

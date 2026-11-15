@@ -17,12 +17,12 @@ The repo uses [Vite+](https://viteplus.dev): `vp check` runs Oxfmt, Oxlint and t
 
 ## Repository
 
-| Path                               | Contents                                                                                                                                                                                                                        |
-| ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `packages/convex-workflow-patches` | The npm package: the `WorkflowManager`, the marker component (`src/component`), the vendored `@convex-dev/workflow` client (`src/vendor/workflow`), the `drain` CLI (`src/cli.ts`) and the convex-test helpers (`src/test.ts`). |
-| `examples/basic`                   | An app with a patched workflow and its tests.                                                                                                                                                                                   |
-| `e2e/`                             | Fixture apps v1, v2 and v2-unguarded, and the script that deploys them over each other on a real backend.                                                                                                                       |
-| `scripts/codegen.ts`               | Rewrites every `_generated/` folder.                                                                                                                                                                                            |
+| Path                               | Contents                                                                                                                                                                                                                                                                                                                                                                       |
+| ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `packages/convex-workflow-patches` | The npm package: the `WorkflowManager` (`src/index.ts`); the patch decisions (`src/patchState.ts`); the patches component (`src/component`); the vendored `@convex-dev/workflow` client (`src/vendor/workflow`); the predeploy check (`src/check.ts`) and its CLI (`src/cli.ts`); the convex-test helpers (`src/test.ts`, with `simulateDeploy`'s switch in `src/testing.ts`). |
+| `examples/basic`                   | An app with a patched workflow and its tests.                                                                                                                                                                                                                                                                                                                                  |
+| `e2e/`                             | Fixture apps v1 (plain `@convex-dev/workflow`), v2 (adopts the package and adds two patches), v3 (removes one patch's old branch) and v2-unguarded (the same change as v2, without patches), and the script that deploys them over each other on a real backend.                                                                                                               |
+| `scripts/codegen.ts`               | Rewrites every `_generated/` folder.                                                                                                                                                                                                                                                                                                                                           |
 
 ## Codegen
 
@@ -38,27 +38,31 @@ Component codegen pulls deployment state, so the script starts a throwaway backe
 
 ```sh
 bun run e2e             # all scenarios, under a minute
-bun run e2e patched     # only the named scenarios
+bun run e2e check       # only the named scenarios: patched, check, unguarded
 ```
 
-Each scenario starts a fresh backend, deploys fixture app v1, starts a run that waits on `awaitEvent`, deploys the next fixture app over it, sends the event and checks which steps ran.
+The script builds the package first. Each scenario starts a fresh backend and deploys fixture app v1 with a run waiting on `awaitEvent`:
+
+- `patched` deploys v2 over it, sends the event and checks which steps ran.
+- `check` runs `convex-workflow-patches check` from v2 and v3 between deploys, and checks its exit codes and output.
+- `unguarded` deploys v2-unguarded and checks that the waiting run fails.
 
 ## Updating @convex-dev/workflow
 
-The package carries a copy of one upstream release's client code. To move to a new release:
+The package carries a copy of one upstream release's client code. A weekly job (`.github/workflows/upstream.yml`) fails when a newer upstream release is out. To move to it:
 
 1. Set the new version in the root `package.json` catalog and in the package's `peerDependencies`, then `bun install`.
 2. Follow the steps in [`VENDORED.md`](packages/convex-workflow-patches/src/vendor/workflow/VENDORED.md): copy the new upstream files, re-apply `upstream.diff`, regenerate it.
-3. `bun run ready` and `bun run e2e`. `tests/vendor.test.ts` fails until the copy is the installed release plus the diff.
-4. Add a row to the versions table in README.md and a line to CHANGELOG.md.
+3. `bun run ready` and `bun run e2e`. `packages/convex-workflow-patches/tests/vendor.test.ts` fails until the copy is the installed release plus the diff, and `packages/convex-workflow-patches/tests/exports.test.ts` fails if upstream added an export this package doesn't re-export or leave out on purpose.
+4. Add a row to the versions table in README.md and a line to CHANGELOG.md. This is a minor release unless upstream's change breaks something.
 
 ## Backend version
 
-`e2e/backend.ts` pins the Convex backend build the tests use: the one convex-release pins in its `images/Dockerfile`. Move them together, then run `bun run e2e`.
+`e2e/backend.ts` pins the Convex backend build the tests use: the one [convex-release](https://github.com/dev-marzahn/convex-release) (the migrations and release-image tool this repo's layout follows) pins in its `images/Dockerfile`. Move them together, then run `bun run e2e`.
 
 ## Pull requests
 
-- Run `bun run ready` before you push. Run `bun run e2e` too if you touched the vendored client, the component or `src/patchState.ts`.
+- Run `bun run ready` before you push. Run `bun run e2e` too if you touched the vendored client, the component, `src/patchState.ts`, `src/check.ts` or `src/cli.ts`.
 - Add a test for a bug fix or a new option.
 - Add a line under "Unreleased" in [CHANGELOG.md](CHANGELOG.md) for a change users will notice.
 - If you change how the package behaves, update [README.md](README.md) in the same pull request. It's the only README: packing the package copies it, and `LICENSE`, into `packages/convex-workflow-patches`.
@@ -67,7 +71,7 @@ The package carries a copy of one upstream release's client code. To move to a n
 
 Maintainers release from `main`:
 
-1. Pick the version by [Epoch SemVer](https://antfu.me/posts/epoch-semver): `{EPOCH * 100 + MAJOR}.MINOR.PATCH`, starting at `100.0.0`. Bump the first number by one for a breaking change, which includes moving to a new `@convex-dev/workflow` version with breaking changes, and to the next hundred for a new epoch.
+1. Pick the version by [Epoch SemVer](https://antfu.me/posts/epoch-semver): `{EPOCH * 100 + MAJOR}.MINOR.PATCH`, starting at `100.0.0`. Bump the first number by one for a breaking change, which includes moving to a new `@convex-dev/workflow` version with breaking changes, and to the next hundred for a new epoch. A new upstream version without breaking changes is a minor release.
 2. Set `version` in `packages/convex-workflow-patches/package.json`, and move the "Unreleased" changelog entries under the new version.
 3. Push a tag `v<version>`. The [release workflow](.github/workflows/release.yml) checks that the tag matches the package version, runs the checks, then stages the package on npm.
 4. Approve the staged version with 2FA under **Staged Packages** on npmjs.com, or with `npm stage approve <id>`. It goes live on approval.

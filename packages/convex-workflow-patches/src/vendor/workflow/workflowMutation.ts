@@ -33,7 +33,11 @@ import {
   type WorkflowMutationResult,
 } from "./types.js";
 import { createWorkflowCtx } from "./workflowContext.js";
-import { PatchState, type PatchesComponent } from "../../patchState.js";
+import {
+  PatchState,
+  type DeclaredPatches,
+  type PatchesComponent,
+} from "../../patchState.js";
 
 export type WorkflowArgs<V extends PropertyValidators, Context = unknown> = {
   /**
@@ -112,8 +116,8 @@ export function workflowMutation<
   ReturnsValidator extends Validator<any, "required", any> | void,
 >(
   component: WorkflowComponent,
-  // PATCHES: the marker store.
-  patches: PatchesComponent,
+  // PATCHES: the patches component, and the patch ids each workflow declares.
+  patches: { component: PatchesComponent; declared: DeclaredPatches },
   registered: WorkflowDefinition<ArgsValidator, ReturnsValidator> & {
     handler: WorkflowHandler<ArgsValidator, ReturnsValidator>;
   },
@@ -233,10 +237,16 @@ export function workflowMutation<
       const channel = new BaseChannel<StepRequest>(
         workpoolOptions.maxParallelism ?? 10,
       );
-      // PATCHES: load this run's markers and track patch decisions.
+      // PATCHES: load this run's records and track patch decisions.
+      const workflowName = (await ctx.meta.getFunctionMetadata()).name;
       const patchState = new PatchState(
         journalEntries as JournalEntry[],
-        await ctx.runQuery(patches.markers.list, { workflowId }),
+        await ctx.runQuery(patches.component.runs.load, {
+          workflowId,
+          workflow: workflowName,
+        }),
+        workflowName,
+        patches.declared[workflowName] ?? [],
       );
       const step = createWorkflowCtx(workflowId, channel, undefined, patchState);
       const executor = new StepExecutor(
@@ -249,7 +259,6 @@ export function workflowMutation<
         Date.now(),
         workpoolOptions,
         // PATCHES:
-        patches,
         patchState,
       );
       const restoreEnvironment = setupEnvironment(
@@ -299,7 +308,25 @@ export function workflowMutation<
         const executorWorker = async (): Promise<WorkerResult> => {
           return await executor.run();
         };
-        const result = await Promise.race([handlerWorker(), executorWorker()]);
+        // PATCHES: a replay failure in a run that skipped a removed patch
+        // gets the cause in its message. The mutation still fails.
+        let result: WorkerResult;
+        try {
+          result = await Promise.race([handlerWorker(), executorWorker()]);
+        } catch (error) {
+          const removed = patchState.removedSkips();
+          if (removed.length === 0) throw error;
+          throw new Error(
+            `Workflow patch ${removed.map((id) => `"${id}"`).join(", ")} was removed, but ${workflowName} ${workflowId} passed it ` +
+              `without the patch, so it needs the old branch. Deploy a release that still has it, then restart the run. ` +
+              formatErrorWithStack(error),
+          );
+        }
+        // PATCHES: record what this handler run decided, in its transaction.
+        const update = patchState.update();
+        if (update) {
+          await ctx.runMutation(patches.component.runs.save, { workflowId, ...update });
+        }
         switch (result.type) {
           case "handlerDone": {
             await ctx.runMutation(component.workflow.complete, {

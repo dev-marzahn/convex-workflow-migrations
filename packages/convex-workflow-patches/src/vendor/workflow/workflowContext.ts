@@ -194,10 +194,12 @@ export type WorkflowCtx = {
    * PATCHES: Whether this run takes the code path added by patch `id`.
    *
    * The first time a run reaches this call, it returns `true` and records a
-   * marker before the next step. On replay it returns `true` only if that
-   * marker is there: a run that passed this point under code without the
-   * patch gets `false` on every replay. The decision is remembered per run,
-   * so every call with the same `id` returns the same value.
+   * marker before the next step. On replay it returns `true` only if the run
+   * has that marker: a run that passed this point under code without the
+   * patch gets `false` on every replay, and that is recorded as a skip. The
+   * decision is remembered per run, so every call with the same `id` returns
+   * the same value. `id` must be declared for the workflow in
+   * convex/patches.ts.
    *
    * ```ts
    * if (step.patched("add-prepare")) {
@@ -208,11 +210,10 @@ export type WorkflowCtx = {
   patched(id: string): boolean;
 
   /**
-   * PATCHES: Mark patch `id` as applied to every live run: the old branch is
-   * gone, so this code always takes the new path. Records a marker like
-   * `patched()`, so code that still calls `patched(id)` replays this run.
-   * Throws if this run recorded history here without the patch, because
-   * such a run can no longer replay.
+   * PATCHES: Mark patch `id` as permanent in this code: the old branch is
+   * gone. Records the patch for this run like `patched()`, so code that still
+   * calls `patched(id)` replays it after a rollback. Throws if this run
+   * passed this point without the patch, because it can no longer replay.
    */
   deprecatePatch(id: string): void;
 };

@@ -23,7 +23,7 @@ import type {
 import { MAX_JOURNAL_SIZE, formatErrorWithStack } from "./shared.js";
 import type { EventId, SchedulerOptions } from "./publicTypes.js";
 import { pick } from "convex-helpers";
-import type { PatchesComponent, PatchState } from "../../patchState.js";
+import type { PatchState } from "../../patchState.js";
 
 export type WorkerResult =
   | { type: "handlerDone"; runResult: RunResult }
@@ -78,7 +78,6 @@ export class StepExecutor {
     private now: number,
     private workpoolOptions: WorkpoolOptions | undefined,
     // PATCHES:
-    private patches: PatchesComponent,
     private patchState: PatchState,
   ) {
     this.journalEntrySize = journalEntries.reduce(
@@ -264,18 +263,12 @@ export class StepExecutor {
         workpoolOptions: this.workpoolOptions,
       },
     )) as JournalEntry[];
-    // PATCHES: record a marker before the first step issued after each
-    // patched() call that was decided at the frontier. Same transaction.
-    const markers = this.patchState.takeMarkers(
+    // PATCHES: a marker names the first step issued after each patched()
+    // call decided at the frontier. The workflow mutation writes them.
+    this.patchState.takeMarkers(
       messages.map((message) => message.seq),
       entries.map((entry) => entry._id),
     );
-    if (markers.length > 0) {
-      await this.ctx.runMutation(this.patches.markers.record, {
-        workflowId: this.workflowId,
-        markers,
-      });
-    }
     for (const entry of entries) {
       this.journalEntrySize += getConvexSize(entry);
       if (this.journalEntrySize > MAX_JOURNAL_SIZE) {

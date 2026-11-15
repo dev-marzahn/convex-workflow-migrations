@@ -16,7 +16,6 @@
       "dependencies": {
         "@convex-dev/workflow": "catalog:",
         "@convex-dev/workpool": "catalog:",
-        "@dev-marzahn/convex-workflow-patches": "workspace:*",
         "convex": "catalog:",
         "convex-helpers": "catalog:",
       },
@@ -33,6 +32,16 @@
     },
     "e2e/apps/v2-unguarded": {
       "name": "e2e-app-v2-unguarded",
+      "dependencies": {
+        "@convex-dev/workflow": "catalog:",
+        "@convex-dev/workpool": "catalog:",
+        "@dev-marzahn/convex-workflow-patches": "workspace:*",
+        "convex": "catalog:",
+        "convex-helpers": "catalog:",
+      },
+    },
+    "e2e/apps/v3": {
+      "name": "e2e-app-v3",
       "dependencies": {
         "@convex-dev/workflow": "catalog:",
         "@convex-dev/workpool": "catalog:",
@@ -422,6 +431,8 @@
     "e2e-app-v2": ["e2e-app-v2@workspace:e2e/apps/v2"],
 
     "e2e-app-v2-unguarded": ["e2e-app-v2-unguarded@workspace:e2e/apps/v2-unguarded"],
+
+    "e2e-app-v3": ["e2e-app-v3@workspace:e2e/apps/v3"],
 
     "es-module-lexer": ["es-module-lexer@2.3.2", "", {}, "sha512-poHGpORABojJJucnV9KbOavETW8lBVnphkW77ER5/BQ5Fz7oXSoCNek7IH3vR5nRjdsEz926ibFYX8KtLQmdyw=="],
 

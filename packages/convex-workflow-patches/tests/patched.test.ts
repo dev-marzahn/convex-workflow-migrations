@@ -7,7 +7,19 @@ import { type PatchesComponent, type WorkflowComponent, type WorkflowCtx, type W
 import patchesTest, { simulateDeploy } from '../src/test.ts';
 
 const components = componentsGeneric() as unknown as { workflow: WorkflowComponent; workflowPatches: PatchesComponent };
-const manager = new WorkflowManager(components.workflow, { patches: components.workflowPatches });
+// Mutable, so a test can drop a patch's declaration as a release would.
+const declared: Record<string, string[]> = {};
+const DECLARED = {
+  'flows:pipeline': ['notify', 'prepare'],
+  'flows:twoSites': ['format'],
+  'flows:parallel': ['notify'],
+  'flows:moved': ['notify'],
+  'flows:wide': ['notify'],
+  'flows:child': ['notify'],
+  'flows:twoWaits': ['notify'],
+  'flows:typo': [],
+};
+const manager = new WorkflowManager(components.workflow, { patches: components.workflowPatches, declared });
 type Ref = FunctionReference<'mutation', 'internal', { args: Record<string, never> }, WorkflowId>;
 const ref = (name: string) => anyApi.flows![name] as Ref;
 const step = (name: string) => anyApi.flows![name]!;
@@ -17,6 +29,8 @@ const noop = internalMutationGeneric({ args: {}, handler: async () => null });
 // How the pipeline's notify step is written in the deployed code. `simulateDeploy`
 // switches patches off; this switches what replaces them.
 let notify: 'patched' | 'unguarded' | 'deprecated' = 'patched';
+// Where the `moved` workflow decides its patch: inside its batch, or before it.
+let decide: 'inBatch' | 'first' = 'inBatch';
 
 // grab -> (notify) -> wait -> import -> (prepare) -> publish
 async function pipeline(s: WorkflowCtx): Promise<string[]> {
@@ -79,6 +93,66 @@ const functions = {
       return path;
     },
   }),
+  // The same patch, decided inside the batch or hoisted before it.
+  moved: manager.define({
+    ...returnsPath,
+    handler: async (s): Promise<string[]> => {
+      const early = decide === 'first' ? s.patched('notify') : undefined;
+      const batch = [s.runMutation(step('grab'), {})];
+      const took = early ?? s.patched('notify');
+      if (took) batch.push(s.runMutation(step('notify'), {}));
+      batch.push(s.runMutation(step('grab2'), {}));
+      await Promise.all(batch);
+      await s.awaitEvent({ name: 'downloadDone' });
+      await s.runMutation(step('publish'), {});
+      return took ? ['notify'] : [];
+    },
+  }),
+  // A batch wider than maxParallelism (10), with the patch decided mid-batch.
+  wide: manager.define({
+    ...returnsPath,
+    handler: async (s): Promise<string[]> => {
+      const batch = Array.from({ length: 6 }, () => s.runMutation(step('grab'), {}));
+      const notified = s.patched('notify');
+      if (notified) batch.push(s.runMutation(step('notify'), {}));
+      batch.push(...Array.from({ length: 6 }, () => s.runMutation(step('grab2'), {})));
+      await Promise.all(batch);
+      await s.awaitEvent({ name: 'downloadDone' });
+      await s.runMutation(step('publish'), {});
+      return notified ? ['notify'] : [];
+    },
+  }),
+  // A child workflow, started under a custom step name.
+  parent: manager.define({
+    ...returnsPath,
+    handler: async (s): Promise<string[]> => (await s.runWorkflow(ref('child'), {}, { name: 'custom child name' })) as string[],
+  }),
+  child: manager.define({
+    ...returnsPath,
+    handler: async (s): Promise<string[]> => {
+      const notified = s.patched('notify');
+      if (notified) await s.runMutation(step('notify'), {});
+      return notified ? ['notify'] : [];
+    },
+  }),
+  // Two waits, so a run that skipped a patch is still running afterwards.
+  twoWaits: manager.define({
+    ...returnsPath,
+    handler: async (s): Promise<string[]> => {
+      await s.runMutation(step('grab'), {});
+      const removed = !(declared['flows:twoWaits'] ?? []).includes('notify');
+      if (removed || s.patched('notify')) await s.runMutation(step('notify'), {});
+      await s.awaitEvent({ name: 'downloadDone' });
+      await s.runMutation(step('importFiles'), {});
+      await s.awaitEvent({ name: 'prepared' });
+      await s.runMutation(step('publish'), {});
+      return [];
+    },
+  }),
+  typo: manager.define({
+    ...returnsPath,
+    handler: async (s): Promise<string[]> => (s.patched('notfiy') ? ['typo'] : []),
+  }),
 };
 
 function setup() {
@@ -103,8 +177,9 @@ async function downloadDone(t: T, workflowId: WorkflowId) {
 }
 const result = (t: T, workflowId: WorkflowId) =>
   t.run(async (ctx) => (await ctx.runQuery(components.workflow.workflow.getStatus, { workflowId })).workflow.runResult);
-const markers = (t: T, workflowId: WorkflowId) =>
-  t.run(async (ctx) => (await ctx.runQuery(components.workflowPatches.markers.list, { workflowId })).map((m) => m.patchId).sort());
+const records = (t: T, workflowId: WorkflowId, workflow = 'flows:pipeline') =>
+  t.run((ctx) => ctx.runQuery(components.workflowPatches.runs.load, { workflowId, workflow }));
+const markers = async (t: T, workflowId: WorkflowId, workflow?: string) => (await records(t, workflowId, workflow)).markers.map((m) => m.patchId).sort();
 const success = (returnValue: string[]) => ({ kind: 'success', returnValue });
 const failure = async (t: T, workflowId: WorkflowId) => {
   const r = await result(t, workflowId);
@@ -115,6 +190,9 @@ beforeEach(() => {
   vi.useFakeTimers();
   simulateDeploy();
   notify = 'patched';
+  decide = 'inBatch';
+  for (const key of Object.keys(declared)) delete declared[key];
+  for (const [workflow, ids] of Object.entries(DECLARED)) declared[workflow] = [...ids];
 });
 afterEach(() => vi.useRealTimers());
 
@@ -209,4 +287,58 @@ test('cleanup removes the markers', async () => {
   expect(await markers(t, id)).toEqual(['notify', 'prepare']);
   expect(await t.run((ctx) => manager.cleanup(ctx, id))).toBe(true);
   expect(await markers(t, id)).toEqual([]);
+});
+
+test('moving a released patched() call before its batch keeps runs that took it on the new path', async () => {
+  const t = setup();
+  const id = await start(t, 'moved'); // decides inside the batch, takes the patch
+  decide = 'first'; // the next release hoists the decision
+  await downloadDone(t, id);
+  expect(await result(t, id)).toEqual(success(['notify']));
+});
+
+test('a batch wider than maxParallelism with a patch decided in the middle', async () => {
+  const t = setup();
+  simulateDeploy({ without: ['notify'] });
+  const old = await start(t, 'wide');
+  simulateDeploy();
+  const fresh = await start(t, 'wide');
+  await downloadDone(t, old);
+  await downloadDone(t, fresh);
+  expect(await result(t, old)).toEqual(success([]));
+  expect(await result(t, fresh)).toEqual(success(['notify']));
+  const [marker] = (await records(t, fresh, 'flows:wide')).markers;
+  const names = await t.run(async (ctx) => (await manager.listSteps(ctx, fresh)).page.map((s) => [s.stepId, s.name]));
+  expect(Object.fromEntries(names)[marker!.beforeStepId]).toBe('flows:notify');
+});
+
+test('a child workflow started under a custom name is recorded under its function name', async () => {
+  const t = setup();
+  const parent = await start(t, 'parent');
+  expect(await result(t, parent)).toEqual(success(['notify']));
+  const child = await t.run(async (ctx) => (await manager.listSteps(ctx, parent)).page.find((s) => s.kind === 'workflow'));
+  const childId = child?.kind === 'workflow' ? child.nestedWorkflowId : undefined;
+  expect(child?.name).toBe('custom child name');
+  expect((await records(t, childId!, 'flows:child')).run?.workflow).toBe('flows:child');
+});
+
+test('patched() with an id the workflow does not declare fails the run', async () => {
+  const t = setup();
+  const id = await start(t, 'typo');
+  expect(await failure(t, id)).toContain('Workflow patch "notfiy" isn\'t declared for flows:typo');
+});
+
+test('a run that skipped a patch whose old branch was removed fails with the patch named', async () => {
+  const t = setup();
+  simulateDeploy({ without: ['notify'] }); // release 1
+  const id = await start(t, 'twoWaits');
+  simulateDeploy(); // release 2: the run replays past notify without it
+  await downloadDone(t, id);
+  expect((await records(t, id, 'flows:twoWaits')).skips).toEqual(['notify']);
+  declared['flows:twoWaits'] = []; // release 3: notify's old branch is gone
+  await t.run((ctx) => manager.sendEvent(ctx, { workflowId: id, name: 'prepared' }));
+  await settle(t);
+  const error = await failure(t, id);
+  expect(error).toContain('Workflow patch "notify" was removed');
+  expect(error).toContain('Journal entry mismatch');
 });
