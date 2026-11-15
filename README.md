@@ -102,7 +102,26 @@ Once every live run has passed the patch point with the patch, the old branch ca
 - **Directly:** delete the `patched()` call and the old branch. Leftover markers are ignored.
 - **With a check in between:** replace `if (step.patched(id)) { new }` with `step.deprecatePatch(id); new`. It records a marker like `patched()`, so a rollback to the previous release still replays. A run that passed the point without the patch fails with a message naming the patch, instead of `Journal entry mismatch` a few steps later.
 
-`components.workflowPatches.markers.runsWithPatch` lists the runs that recorded a patch. Compare it with your running workflows (`workflow.listByName`) to find runs that still need the old branch.
+### Checking before you deploy
+
+`convex-workflow-patches drain` lists the running workflows that may still need a patch's old branch, and exits 1 if there are any. Run it against the deployed code, before you deploy code that removes the branch. It calls a query your app exports:
+
+```ts
+// convex/patches.ts
+import { workflow } from './workflow';
+
+export const drain = workflow.drainQuery();
+```
+
+```sh
+npx convex-workflow-patches drain --workflow pipeline:run --patch notify-after-grab
+# notify-after-grab: 1 running pipeline:run workflow(s) may still need the code path without it:
+#   m57d3c1b8e5f2a9...
+```
+
+`--patch` can be repeated. `--function` names the query if it isn't `patches:drain`. Options after `--` go to `convex run`, for example `-- --prod`. It exits 0 when nothing is waiting, 1 when runs are, and 2 on a usage or deployment error.
+
+A run is listed when it's still running and has no marker for the patch. That includes runs that haven't reached the patch point yet: those would take the new path, but the check can't tell them apart from runs that passed the point without the patch, so it waits for them too. In code, `workflow.runsWithoutPatch(ctx, internal.pipeline.run, patchId, paginationOpts)` returns the same list one page at a time.
 
 ## Testing
 
@@ -173,16 +192,20 @@ Fixes to upstream's client code arrive when this package updates its copy. Fixes
 
 ## API
 
-| Export                                                      | What it does                                                                                                            |
-| ----------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
-| `WorkflowManager(component, { patches, workpoolOptions? })` | Upstream's manager. `define()` gives handlers the patched step context, and `cleanup()` also deletes the run's markers. |
-| `step.patched(id): boolean`                                 | Whether this run takes patch `id`'s new path. See [How it works](#how-it-works).                                        |
-| `step.deprecatePatch(id): void`                             | Records the patch like `patched()`. Throws if this run passed the point without it.                                     |
-| `components.workflowPatches.markers.list`                   | A run's markers: `{ workflowId }` → `{ patchId, beforeStepId }[]`.                                                      |
-| `components.workflowPatches.markers.runsWithPatch`          | The runs that recorded a patch: `{ patchId }` → workflow ids.                                                           |
-| `components.workflowPatches.markers.cleanup`                | Deletes a run's markers. `WorkflowManager.cleanup` calls it.                                                            |
-| `register(t, names?)` from `/test`                          | Registers `@convex-dev/workflow`, its workpool and the marker component with convex-test.                               |
-| `simulateDeploy({ without })` from `/test`                  | Makes later handler runs behave like a release without those patches. `simulateDeploy()` restores the current code.     |
+| Export                                                              | What it does                                                                                                               |
+| ------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `WorkflowManager(component, { patches, workpoolOptions? })`         | Upstream's manager. `define()` gives handlers the patched step context, and `cleanup()` also deletes the run's markers.    |
+| `step.patched(id): boolean`                                         | Whether this run takes patch `id`'s new path. See [How it works](#how-it-works).                                           |
+| `step.deprecatePatch(id): void`                                     | Records the patch like `patched()`. Throws if this run passed the point without it.                                        |
+| `workflow.runsWithoutPatch(ctx, workflow, patchId, paginationOpts)` | One page of running workflows with no marker for `patchId`. See [Checking before you deploy](#checking-before-you-deploy). |
+| `workflow.drainQuery()`                                             | An internal query over `runsWithoutPatch`, for the `drain` command.                                                        |
+| `convex-workflow-patches drain`                                     | The deploy check. Exits 1 while runs may still need a patch's old branch.                                                  |
+| `components.workflowPatches.markers.list`                           | A run's markers: `{ workflowId }` → `{ patchId, beforeStepId }[]`.                                                         |
+| `components.workflowPatches.markers.runsWithPatch`                  | The runs that recorded a patch: `{ patchId }` → workflow ids.                                                              |
+| `components.workflowPatches.markers.withPatch`                      | Which of the given runs recorded a patch: `{ patchId, workflowIds }` → workflow ids.                                       |
+| `components.workflowPatches.markers.cleanup`                        | Deletes a run's markers. `WorkflowManager.cleanup` calls it.                                                               |
+| `register(t, names?)` from `/test`                                  | Registers `@convex-dev/workflow`, its workpool and the marker component with convex-test.                                  |
+| `simulateDeploy({ without })` from `/test`                          | Makes later handler runs behave like a release without those patches. `simulateDeploy()` restores the current code.        |
 
 Everything else `@convex-dev/workflow` exports is re-exported unchanged.
 

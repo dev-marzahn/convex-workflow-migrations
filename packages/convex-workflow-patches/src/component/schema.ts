@@ -12,5 +12,5 @@ export default defineSchema({
     beforeStepId: v.string(),
   })
     .index('workflowId', ['workflowId'])
-    .index('patchId', ['patchId']),
+    .index('patchId_workflowId', ['patchId', 'workflowId']),
 });

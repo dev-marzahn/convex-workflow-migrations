@@ -7,6 +7,7 @@
 //
 // Needs Docker. Builds the package first.
 import { spawnSync, type SpawnSyncOptions } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
@@ -59,6 +60,19 @@ function expectEqual(actual: unknown, expected: unknown, what: string): void {
   if (!isDeepStrictEqual(actual, expected)) throw new Error(`${what}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
 }
 
+/**
+ * Runs the package's `bin` from an app's dependency on it, as a deploy step
+ * would. Resolved through package.json rather than node_modules/.bin, which a
+ * fresh install doesn't link before the first build. Doesn't throw on a
+ * non-zero exit.
+ */
+function runDrainCli(app: string, backend: Backend, args: string[]): { status: number | null; output: string } {
+  const pkg = join(appDir(app), 'node_modules/@dev-marzahn/convex-workflow-patches');
+  const bin = (JSON.parse(readFileSync(join(pkg, 'package.json'), 'utf8')) as { bin: Record<string, string> }).bin['convex-workflow-patches']!;
+  const result = spawnSync(process.execPath, [join(pkg, bin), 'drain', ...args], { cwd: appDir(app), env: backend.env, encoding: 'utf8' });
+  return { status: result.status, output: `${result.stdout}\n${result.stderr}` };
+}
+
 /** Release 1 starts a run and leaves it waiting for its download. */
 async function startWaitingRun(backend: Backend): Promise<Ids> {
   deploy('v1', backend);
@@ -83,6 +97,30 @@ const scenarios: Record<string, (backend: Backend) => Promise<void>> = {
     expectEqual(oldGrab, { log: ['grab', 'import', 'prepare', 'publish'], status: 'completed' }, 'the run started on release 1');
     const freshGrab = await until('v2', backend, fresh.grabId, (g) => g.status !== 'inProgress');
     expectEqual(freshGrab, { log: ['grab', 'notify', 'import', 'prepare', 'publish'], status: 'completed' }, 'the run started on release 2');
+  },
+
+  /** `convex-workflow-patches drain` refuses while a run lacks a patch, and passes once it finishes. */
+  async drain(backend) {
+    const args = ['--workflow', 'pipeline:run', '--patch', 'notify-after-grab'];
+    const old = await startWaitingRun(backend);
+    // Release 1 doesn't export the drain query.
+    const missing = runDrainCli('v1', backend, args);
+    expectEqual(missing.status, 2, 'drain exit code without a deployed drain query');
+    if (!missing.output.includes("patches:drain isn't deployed")) throw new Error(`drain didn't explain the missing query:\n${missing.output}`);
+
+    deploy('v2', backend);
+    const fresh = call<Ids>('v2', backend, 'pipeline:startGrab', { title: 'started on release 2' });
+    await until('v2', backend, fresh.grabId, (g) => g.log.length === 2);
+
+    const before = runDrainCli('v2', backend, args);
+    expectEqual(before.status, 1, 'drain exit code while the release 1 run is waiting');
+    if (!before.output.includes(old.workflowId)) throw new Error(`drain didn't list the release 1 run ${old.workflowId}:\n${before.output}`);
+    if (before.output.includes(fresh.workflowId)) throw new Error(`drain listed the release 2 run ${fresh.workflowId}:\n${before.output}`);
+
+    call('v2', backend, 'pipeline:downloadDone', { workflowId: old.workflowId });
+    await until('v2', backend, old.grabId, (g) => g.status !== 'inProgress');
+    const after = runDrainCli('v2', backend, args);
+    expectEqual(after.status, 0, `drain exit code once the release 1 run finished (output: ${after.output})`);
   },
 
   /** The same change without patched() fails the waiting run: what the package exists to prevent. */

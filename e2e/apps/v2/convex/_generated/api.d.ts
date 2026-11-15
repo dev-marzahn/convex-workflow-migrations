@@ -8,6 +8,7 @@
  * @module
  */
 
+import type * as patches from "../patches.js";
 import type * as pipeline from "../pipeline.js";
 import type * as workflow from "../workflow.js";
 
@@ -18,6 +19,7 @@ import type {
 } from "convex/server";
 
 declare const fullApi: ApiFromModules<{
+  patches: typeof patches;
   pipeline: typeof pipeline;
   workflow: typeof workflow;
 }>;

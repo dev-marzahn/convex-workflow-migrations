@@ -50,8 +50,26 @@ export const runsWithPatch = query({
   handler: async (ctx, { patchId }) => {
     const rows = await ctx.db
       .query('markers')
-      .withIndex('patchId', (q) => q.eq('patchId', patchId))
+      .withIndex('patchId_workflowId', (q) => q.eq('patchId', patchId))
       .collect();
     return [...new Set(rows.map((row) => row.workflowId))];
+  },
+});
+
+/** Which of the given runs recorded a patch. `WorkflowManager.runsWithoutPatch` calls this per page. */
+export const withPatch = query({
+  args: { patchId: v.string(), workflowIds: v.array(v.string()) },
+  returns: v.array(v.string()),
+  handler: async (ctx, { patchId, workflowIds }) => {
+    const marked = await Promise.all(
+      workflowIds.map(async (workflowId) => {
+        const row = await ctx.db
+          .query('markers')
+          .withIndex('patchId_workflowId', (q) => q.eq('patchId', patchId).eq('workflowId', workflowId))
+          .first();
+        return row ? workflowId : null;
+      }),
+    );
+    return marked.filter((id) => id !== null);
   },
 });

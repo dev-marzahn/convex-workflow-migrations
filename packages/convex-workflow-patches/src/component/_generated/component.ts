@@ -55,5 +55,12 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         Array<string>,
         Name
       >;
+      withPatch: FunctionReference<
+        "query",
+        "internal",
+        { patchId: string; workflowIds: Array<string> },
+        Array<string>,
+        Name
+      >;
     };
   };

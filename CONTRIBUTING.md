@@ -17,12 +17,12 @@ The repo uses [Vite+](https://viteplus.dev): `vp check` runs Oxfmt, Oxlint and t
 
 ## Repository
 
-| Path                               | Contents                                                                                                                                                                                        |
-| ---------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `packages/convex-workflow-patches` | The npm package: the `WorkflowManager`, the marker component (`src/component`), the vendored `@convex-dev/workflow` client (`src/vendor/workflow`) and the convex-test helpers (`src/test.ts`). |
-| `examples/basic`                   | An app with a patched workflow and its tests.                                                                                                                                                   |
-| `e2e/`                             | Fixture apps v1, v2 and v2-unguarded, and the script that deploys them over each other on a real backend.                                                                                       |
-| `scripts/codegen.ts`               | Rewrites every `_generated/` folder.                                                                                                                                                            |
+| Path                               | Contents                                                                                                                                                                                                                        |
+| ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `packages/convex-workflow-patches` | The npm package: the `WorkflowManager`, the marker component (`src/component`), the vendored `@convex-dev/workflow` client (`src/vendor/workflow`), the `drain` CLI (`src/cli.ts`) and the convex-test helpers (`src/test.ts`). |
+| `examples/basic`                   | An app with a patched workflow and its tests.                                                                                                                                                                                   |
+| `e2e/`                             | Fixture apps v1, v2 and v2-unguarded, and the script that deploys them over each other on a real backend.                                                                                                                       |
+| `scripts/codegen.ts`               | Rewrites every `_generated/` folder.                                                                                                                                                                                            |
 
 ## Codegen
 

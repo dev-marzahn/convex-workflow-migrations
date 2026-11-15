@@ -59,6 +59,9 @@
     "packages/convex-workflow-patches": {
       "name": "@dev-marzahn/convex-workflow-patches",
       "version": "100.0.0",
+      "bin": {
+        "convex-workflow-patches": "./dist/cli.js",
+      },
       "dependencies": {
         "async-channel": "catalog:",
       },
