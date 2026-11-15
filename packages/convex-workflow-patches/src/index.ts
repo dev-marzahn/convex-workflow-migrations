@@ -41,13 +41,27 @@ export type {
   WorkflowStatus,
   WorkflowStep,
 } from '@convex-dev/workflow';
-export type { DeclaredPatches, PatchesComponent } from './patchState.ts';
+export type { DeclaredPatches, PatchDeclaration, PatchesComponent } from './patchState.ts';
 export type { WorkflowHandler } from './vendor/workflow/types.ts';
 export type { WorkflowCtx } from './vendor/workflow/workflowContext.ts';
 export type { WorkflowArgs } from './vendor/workflow/workflowMutation.ts';
 
 type MutationCtx = Pick<GenericMutationCtx<GenericDataModel>, 'runQuery' | 'runMutation'>;
 type ActionCtx = Pick<GenericActionCtx<GenericDataModel>, 'runQuery' | 'runMutation' | 'runAction'>;
+
+/** The ids some workflow in `Declared` lists under `State`. `string` when the declarations aren't literal (no `as const`). */
+type IdsIn<Declared extends DeclaredPatches, State extends 'active' | 'deprecated'> = string extends keyof Declared
+  ? string
+  : { [Workflow in keyof Declared]: Declared[Workflow] extends { readonly [S in State]: readonly (infer Id extends string)[] } ? Id : never }[keyof Declared];
+
+/** The step context of a workflow defined with a manager for `Declared`. */
+export type PatchedWorkflowCtx<Declared extends DeclaredPatches> = WorkflowCtx<IdsIn<Declared, 'active'>, IdsIn<Declared, 'deprecated'>>;
+
+type Handler<
+  Declared extends DeclaredPatches,
+  ArgsValidator extends PropertyValidators,
+  ReturnsValidator extends Validator<unknown, 'required', string> | void,
+> = (step: PatchedWorkflowCtx<Declared>, args: ObjectType<ArgsValidator>) => Promise<ReturnValueForOptionalValidator<ReturnsValidator>>;
 
 type WorkflowMutation<ArgsValidator extends PropertyValidators, ReturnsValidator extends Validator<unknown, 'required', string> | void> = RegisteredMutation<
   'internal',
@@ -57,7 +71,8 @@ type WorkflowMutation<ArgsValidator extends PropertyValidators, ReturnsValidator
 
 /**
  * `@convex-dev/workflow`'s `WorkflowManager`, with `step.patched()` and
- * `step.deprecatePatch()` in every workflow it defines.
+ * `step.deprecatePatch()` in every workflow it defines. With `as const`
+ * declarations, both only accept declared ids.
  *
  * ```ts
  * import declared from './patches';
@@ -68,36 +83,44 @@ type WorkflowMutation<ArgsValidator extends PropertyValidators, ReturnsValidator
  * });
  * ```
  */
-export class WorkflowManager extends UpstreamWorkflowManager {
+export class WorkflowManager<Declared extends DeclaredPatches = DeclaredPatches> extends UpstreamWorkflowManager {
   public readonly patches: PatchesComponent;
-  public readonly declared: DeclaredPatches;
+  public readonly declared: Declared;
 
-  public constructor(component: WorkflowComponent, options: { patches: PatchesComponent; declared: DeclaredPatches; workpoolOptions?: WorkpoolOptions }) {
+  public constructor(component: WorkflowComponent, options: { patches: PatchesComponent; declared: Declared; workpoolOptions?: WorkpoolOptions }) {
     super(component, options.workpoolOptions ? { workpoolOptions: options.workpoolOptions } : undefined);
     this.patches = options.patches;
     this.declared = options.declared;
   }
 
   public override define<ArgsValidator extends PropertyValidators, ReturnsValidator extends Validator<unknown, 'required', string> | void>(
-    workflow: WorkflowDefinition<ArgsValidator, ReturnsValidator> & { handler: WorkflowHandler<ArgsValidator, ReturnsValidator> },
+    workflow: WorkflowDefinition<ArgsValidator, ReturnsValidator> & { handler: Handler<Declared, ArgsValidator, ReturnsValidator> },
   ): WorkflowMutation<ArgsValidator, ReturnsValidator>;
   public override define<ArgsValidator extends PropertyValidators, ReturnsValidator extends Validator<unknown, 'required', string> | void>(
     workflow: WorkflowDefinition<ArgsValidator, ReturnsValidator>,
   ): {
-    handler(
-      fn: (step: WorkflowCtx, args: ObjectType<ArgsValidator>) => Promise<ReturnValueForOptionalValidator<ReturnsValidator>>,
-    ): WorkflowMutation<ArgsValidator, ReturnsValidator>;
+    handler(fn: Handler<Declared, ArgsValidator, ReturnsValidator>): WorkflowMutation<ArgsValidator, ReturnsValidator>;
   };
   public override define<ArgsValidator extends PropertyValidators, ReturnsValidator extends Validator<unknown, 'required', string> | void>(
-    workflow: WorkflowDefinition<ArgsValidator, ReturnsValidator> & { handler?: WorkflowHandler<ArgsValidator, ReturnsValidator> },
+    workflow: WorkflowDefinition<ArgsValidator, ReturnsValidator> & { handler?: Handler<Declared, ArgsValidator, ReturnsValidator> },
   ): unknown {
     const patches = { component: this.patches, declared: this.declared };
-    const build = (handler: WorkflowHandler<ArgsValidator, ReturnsValidator>) =>
-      workflowMutation(this.component, patches, { ...workflow, handler }, this.options?.workpoolOptions);
+    // The narrower step type only restricts which ids the handler may pass.
+    const build = (handler: Handler<Declared, ArgsValidator, ReturnsValidator>) =>
+      workflowMutation(
+        this.component,
+        patches,
+        { ...workflow, handler: handler as WorkflowHandler<ArgsValidator, ReturnsValidator> },
+        this.options?.workpoolOptions,
+      );
     return workflow.handler ? build(workflow.handler) : { handler: build };
   }
 
-  /** Deletes a finished workflow, its journal and its patch records. */
+  /**
+   * Deletes a finished workflow, its journal and its patch records. From a
+   * mutation, all in its transaction; from an action, the patch records go in
+   * a second one.
+   */
   public override async cleanup(ctx: MutationCtx | ActionCtx, workflowId: WorkflowId): Promise<boolean> {
     const removed = await super.cleanup(ctx, workflowId);
     if (removed) await ctx.runMutation(this.patches.runs.cleanup, { workflowId });

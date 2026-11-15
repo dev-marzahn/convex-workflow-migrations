@@ -7,9 +7,8 @@ import { check as predeployCheck, COMPONENT_NOT_DEPLOYED, DEFAULT_COMPONENT_PATH
 import patchesTest, { simulateDeploy } from '../src/test.ts';
 
 const components = componentsGeneric() as unknown as { workflow: WorkflowComponent; workflowPatches: PatchesComponent };
-const manager = new WorkflowManager(components.workflow, { patches: components.workflowPatches, declared: { 'checked:pipeline': ['notify'] } });
+const manager = new WorkflowManager(components.workflow, { patches: components.workflowPatches, declared: { 'checked:pipeline': { active: ['notify'] } } });
 type Ref = FunctionReference<'mutation', 'internal', { args: Record<string, never> }, WorkflowId>;
-const pipelineRef = anyApi.checked!.pipeline as Ref;
 const step = (name: string) => anyApi.checked![name]!;
 const noop = internalMutationGeneric({ args: {}, handler: async () => null });
 
@@ -30,6 +29,14 @@ const functions = {
       await s.runMutation(step('publish'), {});
     },
   }),
+  // A workflow without patches, waiting.
+  idle: manager.define({
+    args: {},
+    handler: async (s): Promise<void> => {
+      await s.runMutation(step('grab'), {});
+      await s.awaitEvent({ name: 'first' });
+    },
+  }),
 };
 
 function setup() {
@@ -43,8 +50,8 @@ function setup() {
 type T = ReturnType<typeof setup>;
 
 const settle = (t: T) => t.finishAllScheduledFunctions(vi.runAllTimers);
-async function start(t: T) {
-  const id = await t.run((ctx) => manager.start(ctx, pipelineRef, {}));
+async function start(t: T, workflow: 'pipeline' | 'idle' = 'pipeline') {
+  const id = await t.run((ctx) => manager.start(ctx, anyApi.checked![workflow] as Ref, {}));
   await settle(t);
   return id;
 }
@@ -52,6 +59,8 @@ async function send(t: T, workflowId: WorkflowId, name: 'first' | 'second') {
   await t.run((ctx) => manager.sendEvent(ctx, { workflowId, name }));
   await settle(t);
 }
+/** Deletes a run's records, as if it last ran before the app adopted this package. */
+const forget = (t: T, workflowId: WorkflowId) => t.run((ctx) => ctx.runMutation(components.workflowPatches.runs.cleanup, { workflowId }));
 
 /**
  * The deployment as the check module sees it: `query` as convex-release and
@@ -69,7 +78,8 @@ const queryOf =
   };
 const facts = (declared: DeclaredPatches): Facts => ({ declared, componentPaths: DEFAULT_COMPONENT_PATHS });
 const check = async (t: T, declared: DeclaredPatches, pageSize?: number) => (await inspect(facts(declared), queryOf(t), pageSize))!;
-const removingNotify = { 'checked:pipeline': [] };
+const retiringNotify = { 'checked:pipeline': { retired: ['notify'] } };
+const deprecatingNotify = { 'checked:pipeline': { deprecated: ['notify'] } };
 
 beforeEach(() => {
   vi.useFakeTimers();
@@ -77,7 +87,7 @@ beforeEach(() => {
 });
 afterEach(() => vi.useRealTimers());
 
-test('removing a patch is blocked by a run that skipped it, not by one that took it', async () => {
+test('retiring a patch is blocked by a run that skipped it, not by one that took it', async () => {
   const t = setup();
   simulateDeploy({ without: ['notify'] }); // release 1
   const skipped = await start(t);
@@ -85,20 +95,30 @@ test('removing a patch is blocked by a run that skipped it, not by one that took
   await start(t); // takes notify
   await send(t, skipped, 'first'); // replays past notify without it
 
-  expect(await check(t, removingNotify)).toEqual({
-    removed: { 'checked:pipeline': ['notify'] },
+  expect(await check(t, retiringNotify)).toEqual({
+    gone: { 'checked:pipeline': ['notify'] },
+    unknown: {},
     blockers: [{ workflowId: skipped, workflow: 'checked:pipeline', patchId: 'notify', reason: 'skipped' }],
   });
 });
 
-test("removing a patch is blocked by a run that hasn't run since before it shipped", async () => {
+test('deprecating a patch (step 2) is checked like retiring it', async () => {
+  const t = setup();
+  simulateDeploy({ without: ['notify'] });
+  const skipped = await start(t);
+  simulateDeploy();
+  await send(t, skipped, 'first');
+
+  expect((await check(t, deprecatingNotify)).blockers).toEqual([{ workflowId: skipped, workflow: 'checked:pipeline', patchId: 'notify', reason: 'skipped' }]);
+});
+
+test('a run waiting since before the patch shipped blocks, with no handler run on the release in between', async () => {
   const t = setup();
   simulateDeploy({ without: ['notify'] });
   const waiting = await start(t); // passed the notify point on release 1, waits for "first"
-  simulateDeploy();
-  await start(t); // release 2 runs, so the deployment records what it declares
+  simulateDeploy(); // release 2 ships notify, but nothing runs on it
 
-  expect((await check(t, removingNotify)).blockers).toEqual([{ workflowId: waiting, workflow: 'checked:pipeline', patchId: 'notify', reason: 'waiting' }]);
+  expect((await check(t, retiringNotify)).blockers).toEqual([{ workflowId: waiting, workflow: 'checked:pipeline', patchId: 'notify', reason: 'waiting' }]);
 });
 
 test('finished runs and releases that remove nothing pass', async () => {
@@ -110,18 +130,31 @@ test('finished runs and releases that remove nothing pass', async () => {
   await send(t, old, 'first');
   await send(t, old, 'second'); // finished
 
-  expect((await check(t, removingNotify)).blockers).toEqual([]);
-  expect(await check(t, { 'checked:pipeline': ['notify'] })).toEqual({ removed: {}, blockers: [] });
+  expect((await check(t, retiringNotify)).blockers).toEqual([]);
+  expect(await check(t, { 'checked:pipeline': { active: ['notify'] } })).toEqual({ gone: {}, unknown: {}, blockers: [] });
 });
 
-test('a patch the deployed release already removed is not removed again', async () => {
+test('a rollback to a release without the patch is blocked by runs that recorded it', async () => {
   const t = setup();
-  await start(t); // release 2: knows notify
-  // Release 3 dropped notify and has run since, so the deployment records no patches.
-  simulateDeploy({ without: ['notify'] });
-  await start(t);
+  const took = await start(t); // takes notify
 
-  expect(await check(t, removingNotify)).toEqual({ removed: {}, blockers: [] });
+  expect(await check(t, { 'checked:pipeline': {} })).toEqual({
+    gone: {},
+    unknown: { 'checked:pipeline': ['notify'] },
+    blockers: [{ workflowId: took, workflow: 'checked:pipeline', patchId: 'notify', reason: 'unknown' }],
+  });
+});
+
+test('every run is tracked, and an untracked run only blocks its own workflow', async () => {
+  const t = setup();
+  const idle = await start(t, 'idle');
+  const lookup = (id: WorkflowId) => t.run((ctx) => ctx.runQuery(components.workflowPatches.runs.lookup, { workflowIds: [id] }));
+  expect((await lookup(idle))[0]!.run).toEqual({ workflow: 'checked:idle', known: [] });
+
+  const pipeline = await start(t);
+  await forget(t, idle);
+  await forget(t, pipeline);
+  expect((await check(t, retiringNotify)).blockers).toEqual([{ workflowId: pipeline, workflow: 'checked:pipeline', reason: 'untracked' }]);
 });
 
 test('reads every page of running workflows', async () => {
@@ -131,31 +164,31 @@ test('reads every page of running workflows', async () => {
   simulateDeploy();
   await start(t);
 
-  const { blockers } = await check(t, removingNotify, 1);
-  expect(blockers.map((b) => b.workflowId).sort()).toEqual([...waiting].sort());
+  const { blockers } = await check(t, retiringNotify, 1);
+  expect(blockers.map((b) => b.reason)).toEqual(['waiting', 'waiting', 'waiting']);
+  expect(new Set(blockers.map((b) => b.workflowId))).toEqual(new Set(waiting));
 });
 
-test("convex-release's check() refuses with one detail per blocking run, and logs what is removed", async () => {
+test("convex-release's check() refuses with one detail per blocking run", async () => {
   const t = setup();
   simulateDeploy({ without: ['notify'] });
   const waiting = await start(t);
   simulateDeploy();
-  await start(t);
 
   const logs: string[] = [];
-  expect(await predeployCheck({ facts: facts(removingNotify), query: queryOf(t), log: (line) => logs.push(line) })).toEqual({
+  expect(await predeployCheck({ facts: facts(retiringNotify), query: queryOf(t), log: (line) => logs.push(line) })).toEqual({
     ok: false,
     message: '1 running workflow still needs code this release removes',
     details: [`${waiting} (checked:pipeline) has been waiting since before "notify" shipped`],
   });
-  expect(logs).toEqual(['checked:pipeline removes "notify".']);
-  expect(await predeployCheck({ facts: facts({ 'checked:pipeline': ['notify'] }), query: queryOf(t), log: () => {} })).toEqual({ ok: true });
+  expect(logs).toEqual([]);
+  expect(await predeployCheck({ facts: facts({ 'checked:pipeline': { active: ['notify'] } }), query: queryOf(t), log: () => {} })).toEqual({ ok: true });
 });
 
 test('passes on the release that adopts the package, before its component is deployed', async () => {
   const t = setup();
   const logs: string[] = [];
-  const result = await predeployCheck({ facts: facts(removingNotify), query: queryOf(t, ['workflow']), log: (line) => logs.push(line) });
+  const result = await predeployCheck({ facts: facts(retiringNotify), query: queryOf(t, ['workflow']), log: (line) => logs.push(line) });
   expect(result).toEqual({ ok: true });
   expect(logs).toEqual(['The deployment has no workflowPatches component yet, so no running workflow can need a removed patch.']);
 });

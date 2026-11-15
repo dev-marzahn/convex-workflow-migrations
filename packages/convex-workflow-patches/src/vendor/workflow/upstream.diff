@@ -122,10 +122,26 @@
  import type {
    RunResult,
    TransactionLimits,
-@@ -186,32 +189,75 @@
+@@ -73,7 +76,11 @@
+       transactionLimits?: TransactionLimits;
+     };
+ 
+-export type WorkflowCtx = {
++// PATCHES: generic over the declared patch ids, so a typo is a type error.
++export type WorkflowCtx<
++  ActiveId extends string = string,
++  DeprecatedId extends string = string,
++> = {
+   /**
+    * The ID of the workflow currently running.
+    */
+@@ -185,33 +192,78 @@
+    *
     * Chaining is supported; later defaults override earlier ones.
     */
-   withOptions(defaults: StepDefaults): WorkflowCtx;
+-  withOptions(defaults: StepDefaults): WorkflowCtx;
++  // PATCHES: keeps the patch id types.
++  withOptions(defaults: StepDefaults): WorkflowCtx<ActiveId, DeprecatedId>;
 +
 +  /**
 +   * PATCHES: Whether this run takes the code path added by patch `id`.
@@ -135,7 +151,7 @@
 +   * has that marker: a run that passed this point under code without the
 +   * patch gets `false` on every replay, and that is recorded as a skip. The
 +   * decision is remembered per run, so every call with the same `id` returns
-+   * the same value. `id` must be declared for the workflow in
++   * the same value. `id` must be in the workflow's `active` list in
 +   * convex/patches.ts.
 +   *
 +   * ```ts
@@ -144,15 +160,16 @@
 +   * }
 +   * ```
 +   */
-+  patched(id: string): boolean;
++  patched(id: ActiveId): boolean;
 +
 +  /**
 +   * PATCHES: Mark patch `id` as permanent in this code: the old branch is
 +   * gone. Records the patch for this run like `patched()`, so code that still
 +   * calls `patched(id)` replays it after a rollback. Throws if this run
 +   * passed this point without the patch, because it can no longer replay.
++   * `id` must be in the workflow's `deprecated` list in convex/patches.ts.
 +   */
-+  deprecatePatch(id: string): void;
++  deprecatePatch(id: DeprecatedId): void;
  };
  
 +// PATCHES: step calls go through this, so each gets its position (seq).
@@ -204,7 +221,7 @@
          name: name ?? safeFunctionName(workflow),
          target: {
            kind: "workflow",
-@@ -227,7 +273,7 @@
+@@ -227,7 +279,7 @@
      },
  
      sleep: async (duration, opts?) => {
@@ -213,7 +230,7 @@
          name: opts?.name ?? "sleep",
          target: {
            kind: "sleep",
-@@ -242,7 +288,7 @@
+@@ -242,7 +294,7 @@
      },
  
      awaitEvent: async (event) => {
@@ -222,7 +239,7 @@
          name: event.name ?? event.id ?? "Event",
          target: {
            kind: "event",
-@@ -267,7 +313,7 @@
+@@ -267,7 +319,7 @@
      | FunctionReference<FunctionType, FunctionVisibility>
      | FunctionReference_future<FunctionType, FunctionVisibility>,
  >(
@@ -231,7 +248,7 @@
    functionType: FunctionType,
    f: F,
    args: Record<string, unknown> | undefined,
-@@ -298,7 +344,7 @@
+@@ -298,7 +350,7 @@
    if (!inline && transactionLimits) {
      throw new Error("Cannot set transaction limits for non-inline functions.");
    }
@@ -285,7 +302,7 @@
    registered: WorkflowDefinition<ArgsValidator, ReturnsValidator> & {
      handler: WorkflowHandler<ArgsValidator, ReturnsValidator>;
    },
-@@ -227,7 +237,18 @@
+@@ -227,7 +237,15 @@
        const channel = new BaseChannel<StepRequest>(
          workpoolOptions.maxParallelism ?? 10,
        );
@@ -294,18 +311,15 @@
 +      const workflowName = (await ctx.meta.getFunctionMetadata()).name;
 +      const patchState = new PatchState(
 +        journalEntries as JournalEntry[],
-+        await ctx.runQuery(patches.component.runs.load, {
-+          workflowId,
-+          workflow: workflowName,
-+        }),
++        await ctx.runQuery(patches.component.runs.load, { workflowId }),
 +        workflowName,
-+        patches.declared[workflowName] ?? [],
++        patches.declared[workflowName] ?? {},
 +      );
 +      const step = createWorkflowCtx(workflowId, channel, undefined, patchState);
        const executor = new StepExecutor(
          workflowId,
          generationNumber,
-@@ -237,6 +258,8 @@
+@@ -237,6 +255,8 @@
          channel,
          Date.now(),
          workpoolOptions,
@@ -314,19 +328,19 @@
        );
        const restoreEnvironment = setupEnvironment(
          executor.getGenerationState.bind(executor),
-@@ -285,7 +308,25 @@
+@@ -285,7 +305,25 @@
          const executorWorker = async (): Promise<WorkerResult> => {
            return await executor.run();
          };
 -        const result = await Promise.race([handlerWorker(), executorWorker()]);
-+        // PATCHES: a replay failure in a run that skipped a removed patch
++        // PATCHES: a journal mismatch in a run that skipped a removed patch
 +        // gets the cause in its message. The mutation still fails.
 +        let result: WorkerResult;
 +        try {
 +          result = await Promise.race([handlerWorker(), executorWorker()]);
 +        } catch (error) {
 +          const removed = patchState.removedSkips();
-+          if (removed.length === 0) throw error;
++          if (removed.length === 0 || !String(error).includes("Journal entry mismatch")) throw error;
 +          throw new Error(
 +            `Workflow patch ${removed.map((id) => `"${id}"`).join(", ")} was removed, but ${workflowName} ${workflowId} passed it ` +
 +              `without the patch, so it needs the old branch. Deploy a release that still has it, then restart the run. ` +

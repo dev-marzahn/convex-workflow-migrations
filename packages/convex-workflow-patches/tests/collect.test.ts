@@ -23,8 +23,11 @@ afterEach(() => {
 const collectFrom = (root: string) => collect({ projectRoot: root, convexDir: convexDirOf(root) });
 
 test('reads the default export of convex/patches.ts', async () => {
-  const root = project({ 'convex/patches.ts': "export default { 'pipeline:run': ['notify'] } satisfies Record<string, readonly string[]>;\n" });
-  expect(await collectFrom(root)).toEqual({ declared: { 'pipeline:run': ['notify'] }, componentPaths: DEFAULT_COMPONENT_PATHS });
+  const root = project({ 'convex/patches.ts': "export default { 'pipeline:run': { active: ['notify'], retired: ['old'] } } as const;\n" });
+  expect(await collectFrom(root)).toEqual({
+    declared: { 'pipeline:run': { active: ['notify'], retired: ['old'] } },
+    componentPaths: DEFAULT_COMPONENT_PATHS,
+  });
 });
 
 test('reads where the components are mounted from componentPaths', async () => {
@@ -33,8 +36,8 @@ test('reads where the components are mounted from componentPaths', async () => {
 });
 
 test("follows convex.json's functions directory", async () => {
-  const root = project({ 'convex.json': '{ "functions": "src/convex" }', 'src/convex/patches.ts': "export default { 'a:b': [] };\n" });
-  expect((await collectFrom(root)).declared).toEqual({ 'a:b': [] });
+  const root = project({ 'convex.json': '{ "functions": "src/convex" }', 'src/convex/patches.ts': "export default { 'a:b': {} };\n" });
+  expect((await collectFrom(root)).declared).toEqual({ 'a:b': {} });
 });
 
 test('declares nothing without the file', async () => {
@@ -42,8 +45,10 @@ test('declares nothing without the file', async () => {
 });
 
 test('rejects a malformed file', async () => {
-  const declared = project({ 'convex/patches.ts': "export default { 'pipeline:run': 'notify' };\n" });
-  await expect(collectFrom(declared)).rejects.toThrow('must export default an object of workflow names to arrays of patch ids');
+  const declared = project({ 'convex/patches.ts': "export default { 'pipeline:run': ['notify'] };\n" });
+  await expect(collectFrom(declared)).rejects.toThrow('must export default an object of workflow names to { active, deprecated, retired }');
+  const twice = project({ 'convex/patches.ts': "export default { 'pipeline:run': { active: ['notify'], retired: ['notify'] } };\n" });
+  await expect(collectFrom(twice)).rejects.toThrow('pipeline:run lists "notify" more than once');
   const paths = project({ 'convex/patches.ts': "export const componentPaths = { workpool: 'x' };\nexport default {};\n" });
   await expect(collectFrom(paths)).rejects.toThrow('may only set "workflow" and "patches"');
 });

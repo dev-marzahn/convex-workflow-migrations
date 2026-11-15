@@ -5,6 +5,6 @@
 ## Checklist
 
 - [ ] `bun run ready` passes
-- [ ] `bun run e2e` passes, if this touches the vendored client, the component or `src/patchState.ts`
+- [ ] `bun run e2e` passes, if this touches the vendored client, the component, `src/patchState.ts`, `src/predeploy.ts` or `src/cli.ts`
 - [ ] Tests cover the change
 - [ ] README.md and CHANGELOG.md are updated, if users will notice

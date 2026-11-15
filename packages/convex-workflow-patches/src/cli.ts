@@ -8,20 +8,20 @@ import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
 import { parseArgs } from 'node:util';
 
-import { blockedMessage, collect, COMPONENT_NOT_DEPLOYED, convexDirOf, describeBlocker, describeRemovals, inspect, type Query } from './predeploy.ts';
+import { blockedMessage, collect, COMPONENT_NOT_DEPLOYED, convexDirOf, describeBlocker, inspect, type Query } from './predeploy.ts';
 
-const USAGE = `Usage: convex-workflow-patches check [--workflow-component <path>] [--patches-component <path>] [--page-size <n>] [-- <convex run options>]
+const USAGE = `Usage: convex-workflow-patches check [--page-size <n>] [-- <convex options>]
 
-Compares the patches this checkout declares (convex/patches.ts) with the ones
-the deployed release declares, and lists the running workflows that still need
-code the checkout removes. Exits 1 if there are any. Run it from your app's
-directory, against the deployment you're about to deploy to.
+Reads which patches this checkout's convex/patches.ts deprecates or retires,
+and lists the running workflows that still need their old branches. Exits 1 if
+there are any. Run it from your app's directory, against the deployment you're
+about to deploy to. Where the components are mounted comes from componentPaths
+in convex/patches.ts.
 
-  --workflow-component  Where @convex-dev/workflow is mounted. Default: componentPaths.workflow in patches.ts, or workflow
-  --patches-component   Where this package's component is mounted. Default: componentPaths.patches in patches.ts, or workflowPatches
-  --page-size           Workflows read per \`convex run\`. Default: 100
+  --page-size  Workflows read per \`convex run\`. Default: 100
 
-Options after -- go to \`convex run\`, e.g. -- --prod.
+Options after -- go to every \`convex\` command the check runs (\`convex run\`
+and \`convex data\`), e.g. -- --prod.
 Exit codes: 0 nothing blocks, 1 running workflows block, 2 usage or deployment error.`;
 
 class UsageError extends Error {}
@@ -43,7 +43,9 @@ function convex(args: string[], convexArgs: string[]) {
 /**
  * Queries through `convex run`. `convex run` against a missing component fails
  * with a generic server error, so each component is first looked up with
- * `convex data`, which names the cause.
+ * `convex data`, which names the cause. convex-release tells the same case
+ * apart from `convex run`'s output instead (`classifyCliFailure`); if one of
+ * them changes, check the other.
  */
 function cliQuery(convexArgs: string[]): Query {
   const deployed = new Map<string, boolean>();
@@ -78,8 +80,6 @@ async function check(argv: string[]): Promise<number> {
   const { values } = parseArgs({
     args: split < 0 ? argv : argv.slice(0, split),
     options: {
-      'workflow-component': { type: 'string' },
-      'patches-component': { type: 'string' },
       'page-size': { type: 'string', default: '100' },
       help: { type: 'boolean', short: 'h' },
     },
@@ -92,27 +92,14 @@ async function check(argv: string[]): Promise<number> {
   if (!Number.isInteger(pageSize) || pageSize < 1) throw new UsageError('--page-size must be a positive whole number.');
 
   const projectRoot = process.cwd();
-  const collected = await collect({ projectRoot, convexDir: convexDirOf(projectRoot) });
-  const facts = {
-    declared: collected.declared,
-    componentPaths: {
-      workflow: values['workflow-component'] ?? collected.componentPaths.workflow,
-      patches: values['patches-component'] ?? collected.componentPaths.patches,
-    },
-  };
+  const facts = await collect({ projectRoot, convexDir: convexDirOf(projectRoot) });
   const result = await inspect(facts, cliQuery(split < 0 ? [] : argv.slice(split + 1)), pageSize);
   if (!result) {
     console.log(`The deployment has no ${facts.componentPaths.patches} component yet, so no running workflow can need a removed patch.`);
     return 0;
   }
-  const removals = describeRemovals(result.removed);
-  if (removals.length === 0) {
-    console.log('This release removes no patches.');
-    return 0;
-  }
-  for (const line of removals) console.log(line);
   if (result.blockers.length === 0) {
-    console.log('No running workflow needs the removed code.');
+    console.log('No running workflow needs code this release removes.');
     return 0;
   }
   console.log(`${blockedMessage(result.blockers)}:`);

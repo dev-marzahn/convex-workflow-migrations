@@ -31,22 +31,14 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         number,
         Name
       >;
-      deployed: FunctionReference<
-        "query",
-        "internal",
-        {},
-        Array<{ declared: Array<string>; workflow: string }>,
-        Name
-      >;
       load: FunctionReference<
         "query",
         "internal",
-        { workflow: string; workflowId: string },
+        { workflowId: string },
         {
-          deployed: Array<string> | null;
           markers: Array<{ beforeStepId: string; patchId: string }>;
           run: { known: Array<string>; workflow: string } | null;
-          skips: Array<string>;
+          skips: Array<{ atStepId: string; patchId: string }>;
         },
         Name
       >;
@@ -57,18 +49,25 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         Array<{
           run: { known: Array<string>; workflow: string } | null;
           skips: Array<string>;
+          took: Array<string>;
           workflowId: string;
         }>,
+        Name
+      >;
+      recorded: FunctionReference<
+        "query",
+        "internal",
+        {},
+        Array<{ patchIds: Array<string>; workflow: string }>,
         Name
       >;
       save: FunctionReference<
         "mutation",
         "internal",
         {
-          deployed?: Array<string>;
           markers: Array<{ beforeStepId: string; patchId: string }>;
           run: { known: Array<string>; workflow: string };
-          skips: Array<string>;
+          skips: Array<{ atStepId: string; patchId: string }>;
           unskip: Array<string>;
           workflowId: string;
         },

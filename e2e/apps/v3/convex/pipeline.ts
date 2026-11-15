@@ -7,8 +7,8 @@ import { internalMutation, mutation, query } from './_generated/server';
 import { workflow } from './workflow';
 
 // Release 3: "notify-after-grab"'s old branch is removed, so notify always
-// runs, and the patch is no longer declared. Runs that passed that point on
-// release 1 can't replay on this; `check` refuses it while any are running.
+// runs, and the patch is retired. Runs that passed that point on release 1
+// can't replay on this; the check refuses it while any are running.
 export const run = workflow.define({
   args: { grabId: v.id('grabs') },
   handler: async (step, { grabId }): Promise<void> => {

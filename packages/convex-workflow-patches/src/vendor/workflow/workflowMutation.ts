@@ -241,12 +241,9 @@ export function workflowMutation<
       const workflowName = (await ctx.meta.getFunctionMetadata()).name;
       const patchState = new PatchState(
         journalEntries as JournalEntry[],
-        await ctx.runQuery(patches.component.runs.load, {
-          workflowId,
-          workflow: workflowName,
-        }),
+        await ctx.runQuery(patches.component.runs.load, { workflowId }),
         workflowName,
-        patches.declared[workflowName] ?? [],
+        patches.declared[workflowName] ?? {},
       );
       const step = createWorkflowCtx(workflowId, channel, undefined, patchState);
       const executor = new StepExecutor(
@@ -308,14 +305,14 @@ export function workflowMutation<
         const executorWorker = async (): Promise<WorkerResult> => {
           return await executor.run();
         };
-        // PATCHES: a replay failure in a run that skipped a removed patch
+        // PATCHES: a journal mismatch in a run that skipped a removed patch
         // gets the cause in its message. The mutation still fails.
         let result: WorkerResult;
         try {
           result = await Promise.race([handlerWorker(), executorWorker()]);
         } catch (error) {
           const removed = patchState.removedSkips();
-          if (removed.length === 0) throw error;
+          if (removed.length === 0 || !String(error).includes("Journal entry mismatch")) throw error;
           throw new Error(
             `Workflow patch ${removed.map((id) => `"${id}"`).join(", ")} was removed, but ${workflowName} ${workflowId} passed it ` +
               `without the patch, so it needs the old branch. Deploy a release that still has it, then restart the run. ` +

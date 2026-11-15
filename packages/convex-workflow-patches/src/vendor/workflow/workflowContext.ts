@@ -76,7 +76,11 @@ type InlineArgs =
       transactionLimits?: TransactionLimits;
     };
 
-export type WorkflowCtx = {
+// PATCHES: generic over the declared patch ids, so a typo is a type error.
+export type WorkflowCtx<
+  ActiveId extends string = string,
+  DeprecatedId extends string = string,
+> = {
   /**
    * The ID of the workflow currently running.
    */
@@ -188,7 +192,8 @@ export type WorkflowCtx = {
    *
    * Chaining is supported; later defaults override earlier ones.
    */
-  withOptions(defaults: StepDefaults): WorkflowCtx;
+  // PATCHES: keeps the patch id types.
+  withOptions(defaults: StepDefaults): WorkflowCtx<ActiveId, DeprecatedId>;
 
   /**
    * PATCHES: Whether this run takes the code path added by patch `id`.
@@ -198,7 +203,7 @@ export type WorkflowCtx = {
    * has that marker: a run that passed this point under code without the
    * patch gets `false` on every replay, and that is recorded as a skip. The
    * decision is remembered per run, so every call with the same `id` returns
-   * the same value. `id` must be declared for the workflow in
+   * the same value. `id` must be in the workflow's `active` list in
    * convex/patches.ts.
    *
    * ```ts
@@ -207,15 +212,16 @@ export type WorkflowCtx = {
    * }
    * ```
    */
-  patched(id: string): boolean;
+  patched(id: ActiveId): boolean;
 
   /**
    * PATCHES: Mark patch `id` as permanent in this code: the old branch is
    * gone. Records the patch for this run like `patched()`, so code that still
    * calls `patched(id)` replays it after a rollback. Throws if this run
    * passed this point without the patch, because it can no longer replay.
+   * `id` must be in the workflow's `deprecated` list in convex/patches.ts.
    */
-  deprecatePatch(id: string): void;
+  deprecatePatch(id: DeprecatedId): void;
 };
 
 // PATCHES: step calls go through this, so each gets its position (seq).

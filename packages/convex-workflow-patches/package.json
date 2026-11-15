@@ -61,6 +61,7 @@
   "devDependencies": {
     "@convex-dev/workflow": "catalog:",
     "@convex-dev/workpool": "catalog:",
+    "@dev-marzahn/convex-release": "catalog:",
     "@edge-runtime/vm": "catalog:",
     "@types/node": "catalog:",
     "convex": "catalog:",

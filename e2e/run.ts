@@ -165,8 +165,8 @@ const scenarios: Record<string, (backend: Backend) => Promise<void>> = {
 
   /**
    * `convex-workflow-patches check` before each deploy: adopting the package
-   * and adding patches passes; removing a patch's old branch is refused while a
-   * run from before the patch is running, and passes once it has finished.
+   * and adding patches passes; deprecating or retiring a patch is refused while
+   * a run from before the patch is running, and passes once it has finished.
    */
   async check(backend) {
     const old = await startWaitingRun(backend);
@@ -177,17 +177,21 @@ const scenarios: Record<string, (backend: Backend) => Promise<void>> = {
     await until('v2', backend, fresh.grabId, (g) => g.log.length === 2);
     expectCheck('v2', backend, 0, 'for a release that removes nothing');
 
-    // Release 3 removes notify-after-grab's old branch; the release 1 run may need it.
-    expectCheck('v3', backend, 1, 'while the release 1 run is waiting', { lists: [old.workflowId], omits: [fresh.workflowId] });
+    // Both releases remove notify-after-grab's old branch; the release 1 run may need it.
+    const blocked = { lists: [old.workflowId], omits: [fresh.workflowId] };
+    expectCheck('v3-deprecated', backend, 1, 'while the release 1 run is waiting', blocked);
+    expectCheck('v3', backend, 1, 'while the release 1 run is waiting', blocked);
     call('v2', backend, 'pipeline:downloadDone', { workflowId: old.workflowId });
     expectEqual(
       await until('v2', backend, old.grabId, (g) => g.status !== 'inProgress'),
       { log: ['grab', 'import', 'prepare', 'publish'], status: 'completed' },
       'the run started on release 1',
     );
-    expectCheck('v3', backend, 0, 'once the release 1 run finished');
+    expectCheck('v3-deprecated', backend, 0, 'once the release 1 run finished');
 
-    // The release 2 run took notify-after-grab, so it replays on release 3.
+    // The release 2 run took notify-after-grab, so it replays on both.
+    deploy('v3-deprecated', backend);
+    expectCheck('v3', backend, 0, 'after the deprecating release');
     deploy('v3', backend);
     call('v3', backend, 'pipeline:downloadDone', { workflowId: fresh.workflowId });
     expectEqual(
@@ -224,7 +228,7 @@ const scenarios: Record<string, (backend: Backend) => Promise<void>> = {
     );
 
     expectRun('the one-shot image of v3 once the release 1 run finished', releaseImage('v3', backend), 0, {
-      lists: [`[${PACKAGE}] pipeline:run removes "notify-after-grab".`],
+      lists: ['running 1 predeploy check'],
       omits: [REFUSED],
     });
     call('v3', backend, 'pipeline:downloadDone', { workflowId: fresh.workflowId });
