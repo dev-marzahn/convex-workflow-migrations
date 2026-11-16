@@ -4,6 +4,9 @@
 //
 // Component codegen pulls deployment state, so this runs against a throwaway
 // backend (e2e/backend.ts). Nothing is deployed there; it's removed after.
+// The apps import the built package, whose type check needs the component's
+// generated types: so it runs the component's codegen, then the build, then
+// the apps' codegen.
 //
 //   bun run codegen
 import { spawnSync } from 'node:child_process';
@@ -17,15 +20,21 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const COMPONENT = join(ROOT, 'packages/convex-workflow-migrations/src/component');
 const APPS = [join(ROOT, 'examples/basic'), ...readdirSync(join(ROOT, 'e2e/apps')).map((app) => join(ROOT, 'e2e/apps', app))];
 
+function run(cwd: string, cmd: string, args: string[], env?: NodeJS.ProcessEnv): void {
+  const result = spawnSync(cmd, args, { cwd, env, encoding: 'utf8' });
+  if (result.status !== 0) throw new Error(`${cmd} ${args.join(' ')} failed in ${relative(ROOT, cwd) || '.'}:\n${result.stdout}\n${result.stderr}`);
+}
+
 function codegen(cwd: string, env: NodeJS.ProcessEnv, args: string[] = []): void {
   console.log(`codegen ${relative(ROOT, cwd)} ${args.join(' ')}`.trim());
-  const result = spawnSync(join(cwd, 'node_modules/.bin/convex'), ['codegen', '--typecheck', 'disable', ...args], { cwd, env, encoding: 'utf8' });
-  if (result.status !== 0) throw new Error(`convex codegen failed in ${relative(ROOT, cwd)}:\n${result.stdout}\n${result.stderr}`);
+  run(cwd, join(cwd, 'node_modules/.bin/convex'), ['codegen', '--typecheck', 'disable', ...args], env);
 }
 
 const backend = await startBackend('convex-workflow-migrations-codegen');
 try {
   codegen(APPS[0]!, backend.env, ['--component-dir', relative(APPS[0]!, COMPONENT)]);
+  console.log('build');
+  run(ROOT, 'bun', ['run', 'build']);
   for (const app of APPS) codegen(app, backend.env);
 } finally {
   backend.stop();

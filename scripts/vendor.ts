@@ -7,7 +7,8 @@
 //   bun run vendor          copy, patch and regenerate the diff
 //   bun run vendor diff     only regenerate the diff, after fixing conflicts
 //
-// tests/vendor.test.ts checks the result with the same FILES and `diff`.
+// tests/vendor.test.ts checks the result with the same FILES and
+// diffVendored().
 import { spawnSync } from 'node:child_process';
 import { copyFileSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
@@ -77,7 +78,8 @@ function revendor(): number {
   const upstream = upstreamDir();
   const version = upstreamVersion();
   const patch = readFileSync(DIFF);
-  // Patch a scratch copy, so a failed hunk leaves the vendored files as they were until it's copied over.
+  // Patch a scratch copy of upstream, then copy it over the vendored files, failed hunks or not: a file is patched as
+  // far as the patch got, and its .rej, copied next to it, has the hunks left to apply by hand.
   const work = mkdtempSync(join(tmpdir(), 'convex-workflow-migrations-vendor-'));
   try {
     for (const [name, source] of Object.entries(FILES)) copyFileSync(join(upstream, source), join(work, name));
