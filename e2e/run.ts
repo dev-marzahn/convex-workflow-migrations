@@ -84,14 +84,17 @@ type Exported = { workflowId: string; args: unknown; steps: { name: string; runR
 
 /**
  * Runs the `histories` CLI from `app`'s directory, as a user would: the
- * installed bin, or the build for a fixture without the package. With `out`,
- * it writes the export there, and this reads it back.
+ * installed package's bin, or the build for a fixture without the package.
+ * The bin is resolved through the package's package.json rather than
+ * node_modules/.bin, which a fresh install doesn't link before the first
+ * build. With `out`, it writes the export there, and this reads it back.
  */
 function histories(app: string, backend: Backend, args: string[], { status = 0, out }: { status?: number; out?: string } = {}) {
-  const cli =
-    app === release3 ? join(appDir(app), 'node_modules/.bin/convex-workflow-migrations') : join(ROOT, 'packages/convex-workflow-migrations/dist/cli.js');
-  const argv = ['histories', 'pipeline:run', ...args, ...(out ? ['--out', out] : [])];
-  const result = spawnSync(cli, argv, { cwd: appDir(app), env: backend.env, encoding: 'utf8' });
+  const pkg = app === release3 ? join(appDir(app), 'node_modules/@dev-marzahn/convex-workflow-migrations') : join(ROOT, 'packages/convex-workflow-migrations');
+  const bin = (JSON.parse(readFileSync(join(pkg, 'package.json'), 'utf8')) as { bin: Record<string, string> }).bin['convex-workflow-migrations']!;
+  const argv = [join(pkg, bin), 'histories', 'pipeline:run', ...args, ...(out ? ['--out', out] : [])];
+  const result = spawnSync(process.execPath, argv, { cwd: appDir(app), env: backend.env, encoding: 'utf8' });
+  if (result.error) throw result.error;
   if (result.status !== status) throw new Error(`histories exited with ${result.status}, not ${status}:\n${result.stderr}`);
   const json = out ? readFileSync(out, 'utf8') : result.stdout;
   return { exported: json ? (JSON.parse(json) as Exported[]) : [], stderr: result.stderr };
