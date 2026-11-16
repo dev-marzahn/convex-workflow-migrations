@@ -10,9 +10,9 @@ The main changes are marked `PATCHES:`; [`upstream.diff`](upstream.diff) is the 
 
 | File | Change |
 | --- | --- |
-| `workflowContext.ts` | Adds `step.patched(id)` and `step.deprecatePatch(id)`, and makes `WorkflowCtx` generic over the declared ids. Every step call goes through `runStep`, which gives it a position (`seq`) at the call site. |
-| `step.ts` | `StepRequest` carries `seq`. After `journal.startSteps`, hands the new steps' ids to `PatchState`, so frontier decisions get their markers. |
-| `workflowMutation.ts` | Reads the workflow's function name and the run's records, and creates a `PatchState` per handler run. Writes what the run decided at the end, in its transaction. Adds the cause to a journal mismatch in a run that skipped a removed patch. Takes the patches component and the declared patches as a parameter. |
+| `workflowMutation.ts` | Takes the patches component and the workflow's migrations as a parameter. Loads the run's record and applies its pending migrations in memory (`RunRecord` in `src/migrations.ts`), and replays against the resulting history. A run whose migrations can't be applied, or whose replay doesn't match, is paused instead of failed: the mutation records the pause, with its own function handle for the retry, and returns normally. Saves the record after a replay that matched, in its transaction. Hands a replay request from `expectReplays()` or `migrate()` in `/test` to `src/testing.ts`. |
+| `step.ts` | Matches step calls against the history (`HistoryView.replay()` in `src/history.ts`) instead of the raw journal, so `getGenerationState` reads it too: a stand-in resolves its call without sending anything, a step inserted with `runLate` is started when replay reaches it and records its journal entry, removed steps are gone, rewritten steps compare by their new name and args. A mismatch throws `ReplayMismatch`. A running step blocks replay, which only a history given to `expectReplays()` has. |
+| `workflowContext.ts` | Import paths only. |
 | `types.ts` | `JournalEntry` and `Step` derived from the installed component's API (upstream imports them from its schema, which isn't exported). `WorkflowHandler` with this package's `WorkflowCtx`. |
 | `environment.ts`, `logging.ts`, `publicTypes.ts`, `safeFunctionName.ts`, `shared.ts` | Unchanged copies. Upstream doesn't export them. |
 

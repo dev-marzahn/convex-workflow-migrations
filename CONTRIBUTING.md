@@ -17,12 +17,12 @@ The repo uses [Vite+](https://viteplus.dev): `vp check` runs Oxfmt, Oxlint and t
 
 ## Repository
 
-| Path                               | Contents                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `packages/convex-workflow-patches` | The npm package: the `WorkflowManager` (`src/index.ts`); the patch decisions (`src/patchState.ts`); the patches component (`src/component`); the vendored `@convex-dev/workflow` client (`src/vendor/workflow`); the predeploy check (`src/predeploy.ts`, which is also convex-release's check module) and its CLI (`src/cli.ts`); the convex-test helpers (`src/test.ts`, with `simulateDeploy`'s switch in `src/testing.ts`). |
-| `examples/basic`                   | An app with a patched workflow and its tests.                                                                                                                                                                                                                                                                                                                                                                                   |
-| `e2e/`                             | Fixture apps v1 (plain `@convex-dev/workflow`), v2 (adopts the package and adds two patches), v3-deprecated (deprecates one of them), v3 (retires it) and v2-unguarded (the same change as v2, without patches), and the script that deploys them over each other on a real backend. v2, v3 and v3-deprecated also use convex-release.                                                                                          |
-| `scripts/codegen.ts`               | Rewrites every `_generated/` folder, and `migrations/_generated.ts` in the apps that use convex-release.                                                                                                                                                                                                                                                                                                                        |
+| Path                               | Contents                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| ---------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `packages/convex-workflow-patches` | The npm package: the `WorkflowManager` (`src/index.ts`); the history view and its edits (`src/history.ts`); migrations and what a handler run does with a run's record (`src/migrations.ts`); the patches component (`src/component`); the vendored `@convex-dev/workflow` client (`src/vendor/workflow`); the `histories` CLI (`src/cli.ts`); the convex-test helpers (`src/test.ts`, with the replay they hand to the workflow mutation in `src/testing.ts`). |
+| `examples/basic`                   | An app with a workflow that has three migrations, and its tests.                                                                                                                                                                                                                                                                                                                                                                                                |
+| `e2e/`                             | Fixture apps v1 (release 0, plain `@convex-dev/workflow`), v2 (releases 1 and 2: adopts the package, two migrations), v3 (release 3: a third migration, the list of all three) and v2-unguarded (v2's code without its migrations), and the script that deploys them over each other on a real backend.                                                                                                                                                         |
+| `scripts/codegen.ts`               | Rewrites every `_generated/` folder.                                                                                                                                                                                                                                                                                                                                                                                                                            |
 
 ## Codegen
 
@@ -32,27 +32,28 @@ The `_generated/` folders are committed. After changing the component's function
 bun run codegen
 ```
 
-Component codegen pulls deployment state, so the script starts a throwaway backend in Docker (`e2e/backend.ts`), runs `convex codegen` for the component and every app, and removes the container. Nothing is deployed. In the apps that use convex-release, it first runs `convex-release codegen`, which rewrites `convex/migrations/_generated.ts`.
+Component codegen pulls deployment state, so the script starts a throwaway backend in Docker (`e2e/backend.ts`), runs `convex codegen` for the component and every app, and removes the container. Nothing is deployed. The apps import the built package, so run `bun run build` first. If the component's generated types are stale, the build fails its type check but still writes `dist/`, which is enough for codegen.
 
 ## End-to-end tests
 
 ```sh
-bun run e2e             # all scenarios, under a minute
-bun run e2e check       # only the named scenarios: patched, check, release, unguarded
+bun run e2e             # all scenarios, about a minute and a half
+bun run e2e skip        # only the named scenarios: skip, unguarded, rollback
 ```
 
-The script builds the package first. Each scenario starts a fresh backend and deploys fixture app v1 with a run waiting on `awaitEvent`:
+The script builds the package first. Each scenario starts a fresh backend and leaves a run waiting on `awaitEvent`:
 
-- `patched` deploys v2 over it, sends the event and checks which steps ran.
-- `check` runs `convex-workflow-patches check` from v2, v3-deprecated and v3 between deploys, and checks its exit codes and output.
-- `release` deploys v2 and v3 with `convex-release deploy` and with convex-release's one-shot image (pulled from ghcr.io, at the app's convex-release version), and checks that both refuse v3 while the run waits.
-- `unguarded` deploys v2-unguarded and checks that the waiting run fails.
+- `skip` starts the run on v1, exports its history with `convex-workflow-patches histories` from v3, deploys v3, sends the event, and checks that the run replays through all three migrations and that a run started on v3 has every id applied.
+- `unguarded` starts the run on v1, deploys v2-unguarded, sends the event, and checks that the run pauses (reported once to `onPause`) instead of failing; then deploys v2 and waits for the scheduled retry, a minute later, to finish the run.
+- `rollback` starts the run on v3, deploys v2, sends the event, and checks that the run pauses with `migrations`; then deploys v3 again and resumes it with `resume`.
 
-## The predeploy check
+## The component across versions
 
-`src/predeploy.ts` is the module convex-release runs (`convex-release.predeploy` in the package's `package.json`). convex-release loads it from a folder of its own, without `node_modules`, so it may only import `node:` built-ins; type imports are fine, the build erases them. A test fails if it imports anything else, and the `release` scenario runs it the way convex-release does.
+A deployment's `runs` rows, its scheduled `runs:retry` calls, and what `runs:load` returns outlive the version of this package that wrote them: the next release reads the rows and runs the scheduled retries, and the `histories` CLI of whatever version a developer has installed reads `runs:load`. So from one version to the next:
 
-A release's check module reads what the deployed release wrote, which may be an older version of this package. Keep `runs:recorded`, `runs:lookup` and upstream's `workflow:list` callable with the same arguments and result shapes from one version to the next, or make the check accept both. To move to a new convex-release, set its version in the root `package.json` catalog and run `bun run e2e release`.
+- keep every field of `runs` and of its overlay operations readable, adding only optional fields (Convex refuses a schema that existing rows don't match, so the push fails otherwise);
+- keep `runs:retry` callable with `{ workflowId }`, and `runs:load`'s result shape a superset of the last one;
+- keep the stored `paused.handle` called with `{ workflowId, generationNumber }`, upstream's workflow mutation arguments.
 
 ## Updating @convex-dev/workflow
 
@@ -69,7 +70,7 @@ The package carries a copy of one upstream release's client code. A weekly job (
 
 ## Pull requests
 
-- Run `bun run ready` before you push. Run `bun run e2e` too if you touched the vendored client, the component, `src/patchState.ts`, `src/predeploy.ts` or `src/cli.ts`.
+- Run `bun run ready` before you push. Run `bun run e2e` too if you touched the vendored client, the component, `src/history.ts`, `src/migrations.ts` or `src/cli.ts`.
 - Add a test for a bug fix or a new option.
 - Add a line under "Unreleased" in [CHANGELOG.md](CHANGELOG.md) for a change users will notice.
 - If you change how the package behaves, update [README.md](README.md) in the same pull request. It's the only README: packing the package copies it, and `LICENSE`, into `packages/convex-workflow-patches`.
