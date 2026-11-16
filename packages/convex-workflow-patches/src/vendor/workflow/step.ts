@@ -23,7 +23,11 @@ import type {
 import { MAX_JOURNAL_SIZE, formatErrorWithStack } from "./shared.js";
 import type { EventId, SchedulerOptions } from "./publicTypes.js";
 import { pick } from "convex-helpers";
-import type { PatchState } from "../../patchState.js";
+import {
+  type HistoryView,
+  type ReplayEntry,
+  ReplayMismatch,
+} from "../../history.js";
 
 export type WorkerResult =
   | { type: "handlerDone"; runResult: RunResult }
@@ -58,27 +62,36 @@ export type StepRequest = {
   unstableArgs: boolean;
   transactionLimits: TransactionLimits | undefined;
   schedulerOptions: SchedulerOptions;
-  // PATCHES: position of this request among all step calls in this handler
-  // run, assigned when the call is made. Equals the journal index it replays.
-  seq: number;
 
   resolve: (result: RunResult) => void;
 };
 
+// PATCHES: what completeMessage compares a call with: a step of the run's
+// history, or a journal entry this handler run just started. Only history
+// steps have a position, so only they throw ReplayMismatch.
+type Recorded = {
+  step: Pick<Step, "name" | "kind" | "args" | "inProgress" | "runResult">;
+  argsKnown?: boolean;
+  position?: number;
+};
+
 export class StepExecutor {
   private journalEntrySize: number;
+  // PATCHES: replay matches calls against the run's history, the journal
+  // with its migrations' edits, instead of the raw journal.
+  private journalEntries: ReplayEntry[];
 
   constructor(
     private workflowId: string,
     private generationNumber: number,
     private ctx: GenericMutationCtx<GenericDataModel>,
     private component: WorkflowComponent,
-    private journalEntries: Array<JournalEntry>,
+    journalEntries: Array<JournalEntry>,
     private receiver: BaseChannel<StepRequest>,
     private now: number,
     private workpoolOptions: WorkpoolOptions | undefined,
     // PATCHES:
-    private patchState: PatchState,
+    history: HistoryView,
   ) {
     this.journalEntrySize = journalEntries.reduce(
       (size, entry) => size + getConvexSize(entry),
@@ -89,6 +102,8 @@ export class StepExecutor {
       // This should never happen, but we'll throw an error just in case.
       throw new Error(journalSizeError(this.journalEntrySize, this.workflowId));
     }
+    // PATCHES:
+    this.journalEntries = history.replay(now);
   }
   async run(): Promise<WorkerResult> {
     while (true) {
@@ -96,6 +111,25 @@ export class StepExecutor {
       // In the future we can correlate the calls to entries by handle, args,
       // etc. instead of just ordering. As is, the fn order can't change.
       const entry = this.journalEntries.shift();
+      // PATCHES: a running step blocks replay. The workflow mutation doesn't
+      // replay while a step runs, so only a history given to expectReplays()
+      // has one here.
+      if (entry?.step.inProgress) {
+        this.checkMessage(message, entry);
+        return { type: "executorBlocked" };
+      }
+      // PATCHES: a step a migration inserted with runLate runs now, for real,
+      // and its journal entry takes this position from now on.
+      if (entry?.late) {
+        this.checkMessage(message, entry);
+        const [started] = await this.startSteps([message]);
+        entry.late(started._id);
+        if (!started.step.runResult) {
+          return { type: "executorBlocked" };
+        }
+        message.resolve(started.step.runResult);
+        continue;
+      }
       if (entry) {
         this.completeMessage(message, entry);
         continue;
@@ -134,36 +168,48 @@ export class StepExecutor {
     };
   }
 
-  completeMessage(message: StepRequest, entry: JournalEntry) {
+  // PATCHES: takes a step of the history, and the comparison is in checkMessage.
+  completeMessage(message: StepRequest, entry: Recorded) {
     if (entry.step.inProgress) {
       throw new Error(
         `Assertion failed: not blocked but have in-progress journal entry`,
       );
     }
-    const stepFields = pick(
-      entry.step,
-      message.unstableArgs ? ["name", "kind"] : ["name", "kind", "args"],
-    );
-    const messageFields = message.unstableArgs
-      ? { name: message.name, kind: message.target.kind }
-      : {
-          name: message.name,
-          kind: message.target.kind,
-          args: message.target.args as Value,
-        };
-    const stepJson = JSON.stringify(convexToJson(stepFields));
-    const messageJson = JSON.stringify(convexToJson(messageFields));
-    if (stepJson !== messageJson) {
-      throw new Error(
-        `Journal entry mismatch:\n\n${stepJson}\n\n!==\n\n${messageJson}`,
-      );
-    }
+    this.checkMessage(message, entry);
     if (entry.step.runResult === undefined) {
       throw new Error(
         `Assertion failed: no outcome for completed function call`,
       );
     }
     message.resolve(entry.step.runResult);
+  }
+
+  // PATCHES: upstream's comparison, from completeMessage. A stand-in a
+  // migration inserted without args is matched on its name and kind. A
+  // mismatch throws ReplayMismatch, which pauses the run.
+  checkMessage(message: StepRequest, entry: Recorded) {
+    const compareArgs = !message.unstableArgs && entry.argsKnown !== false;
+    const stepFields = pick(
+      entry.step,
+      compareArgs ? ["name", "kind", "args"] : ["name", "kind"],
+    );
+    const messageFields = !compareArgs
+      ? { name: message.name, kind: message.target.kind }
+      : {
+          name: message.name,
+          kind: message.target.kind,
+          args: message.target.args as Value,
+        };
+    const stepJson = JSON.stringify(convexToJson(stepFields as Value));
+    const messageJson = JSON.stringify(convexToJson(messageFields));
+    if (stepJson !== messageJson) {
+      if (entry.position !== undefined) {
+        throw new ReplayMismatch(entry.position, messageJson, stepJson);
+      }
+      throw new Error(
+        `Journal entry mismatch:\n\n${stepJson}\n\n!==\n\n${messageJson}`,
+      );
+    }
   }
 
   async startSteps(messages: StepRequest[]): Promise<JournalEntry[]> {
@@ -263,12 +309,6 @@ export class StepExecutor {
         workpoolOptions: this.workpoolOptions,
       },
     )) as JournalEntry[];
-    // PATCHES: a marker names the first step issued after each patched()
-    // call decided at the frontier. The workflow mutation writes them.
-    this.patchState.takeMarkers(
-      messages.map((message) => message.seq),
-      entries.map((entry) => entry._id),
-    );
     for (const entry of entries) {
       this.journalEntrySize += getConvexSize(entry);
       if (this.journalEntrySize > MAX_JOURNAL_SIZE) {

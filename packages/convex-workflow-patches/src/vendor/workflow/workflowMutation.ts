@@ -33,11 +33,9 @@ import {
   type WorkflowMutationResult,
 } from "./types.js";
 import { createWorkflowCtx } from "./workflowContext.js";
-import {
-  PatchState,
-  type DeclaredPatches,
-  type PatchesComponent,
-} from "../../patchState.js";
+import { ReplayMismatch } from "../../history.js";
+import { RunRecord, type WorkflowPatches } from "../../migrations.js";
+import { replayRequest } from "../../testing.js";
 
 export type WorkflowArgs<V extends PropertyValidators, Context = unknown> = {
   /**
@@ -116,8 +114,8 @@ export function workflowMutation<
   ReturnsValidator extends Validator<any, "required", any> | void,
 >(
   component: WorkflowComponent,
-  // PATCHES: the patches component, and the patch ids each workflow declares.
-  patches: { component: PatchesComponent; declared: DeclaredPatches },
+  // PATCHES: the patches component, and this workflow's migrations.
+  patches: WorkflowPatches,
   registered: WorkflowDefinition<ArgsValidator, ReturnsValidator> & {
     handler: WorkflowHandler<ArgsValidator, ReturnsValidator>;
   },
@@ -165,6 +163,16 @@ export function workflowMutation<
           );
         }
         assert(validate(vWorkflowArgs, args, { throw: true }));
+      }
+      // PATCHES: expectReplays() and migrate() from /test replay a given
+      // history here, in convex-test, without loading or starting anything.
+      const check =
+        typeof args.workflowId === "string"
+          ? replayRequest(args.workflowId)
+          : undefined;
+      if (check) {
+        await check(ctx, patches, registered, workpoolOptions);
+        return args.workflowId as WorkflowId;
       }
       let workflowId: WorkflowId, generationNumber: number;
 
@@ -234,18 +242,23 @@ export function workflowMutation<
           `Assertion failed: not blocked but have in-progress journal entry`,
         );
       }
+      // PATCHES: load the run's record and apply its pending migrations, in
+      // memory. A run they can't be applied to pauses, and returns normally
+      // so the workpool doesn't fail it.
+      const run = await RunRecord.load(
+        ctx,
+        patches,
+        workflowId,
+        journalEntries as JournalEntry[],
+      );
+      if (run.blocked) {
+        await run.pause(ctx, generationNumber, run.blocked, console);
+        return workflowId;
+      }
       const channel = new BaseChannel<StepRequest>(
         workpoolOptions.maxParallelism ?? 10,
       );
-      // PATCHES: load this run's records and track patch decisions.
-      const workflowName = (await ctx.meta.getFunctionMetadata()).name;
-      const patchState = new PatchState(
-        journalEntries as JournalEntry[],
-        await ctx.runQuery(patches.component.runs.load, { workflowId }),
-        workflowName,
-        patches.declared[workflowName] ?? {},
-      );
-      const step = createWorkflowCtx(workflowId, channel, undefined, patchState);
+      const step = createWorkflowCtx(workflowId, channel);
       const executor = new StepExecutor(
         workflowId,
         generationNumber,
@@ -256,12 +269,14 @@ export function workflowMutation<
         Date.now(),
         workpoolOptions,
         // PATCHES:
-        patchState,
+        run.history,
       );
       const restoreEnvironment = setupEnvironment(
         executor.getGenerationState.bind(executor),
         workflowId,
       );
+      // PATCHES:
+      let mismatch: ReplayMismatch | undefined;
       try {
         const handlerWorker = async (): Promise<WorkerResult> => {
           let runResult: RunResult;
@@ -305,25 +320,20 @@ export function workflowMutation<
         const executorWorker = async (): Promise<WorkerResult> => {
           return await executor.run();
         };
-        // PATCHES: a journal mismatch in a run that skipped a removed patch
-        // gets the cause in its message. The mutation still fails.
+        // PATCHES: a replay that doesn't match the history pauses the run.
+        // Calls are matched in order and new steps start only after the last
+        // recorded one, so the pause commits no partial work. The exception
+        // is a step a migration inserted with runLate, which the pause keeps.
         let result: WorkerResult;
         try {
           result = await Promise.race([handlerWorker(), executorWorker()]);
         } catch (error) {
-          const removed = patchState.removedSkips();
-          if (removed.length === 0 || !String(error).includes("Journal entry mismatch")) throw error;
-          throw new Error(
-            `Workflow patch ${removed.map((id) => `"${id}"`).join(", ")} was removed, but ${workflowName} ${workflowId} passed it ` +
-              `without the patch, so it needs the old branch. Deploy a release that still has it, then restart the run. ` +
-              formatErrorWithStack(error),
-          );
+          if (!(error instanceof ReplayMismatch)) throw error;
+          mismatch = error;
+          return workflowId;
         }
-        // PATCHES: record what this handler run decided, in its transaction.
-        const update = patchState.update();
-        if (update) {
-          await ctx.runMutation(patches.component.runs.save, { workflowId, ...update });
-        }
+        // PATCHES: save what this handler run applied, in its transaction.
+        await run.save(ctx);
         switch (result.type) {
           case "handlerDone": {
             await ctx.runMutation(component.workflow.complete, {
@@ -343,6 +353,11 @@ export function workflowMutation<
         }
       } finally {
         restoreEnvironment();
+        // PATCHES: outside the replay's deterministic Date and console. The
+        // environment can only be restored once.
+        if (mismatch) {
+          await run.pause(ctx, generationNumber, mismatch, console);
+        }
       }
       return workflowId;
     },

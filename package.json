@@ -35,10 +35,8 @@
     "node": ">=22.18.0"
   },
   "catalog": {
-    "@convex-dev/migrations": "^0.3.8",
     "@convex-dev/workflow": "0.4.10",
     "@convex-dev/workpool": "0.4.16",
-    "@dev-marzahn/convex-release": "100.1.0-next.0",
     "@edge-runtime/vm": "5.0.0",
     "@types/node": "^26.6.6",
     "async-channel": "^0.2.0",

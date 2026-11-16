@@ -1,28 +1,33 @@
 #!/usr/bin/env node
-// convex-workflow-patches check: refuses a release that removes code a running
-// workflow still needs. Run it from the app's directory before deploying. Apps
-// deployed with convex-release don't need it: convex-release runs the same
-// check (src/predeploy.ts) on every deploy.
+// convex-workflow-patches histories: exports a workflow's run histories from a
+// deployment as JSON, for expectReplays() in /test. Run it from the app's
+// directory; it reads through `convex run`.
 import { spawnSync } from 'node:child_process';
+import { writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
 import { parseArgs } from 'node:util';
 
-import { blockedMessage, collect, COMPONENT_NOT_DEPLOYED, convexDirOf, describeBlocker, inspect, type Query } from './predeploy.ts';
+import type { OverlayOp, RecordedHistory, RecordedStep, RunResult, StepKind } from './history.ts';
 
-const USAGE = `Usage: convex-workflow-patches check [--page-size <n>] [-- <convex options>]
+const USAGE = `Usage: convex-workflow-patches histories <workflow> [options] [-- <convex options>]
 
-Reads which patches this checkout's convex/patches.ts deprecates or retires,
-and lists the running workflows that still need their old branches. Exits 1 if
-there are any. Run it from your app's directory, against the deployment you're
-about to deploy to. Where the components are mounted comes from componentPaths
-in convex/patches.ts.
+Exports the histories of a workflow's running runs, and of its most recent
+finished ones, as JSON: the input for expectReplays() from
+@dev-marzahn/convex-workflow-patches/test. <workflow> is the workflow's
+function name, like pipeline:run. Run it from your app's directory.
 
-  --page-size  Workflows read per \`convex run\`. Default: 100
+  --recent <n>                 Finished runs to export too, newest first. Default: 10
+  --max-runs <n>               Runs to look through, newest first. Default: 1000
+  --max-steps <n>              Steps to export per run. A longer run is
+                               exported up to there, with "truncated": true.
+                               Default: 1000
+  --out <file>                 Write the JSON to <file> instead of stdout.
+  --workflow-component <name>  Where @convex-dev/workflow is mounted. Default: workflow
+  --patches-component <name>   Where this package's component is mounted. Default: workflowPatches
 
-Options after -- go to every \`convex\` command the check runs (\`convex run\`
-and \`convex data\`), e.g. -- --prod.
-Exit codes: 0 nothing blocks, 1 running workflows block, 2 usage or deployment error.`;
+Options after -- go to every \`convex\` command it runs, e.g. -- --prod.
+Exit codes: 0 exported, 2 usage or deployment error.`;
 
 class UsageError extends Error {}
 
@@ -36,51 +41,56 @@ function convexBin(): string {
 }
 
 function convex(args: string[], convexArgs: string[]) {
-  const result = spawnSync(process.execPath, [convexBin(), ...args, ...convexArgs], { encoding: 'utf8' });
+  const result = spawnSync(process.execPath, [convexBin(), ...args, ...convexArgs], { encoding: 'utf8', maxBuffer: 256 << 20 });
   return { ok: result.status === 0, stdout: result.stdout, output: `${result.stdout}\n${result.stderr}`.trim() };
 }
 
-/**
- * Queries through `convex run`. `convex run` against a missing component fails
- * with a generic server error, so each component is first looked up with
- * `convex data`, which names the cause. convex-release tells the same case
- * apart from `convex run`'s output instead (`classifyCliFailure`); if one of
- * them changes, check the other.
- */
+type Query = <T>(component: string, path: string, args: object) => T;
+
 function cliQuery(convexArgs: string[]): Query {
-  const deployed = new Map<string, boolean>();
-  const isDeployed = (component: string) => {
-    if (!deployed.has(component)) {
-      const result = convex(['data', '--component', component], convexArgs);
-      if (!result.ok && !/Component path '[^']*' not found/.test(result.output))
-        throw new Error(`convex data --component ${component} failed:\n${result.output}`);
-      deployed.set(component, result.ok);
-    }
-    return deployed.get(component)!;
-  };
-  return async <T>({ componentPath, path }: { componentPath?: string; path: string }, args: object = {}) => {
-    const component = componentPath === undefined ? [] : ['--component', componentPath];
-    const what = ['convex run', ...component, path].join(' ');
-    if (componentPath !== undefined && !isDeployed(componentPath)) {
-      throw Object.assign(new Error(`${componentPath} isn't deployed`), { code: COMPONENT_NOT_DEPLOYED });
-    }
-    const result = convex(['run', ...component, path, JSON.stringify(args)], convexArgs);
-    if (!result.ok) throw new Error(`${what} failed:\n${result.output}`);
+  return <T>(component: string, path: string, args: object) => {
+    const result = convex(['run', '--component', component, path, JSON.stringify(args)], convexArgs);
+    if (!result.ok) throw new Error(`convex run --component ${component} ${path} failed:\n${result.output}`);
     try {
       // `convex run` prints nothing for a null result.
       return (result.stdout.trim() ? JSON.parse(result.stdout) : null) as T;
     } catch {
-      throw new Error(`${what} didn't print JSON:\n${result.stdout.trim()}`);
+      throw new Error(`convex run --component ${component} ${path} didn't print JSON:\n${result.stdout.trim()}`);
     }
   };
 }
 
-async function check(argv: string[]): Promise<number> {
+/** Whether a component is deployed. `convex run` against a missing one fails with a generic error; `convex data` names the cause. */
+function isDeployed(component: string, convexArgs: string[]): boolean {
+  const result = convex(['data', '--component', component], convexArgs);
+  if (result.ok) return true;
+  if (/Component path '[^']*' not found/.test(result.output)) return false;
+  throw new Error(`convex data --component ${component} failed:\n${result.output}`);
+}
+
+type Page<T> = { page: T[]; isDone: boolean; continueCursor: string };
+type PublicWorkflow = { workflowId: string; name?: string; args: unknown; runResult?: unknown };
+type WorkflowStep = { stepId: string; name: string; kind: StepKind; args: unknown; runResult?: RunResult; startedAt: number };
+type RunRecord = { applied: string[]; overlay: OverlayOp[] } | null;
+
+const count = (value: string, option: string) => {
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < 0) throw new UsageError(`--${option} must be a whole number.`);
+  return n;
+};
+
+function histories(argv: string[]): number {
   const split = argv.indexOf('--');
-  const { values } = parseArgs({
+  const { values, positionals } = parseArgs({
     args: split < 0 ? argv : argv.slice(0, split),
+    allowPositionals: true,
     options: {
-      'page-size': { type: 'string', default: '100' },
+      recent: { type: 'string', default: '10' },
+      'max-runs': { type: 'string', default: '1000' },
+      'max-steps': { type: 'string', default: '1000' },
+      out: { type: 'string' },
+      'workflow-component': { type: 'string', default: 'workflow' },
+      'patches-component': { type: 'string', default: 'workflowPatches' },
       help: { type: 'boolean', short: 'h' },
     },
   });
@@ -88,34 +98,79 @@ async function check(argv: string[]): Promise<number> {
     console.log(USAGE);
     return 0;
   }
-  const pageSize = Number(values['page-size']);
-  if (!Number.isInteger(pageSize) || pageSize < 1) throw new UsageError('--page-size must be a positive whole number.');
+  const [name, ...extra] = positionals;
+  if (name === undefined || extra.length > 0) throw new UsageError('Pass one workflow function name, like pipeline:run.');
+  const recent = count(values.recent, 'recent');
+  const maxRuns = count(values['max-runs'], 'max-runs');
+  const maxSteps = Math.max(1, count(values['max-steps'], 'max-steps'));
+  const convexArgs = split < 0 ? [] : argv.slice(split + 1);
+  const query = cliQuery(convexArgs);
+  const workflowComponent = values['workflow-component'];
+  const patchesComponent = values['patches-component'];
 
-  const projectRoot = process.cwd();
-  const facts = await collect({ projectRoot, convexDir: convexDirOf(projectRoot) });
-  const result = await inspect(facts, cliQuery(split < 0 ? [] : argv.slice(split + 1)), pageSize);
-  if (!result) {
-    console.log(`The deployment has no ${facts.componentPaths.patches} component yet, so no running workflow can need a removed patch.`);
-    return 0;
+  // Upstream has no index by status, so this pages through the runs newest first.
+  const runs: PublicWorkflow[] = [];
+  let finished = 0;
+  let scanned = 0;
+  let cursor: string | null = null;
+  while (scanned < maxRuns) {
+    const numItems = Math.min(100, maxRuns - scanned);
+    const result: Page<PublicWorkflow> = query(workflowComponent, 'workflow:listByName', { name, order: 'desc', paginationOpts: { numItems, cursor } });
+    scanned += result.page.length;
+    for (const run of result.page) {
+      if (run.runResult === undefined) runs.push(run);
+      else if (finished < recent) {
+        finished++;
+        runs.push(run);
+      }
+    }
+    if (result.isDone) break;
+    cursor = result.continueCursor;
   }
-  if (result.blockers.length === 0) {
-    console.log('No running workflow needs code this release removes.');
-    return 0;
+
+  const records = isDeployed(patchesComponent, convexArgs);
+  const exported = runs.map((run): RecordedHistory => {
+    const steps: Page<WorkflowStep> = query(workflowComponent, 'workflow:listSteps', {
+      workflowId: run.workflowId,
+      order: 'asc',
+      paginationOpts: { numItems: maxSteps, cursor: null },
+    });
+    const record: RunRecord = records ? query(patchesComponent, 'runs:load', { workflowId: run.workflowId }) : null;
+    return {
+      workflowId: run.workflowId,
+      workflow: name,
+      args: run.args,
+      steps: steps.page.map((step): RecordedStep => ({
+        id: step.stepId,
+        name: step.name,
+        kind: step.kind,
+        args: step.args,
+        ...(step.runResult ? { runResult: step.runResult } : {}),
+        startedAt: step.startedAt,
+      })),
+      ...(record ? { applied: record.applied, overlay: record.overlay } : {}),
+      ...(steps.isDone ? {} : { truncated: true }),
+    };
+  });
+  const json = `${JSON.stringify(exported, null, 2)}\n`;
+  if (values.out) {
+    writeFileSync(values.out, json);
+    console.error(`Wrote ${exported.length} histories of ${name} to ${values.out}.`);
+  } else {
+    process.stdout.write(json);
   }
-  console.log(`${blockedMessage(result.blockers)}:`);
-  for (const blocker of result.blockers) console.log(`  ${describeBlocker(blocker)}`);
-  return 1;
+  return 0;
 }
 
-async function main(argv: string[]): Promise<number> {
+function main(argv: string[]): number {
   const [command, ...rest] = argv;
   if (command === undefined || command === '--help' || command === '-h') {
     console.log(USAGE);
     return 0;
   }
   try {
-    if (command !== 'check') throw new UsageError(`Unknown command "${command}".`);
-    return await check(rest);
+    if (command !== 'histories') throw new UsageError(`Unknown command "${command}".`);
+    return histories(rest);
   } catch (error) {
     console.error(error instanceof Error ? error.message : String(error));
     if (error instanceof UsageError || (error as { code?: string }).code?.startsWith('ERR_PARSE_ARGS')) console.error(`\n${USAGE}`);
@@ -123,4 +178,4 @@ async function main(argv: string[]): Promise<number> {
   }
 }
 
-process.exitCode = await main(process.argv.slice(2));
+process.exitCode = main(process.argv.slice(2));

@@ -1,12 +1,13 @@
 {
   "name": "@dev-marzahn/convex-workflow-patches",
   "version": "100.0.0",
-  "description": "Temporal-style patched() for @convex-dev/workflow: change a released workflow without failing the runs already in flight.",
+  "description": "Migrations for @convex-dev/workflow: change a released workflow without failing the runs already in flight.",
   "keywords": [
     "convex",
     "convex-component",
     "convex-dev",
     "durable-execution",
+    "migrations",
     "versioning",
     "workflow"
   ],
@@ -61,7 +62,6 @@
   "devDependencies": {
     "@convex-dev/workflow": "catalog:",
     "@convex-dev/workpool": "catalog:",
-    "@dev-marzahn/convex-release": "catalog:",
     "@edge-runtime/vm": "catalog:",
     "@types/node": "catalog:",
     "convex": "catalog:",
@@ -84,8 +84,5 @@
   },
   "engines": {
     "node": ">=22.18.0"
-  },
-  "convex-release": {
-    "predeploy": "./dist/predeploy.js"
   }
 }

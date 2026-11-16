@@ -31,46 +31,155 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         number,
         Name
       >;
+      list: FunctionReference<
+        "query",
+        "internal",
+        { limit?: number },
+        Array<{
+          at: number;
+          attempts: number;
+          detail: string;
+          nextAttemptAt: number;
+          reason: "mismatch" | "migration" | "migrations" | "error";
+          step?: number;
+          workflow: string;
+          workflowId: string;
+        }>,
+        Name
+      >;
       load: FunctionReference<
         "query",
         "internal",
         { workflowId: string },
         {
-          markers: Array<{ beforeStepId: string; patchId: string }>;
-          run: { known: Array<string>; workflow: string } | null;
-          skips: Array<{ atStepId: string; patchId: string }>;
-        },
+          applied: Array<string>;
+          overlay: Array<
+            | {
+                anchor: string;
+                args?: any;
+                id: string;
+                kind: "function" | "workflow" | "event" | "sleep";
+                name: string;
+                op: "insert";
+                result: any;
+                where: "after" | "before";
+              }
+            | {
+                anchor: string;
+                args: any;
+                executedAs?: string;
+                id: string;
+                kind: "function" | "workflow" | "event" | "sleep";
+                name: string;
+                op: "insertLate";
+                where: "after" | "before";
+              }
+            | { op: "remove"; target: string }
+            | { args?: any; name?: string; op: "rewrite"; target: string }
+          >;
+          paused?: {
+            at: number;
+            attempts: number;
+            detail: string;
+            generationNumber: number;
+            handle: string;
+            nextAttemptAt: number;
+            reason: "mismatch" | "migration" | "migrations" | "error";
+            step?: number;
+          };
+          restart?: number;
+          workflow: string;
+        } | null,
         Name
       >;
-      lookup: FunctionReference<
-        "query",
+      pause: FunctionReference<
+        "mutation",
         "internal",
-        { workflowIds: Array<string> },
-        Array<{
-          run: { known: Array<string>; workflow: string } | null;
-          skips: Array<string>;
-          took: Array<string>;
+        {
+          detail: string;
+          generationNumber: number;
+          handle: string;
+          reason: "mismatch" | "migration" | "migrations" | "error";
+          record?: {
+            applied: Array<string>;
+            overlay: Array<
+              | {
+                  anchor: string;
+                  args?: any;
+                  id: string;
+                  kind: "function" | "workflow" | "event" | "sleep";
+                  name: string;
+                  op: "insert";
+                  result: any;
+                  where: "after" | "before";
+                }
+              | {
+                  anchor: string;
+                  args: any;
+                  executedAs?: string;
+                  id: string;
+                  kind: "function" | "workflow" | "event" | "sleep";
+                  name: string;
+                  op: "insertLate";
+                  where: "after" | "before";
+                }
+              | { op: "remove"; target: string }
+              | { args?: any; name?: string; op: "rewrite"; target: string }
+            >;
+          };
+          step?: number;
+          workflow: string;
           workflowId: string;
-        }>,
+        },
+        { first: boolean },
         Name
       >;
-      recorded: FunctionReference<
-        "query",
+      retry: FunctionReference<
+        "mutation",
         "internal",
-        {},
-        Array<{ patchIds: Array<string>; workflow: string }>,
+        { now?: boolean; restartFrom?: number; workflowId: string },
+        boolean,
         Name
       >;
       save: FunctionReference<
         "mutation",
         "internal",
         {
-          markers: Array<{ beforeStepId: string; patchId: string }>;
-          run: { known: Array<string>; workflow: string };
-          skips: Array<{ atStepId: string; patchId: string }>;
-          unskip: Array<string>;
+          applied: Array<string>;
+          overlay: Array<
+            | {
+                anchor: string;
+                args?: any;
+                id: string;
+                kind: "function" | "workflow" | "event" | "sleep";
+                name: string;
+                op: "insert";
+                result: any;
+                where: "after" | "before";
+              }
+            | {
+                anchor: string;
+                args: any;
+                executedAs?: string;
+                id: string;
+                kind: "function" | "workflow" | "event" | "sleep";
+                name: string;
+                op: "insertLate";
+                where: "after" | "before";
+              }
+            | { op: "remove"; target: string }
+            | { args?: any; name?: string; op: "rewrite"; target: string }
+          >;
+          workflow: string;
           workflowId: string;
         },
+        null,
+        Name
+      >;
+      unpause: FunctionReference<
+        "mutation",
+        "internal",
+        { workflowId: string },
         null,
         Name
       >;

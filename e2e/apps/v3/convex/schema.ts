@@ -9,4 +9,6 @@ export default defineSchema({
     log: v.array(v.string()),
     workflowId: v.optional(vWorkflowId),
   }),
+  // One row per onPause call.
+  pauses: defineTable({ workflowId: vWorkflowId, reason: v.string() }).index('workflowId', ['workflowId']),
 });

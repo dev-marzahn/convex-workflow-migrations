@@ -6,8 +6,8 @@ import * as ours from '../src/index.ts';
 // Upstream exports this package replaces or leaves out on purpose.
 const REPLACED = ['WorkflowManager'];
 const LEFT_OUT = {
-  defineWorkflow: "its workflows can't patch; use workflow.define",
-  cleanup: 'leaves patch records behind; use workflow.cleanup',
+  defineWorkflow: "its workflows can't migrate or pause; use workflow.define",
+  cleanup: "leaves the run's record behind; use workflow.cleanup",
 };
 
 test('every upstream export is re-exported, replaced or deliberately left out', () => {

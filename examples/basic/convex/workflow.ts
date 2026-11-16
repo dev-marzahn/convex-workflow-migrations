@@ -1,9 +1,11 @@
 import { WorkflowManager } from '@dev-marzahn/convex-workflow-patches';
 
 import { components } from './_generated/api';
-import declared from './patches';
 
 export const workflow = new WorkflowManager(components.workflow, {
   patches: components.workflowPatches,
-  declared,
+  // A run whose history doesn't match the code pauses instead of failing. Alert on it.
+  onPause: (_ctx, { workflowId, workflow, reason, detail }) => {
+    console.error(`Workflow ${workflow} ${workflowId} paused (${reason}): ${detail}`);
+  },
 });

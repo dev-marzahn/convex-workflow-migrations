@@ -1,6 +1,6 @@
 --- upstream/step.ts
 +++ vendor/step.ts
-@@ -10,16 +10,20 @@
+@@ -10,16 +10,24 @@
    type GenericMutationCtx,
  } from "convex/server";
  import { convexToJson, getConvexSize, type Value } from "convex/values";
@@ -20,42 +20,142 @@
 +import { MAX_JOURNAL_SIZE, formatErrorWithStack } from "./shared.js";
 +import type { EventId, SchedulerOptions } from "./publicTypes.js";
  import { pick } from "convex-helpers";
-+import type { PatchState } from "../../patchState.js";
++import {
++  type HistoryView,
++  type ReplayEntry,
++  ReplayMismatch,
++} from "../../history.js";
  
  export type WorkerResult =
    | { type: "handlerDone"; runResult: RunResult }
-@@ -54,6 +58,9 @@
-   unstableArgs: boolean;
-   transactionLimits: TransactionLimits | undefined;
-   schedulerOptions: SchedulerOptions;
-+  // PATCHES: position of this request among all step calls in this handler
-+  // run, assigned when the call is made. Equals the journal index it replays.
-+  seq: number;
- 
+@@ -58,18 +66,32 @@
    resolve: (result: RunResult) => void;
  };
-@@ -70,6 +77,8 @@
+ 
++// PATCHES: what completeMessage compares a call with: a step of the run's
++// history, or a journal entry this handler run just started. Only history
++// steps have a position, so only they throw ReplayMismatch.
++type Recorded = {
++  step: Pick<Step, "name" | "kind" | "args" | "inProgress" | "runResult">;
++  argsKnown?: boolean;
++  position?: number;
++};
++
+ export class StepExecutor {
+   private journalEntrySize: number;
++  // PATCHES: replay matches calls against the run's history, the journal
++  // with its migrations' edits, instead of the raw journal.
++  private journalEntries: ReplayEntry[];
+ 
+   constructor(
+     private workflowId: string,
+     private generationNumber: number,
+     private ctx: GenericMutationCtx<GenericDataModel>,
+     private component: WorkflowComponent,
+-    private journalEntries: Array<JournalEntry>,
++    journalEntries: Array<JournalEntry>,
      private receiver: BaseChannel<StepRequest>,
      private now: number,
      private workpoolOptions: WorkpoolOptions | undefined,
 +    // PATCHES:
-+    private patchState: PatchState,
++    history: HistoryView,
    ) {
      this.journalEntrySize = journalEntries.reduce(
        (size, entry) => size + getConvexSize(entry),
-@@ -254,6 +263,12 @@
-         workpoolOptions: this.workpoolOptions,
-       },
-     )) as JournalEntry[];
-+    // PATCHES: a marker names the first step issued after each patched()
-+    // call decided at the frontier. The workflow mutation writes them.
-+    this.patchState.takeMarkers(
-+      messages.map((message) => message.seq),
-+      entries.map((entry) => entry._id),
-+    );
-     for (const entry of entries) {
-       this.journalEntrySize += getConvexSize(entry);
-       if (this.journalEntrySize > MAX_JOURNAL_SIZE) {
+@@ -80,6 +102,8 @@
+       // This should never happen, but we'll throw an error just in case.
+       throw new Error(journalSizeError(this.journalEntrySize, this.workflowId));
+     }
++    // PATCHES:
++    this.journalEntries = history.replay(now);
+   }
+   async run(): Promise<WorkerResult> {
+     while (true) {
+@@ -87,6 +111,25 @@
+       // In the future we can correlate the calls to entries by handle, args,
+       // etc. instead of just ordering. As is, the fn order can't change.
+       const entry = this.journalEntries.shift();
++      // PATCHES: a running step blocks replay. The workflow mutation doesn't
++      // replay while a step runs, so only a history given to expectReplays()
++      // has one here.
++      if (entry?.step.inProgress) {
++        this.checkMessage(message, entry);
++        return { type: "executorBlocked" };
++      }
++      // PATCHES: a step a migration inserted with runLate runs now, for real,
++      // and its journal entry takes this position from now on.
++      if (entry?.late) {
++        this.checkMessage(message, entry);
++        const [started] = await this.startSteps([message]);
++        entry.late(started._id);
++        if (!started.step.runResult) {
++          return { type: "executorBlocked" };
++        }
++        message.resolve(started.step.runResult);
++        continue;
++      }
+       if (entry) {
+         this.completeMessage(message, entry);
+         continue;
+@@ -125,36 +168,48 @@
+     };
+   }
+ 
+-  completeMessage(message: StepRequest, entry: JournalEntry) {
++  // PATCHES: takes a step of the history, and the comparison is in checkMessage.
++  completeMessage(message: StepRequest, entry: Recorded) {
+     if (entry.step.inProgress) {
+       throw new Error(
+         `Assertion failed: not blocked but have in-progress journal entry`,
+       );
+     }
++    this.checkMessage(message, entry);
++    if (entry.step.runResult === undefined) {
++      throw new Error(
++        `Assertion failed: no outcome for completed function call`,
++      );
++    }
++    message.resolve(entry.step.runResult);
++  }
++
++  // PATCHES: upstream's comparison, from completeMessage. A stand-in a
++  // migration inserted without args is matched on its name and kind. A
++  // mismatch throws ReplayMismatch, which pauses the run.
++  checkMessage(message: StepRequest, entry: Recorded) {
++    const compareArgs = !message.unstableArgs && entry.argsKnown !== false;
+     const stepFields = pick(
+       entry.step,
+-      message.unstableArgs ? ["name", "kind"] : ["name", "kind", "args"],
++      compareArgs ? ["name", "kind", "args"] : ["name", "kind"],
+     );
+-    const messageFields = message.unstableArgs
++    const messageFields = !compareArgs
+       ? { name: message.name, kind: message.target.kind }
+       : {
+           name: message.name,
+           kind: message.target.kind,
+           args: message.target.args as Value,
+         };
+-    const stepJson = JSON.stringify(convexToJson(stepFields));
++    const stepJson = JSON.stringify(convexToJson(stepFields as Value));
+     const messageJson = JSON.stringify(convexToJson(messageFields));
+     if (stepJson !== messageJson) {
++      if (entry.position !== undefined) {
++        throw new ReplayMismatch(entry.position, messageJson, stepJson);
++      }
+       throw new Error(
+         `Journal entry mismatch:\n\n${stepJson}\n\n!==\n\n${messageJson}`,
+       );
+     }
+-    if (entry.step.runResult === undefined) {
+-      throw new Error(
+-        `Assertion failed: no outcome for completed function call`,
+-      );
+-    }
+-    message.resolve(entry.step.runResult);
+   }
+ 
+   async startSteps(messages: StepRequest[]): Promise<JournalEntry[]> {
 --- upstream/types.ts
 +++ vendor/types.ts
 @@ -1,10 +1,42 @@
@@ -107,7 +207,7 @@
   * validator. Defaults to `unknown` if the workflow has no `returns` validator.
 --- upstream/workflowContext.ts
 +++ vendor/workflowContext.ts
-@@ -10,10 +10,13 @@
+@@ -10,8 +10,10 @@
    FunctionType,
    FunctionVisibility,
  } from "convex/server";
@@ -118,148 +218,10 @@
 +import type { EventId, SchedulerOptions, WorkflowId } from "./publicTypes.js";
  import { safeFunctionName } from "./safeFunctionName.js";
  import type { StepRequest } from "./step.js";
-+import type { PatchState } from "../../patchState.js";
  import type {
-   RunResult,
-   TransactionLimits,
-@@ -73,7 +76,11 @@
-       transactionLimits?: TransactionLimits;
-     };
- 
--export type WorkflowCtx = {
-+// PATCHES: generic over the declared patch ids, so a typo is a type error.
-+export type WorkflowCtx<
-+  ActiveId extends string = string,
-+  DeprecatedId extends string = string,
-+> = {
-   /**
-    * The ID of the workflow currently running.
-    */
-@@ -185,33 +192,78 @@
-    *
-    * Chaining is supported; later defaults override earlier ones.
-    */
--  withOptions(defaults: StepDefaults): WorkflowCtx;
-+  // PATCHES: keeps the patch id types.
-+  withOptions(defaults: StepDefaults): WorkflowCtx<ActiveId, DeprecatedId>;
-+
-+  /**
-+   * PATCHES: Whether this run takes the code path added by patch `id`.
-+   *
-+   * The first time a run reaches this call, it returns `true` and records a
-+   * marker before the next step. On replay it returns `true` only if the run
-+   * has that marker: a run that passed this point under code without the
-+   * patch gets `false` on every replay, and that is recorded as a skip. The
-+   * decision is remembered per run, so every call with the same `id` returns
-+   * the same value. `id` must be in the workflow's `active` list in
-+   * convex/patches.ts.
-+   *
-+   * ```ts
-+   * if (step.patched("add-prepare")) {
-+   *   await step.runAction(internal.media.prepare, { grabId });
-+   * }
-+   * ```
-+   */
-+  patched(id: ActiveId): boolean;
-+
-+  /**
-+   * PATCHES: Mark patch `id` as permanent in this code: the old branch is
-+   * gone. Records the patch for this run like `patched()`, so code that still
-+   * calls `patched(id)` replays it after a rollback. Throws if this run
-+   * passed this point without the patch, because it can no longer replay.
-+   * `id` must be in the workflow's `deprecated` list in convex/patches.ts.
-+   */
-+  deprecatePatch(id: DeprecatedId): void;
- };
- 
-+// PATCHES: step calls go through this, so each gets its position (seq).
-+type RunStep = (request: Omit<StepRequest, "resolve" | "seq">) => Promise<unknown>;
-+
- export function createWorkflowCtx(
-   workflowId: WorkflowId,
-   sender: BaseChannel<StepRequest>,
--  defaults?: StepDefaults,
-+  defaults: StepDefaults | undefined,
-+  // PATCHES:
-+  patchState: PatchState,
- ): WorkflowCtx {
-+  // PATCHES: assigned at the call site, before enqueueing can yield.
-+  const runStep: RunStep = (request) =>
-+    run(sender, { ...request, seq: patchState.nextSeq() });
-   return {
-     workflowId,
-     withOptions: (opts) =>
--      createWorkflowCtx(workflowId, sender, { ...defaults, ...opts }),
-+      createWorkflowCtx(
-+        workflowId,
-+        sender,
-+        { ...defaults, ...opts },
-+        patchState,
-+      ),
-+    // PATCHES:
-+    patched: (id) => patchState.patched(id),
-+    deprecatePatch: (id) => patchState.deprecatePatch(id),
-     runQuery: async (query, args, opts?) => {
--      return runFunction(sender, "query", query, args, opts, defaults);
-+      return runFunction(runStep, "query", query, args, opts, defaults);
-     },
- 
-     runMutation: async (mutation, args, opts?) => {
--      return runFunction(sender, "mutation", mutation, args, opts, defaults);
-+      return runFunction(runStep, "mutation", mutation, args, opts, defaults);
-     },
- 
-     runAction: async (action, args, opts?) => {
--      return runFunction(sender, "action", action, args, opts, defaults);
-+      return runFunction(runStep, "action", action, args, opts, defaults);
-     },
- 
-     runWorkflow: async (workflow, args, opts?) => {
-       const { name, unstableArgs, ...schedulerOptions } = opts ?? {};
--      return run(sender, {
-+      return runStep({
-         name: name ?? safeFunctionName(workflow),
-         target: {
-           kind: "workflow",
-@@ -227,7 +279,7 @@
-     },
- 
-     sleep: async (duration, opts?) => {
--      await run(sender, {
-+      await runStep({
-         name: opts?.name ?? "sleep",
-         target: {
-           kind: "sleep",
-@@ -242,7 +294,7 @@
-     },
- 
-     awaitEvent: async (event) => {
--      const result = await run(sender, {
-+      const result = await runStep({
-         name: event.name ?? event.id ?? "Event",
-         target: {
-           kind: "event",
-@@ -267,7 +319,7 @@
-     | FunctionReference<FunctionType, FunctionVisibility>
-     | FunctionReference_future<FunctionType, FunctionVisibility>,
- >(
--  sender: BaseChannel<StepRequest>,
-+  runStep: RunStep, // PATCHES: was `sender: BaseChannel<StepRequest>`
-   functionType: FunctionType,
-   f: F,
-   args: Record<string, unknown> | undefined,
-@@ -298,7 +350,7 @@
-   if (!inline && transactionLimits) {
-     throw new Error("Cannot set transaction limits for non-inline functions.");
-   }
--  return run(sender, {
-+  return runStep({
-     name: name ?? safeFunctionName(f),
-     target: {
-       kind: "function",
 --- upstream/workflowMutation.ts
 +++ vendor/workflowMutation.ts
-@@ -16,20 +16,28 @@
+@@ -16,20 +16,26 @@
    type PropertyValidators,
    type Validator,
  } from "convex/values";
@@ -285,73 +247,105 @@
    type WorkflowMutationResult,
  } from "./types.js";
  import { createWorkflowCtx } from "./workflowContext.js";
-+import {
-+  PatchState,
-+  type DeclaredPatches,
-+  type PatchesComponent,
-+} from "../../patchState.js";
++import { ReplayMismatch } from "../../history.js";
++import { RunRecord, type WorkflowPatches } from "../../migrations.js";
++import { replayRequest } from "../../testing.js";
  
  export type WorkflowArgs<V extends PropertyValidators, Context = unknown> = {
    /**
-@@ -108,6 +116,8 @@
+@@ -108,6 +114,8 @@
    ReturnsValidator extends Validator<any, "required", any> | void,
  >(
    component: WorkflowComponent,
-+  // PATCHES: the patches component, and the patch ids each workflow declares.
-+  patches: { component: PatchesComponent; declared: DeclaredPatches },
++  // PATCHES: the patches component, and this workflow's migrations.
++  patches: WorkflowPatches,
    registered: WorkflowDefinition<ArgsValidator, ReturnsValidator> & {
      handler: WorkflowHandler<ArgsValidator, ReturnsValidator>;
    },
-@@ -227,7 +237,15 @@
+@@ -156,6 +164,16 @@
+         }
+         assert(validate(vWorkflowArgs, args, { throw: true }));
+       }
++      // PATCHES: expectReplays() and migrate() from /test replay a given
++      // history here, in convex-test, without loading or starting anything.
++      const check =
++        typeof args.workflowId === "string"
++          ? replayRequest(args.workflowId)
++          : undefined;
++      if (check) {
++        await check(ctx, patches, registered, workpoolOptions);
++        return args.workflowId as WorkflowId;
++      }
+       let workflowId: WorkflowId, generationNumber: number;
+ 
+       // Direct call { args: {...}, onComplete?, context?, startAsync? }
+@@ -224,6 +242,19 @@
+           `Assertion failed: not blocked but have in-progress journal entry`,
+         );
+       }
++      // PATCHES: load the run's record and apply its pending migrations, in
++      // memory. A run they can't be applied to pauses, and returns normally
++      // so the workpool doesn't fail it.
++      const run = await RunRecord.load(
++        ctx,
++        patches,
++        workflowId,
++        journalEntries as JournalEntry[],
++      );
++      if (run.blocked) {
++        await run.pause(ctx, generationNumber, run.blocked, console);
++        return workflowId;
++      }
        const channel = new BaseChannel<StepRequest>(
          workpoolOptions.maxParallelism ?? 10,
        );
--      const step = createWorkflowCtx(workflowId, channel);
-+      // PATCHES: load this run's records and track patch decisions.
-+      const workflowName = (await ctx.meta.getFunctionMetadata()).name;
-+      const patchState = new PatchState(
-+        journalEntries as JournalEntry[],
-+        await ctx.runQuery(patches.component.runs.load, { workflowId }),
-+        workflowName,
-+        patches.declared[workflowName] ?? {},
-+      );
-+      const step = createWorkflowCtx(workflowId, channel, undefined, patchState);
-       const executor = new StepExecutor(
-         workflowId,
-         generationNumber,
-@@ -237,6 +255,8 @@
+@@ -237,11 +268,15 @@
          channel,
          Date.now(),
          workpoolOptions,
 +        // PATCHES:
-+        patchState,
++        run.history,
        );
        const restoreEnvironment = setupEnvironment(
          executor.getGenerationState.bind(executor),
-@@ -285,7 +305,25 @@
+         workflowId,
+       );
++      // PATCHES:
++      let mismatch: ReplayMismatch | undefined;
+       try {
+         const handlerWorker = async (): Promise<WorkerResult> => {
+           let runResult: RunResult;
+@@ -285,7 +320,20 @@
          const executorWorker = async (): Promise<WorkerResult> => {
            return await executor.run();
          };
 -        const result = await Promise.race([handlerWorker(), executorWorker()]);
-+        // PATCHES: a journal mismatch in a run that skipped a removed patch
-+        // gets the cause in its message. The mutation still fails.
++        // PATCHES: a replay that doesn't match the history pauses the run.
++        // Calls are matched in order and new steps start only after the last
++        // recorded one, so the pause commits no partial work. The exception
++        // is a step a migration inserted with runLate, which the pause keeps.
 +        let result: WorkerResult;
 +        try {
 +          result = await Promise.race([handlerWorker(), executorWorker()]);
 +        } catch (error) {
-+          const removed = patchState.removedSkips();
-+          if (removed.length === 0 || !String(error).includes("Journal entry mismatch")) throw error;
-+          throw new Error(
-+            `Workflow patch ${removed.map((id) => `"${id}"`).join(", ")} was removed, but ${workflowName} ${workflowId} passed it ` +
-+              `without the patch, so it needs the old branch. Deploy a release that still has it, then restart the run. ` +
-+              formatErrorWithStack(error),
-+          );
++          if (!(error instanceof ReplayMismatch)) throw error;
++          mismatch = error;
++          return workflowId;
 +        }
-+        // PATCHES: record what this handler run decided, in its transaction.
-+        const update = patchState.update();
-+        if (update) {
-+          await ctx.runMutation(patches.component.runs.save, { workflowId, ...update });
-+        }
++        // PATCHES: save what this handler run applied, in its transaction.
++        await run.save(ctx);
          switch (result.type) {
            case "handlerDone": {
              await ctx.runMutation(component.workflow.complete, {
+@@ -305,6 +353,11 @@
+         }
+       } finally {
+         restoreEnvironment();
++        // PATCHES: outside the replay's deterministic Date and console. The
++        // environment can only be restored once.
++        if (mismatch) {
++          await run.pause(ctx, generationNumber, mismatch, console);
++        }
+       }
+       return workflowId;
+     },
