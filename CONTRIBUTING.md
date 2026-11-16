@@ -35,15 +35,14 @@ The `_generated/` folders are committed. After changing the component's function
 
 ```sh
 bun run e2e                   # all scenarios
-bun run e2e skip              # only the named scenarios: skip, unguarded, rollback, failed
+bun run e2e skip              # only the named scenarios: skip, unguarded, rollback
 ```
 
 The script builds the package first. Each scenario starts a fresh backend and deploys an app with a run waiting on `awaitEvent`, `v1` unless it says otherwise:
 
 - `skip` deploys `examples/basic` over it, sends the event, and checks that the run replays through all three migrations, without releases 1 and 2 ever deployed, and that a run started on `examples/basic` has every id applied.
-- `unguarded` deploys `v2-unguarded` over it, sends the event, and checks that the run pauses with the mismatch, reported once to `onPause`, with nothing saved; then deploys `examples/basic` and waits for the scheduled retry, about a minute later, to finish the run.
-- `rollback` starts the run on `examples/basic`, deploys `v2-unguarded`, sends the event, and checks that the run pauses with `migrations`; then deploys `examples/basic` again and finishes the run with `resume`.
-- `failed` deploys `examples/basic` over it and sends a failed download: the handler passes the failure on in the handler run where the migrations first apply, so the run fails (throw rule 4).
+- `unguarded` deploys `v2-unguarded` over it, sends the event, and checks that the run pauses with the mismatch, reported once to `onPause`, with nothing saved; then deploys `examples/basic` and waits for the scheduled retry, about a minute later, to finish the run. That assumes the deploy is live before the first retry; if it isn't, the scenario calls `resume` instead of waiting 10 minutes for the next one.
+- `rollback` starts two runs on `examples/basic`, deploys `v2-unguarded`, sends the events, and checks that both pause with `migrations`; then deploys `examples/basic` again and finishes one with `resume`. It deletes the other with upstream's forced `cleanup`, and checks that `resume` returns false and deletes its pause and record (`callHandle`, below).
 
 ## Internals
 

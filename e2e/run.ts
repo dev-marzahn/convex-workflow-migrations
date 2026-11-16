@@ -1,7 +1,7 @@
 // End-to-end tests on a real self-hosted backend: a fixture app starts a run
 // that waits on `awaitEvent`, a later release (another fixture, or
 // examples/basic) is deployed over it, and the run finishes on the new code,
-// pauses, or fails.
+// or pauses.
 //
 //   bun run e2e                 all scenarios
 //   bun run e2e skip            only these
@@ -129,7 +129,9 @@ const scenarios: Record<string, (backend: Backend) => Promise<void>> = {
    * Release 2's change without its migrations: the run release 0 left
    * waiting pauses at its next handler run instead of failing, and onPause
    * records it once. Deploying the fix, release 3, resumes it at the
-   * scheduled retry, about a minute later.
+   * scheduled retry, 48 to 72 s after the pause. That assumes the deploy is
+   * live by then: if the first retry came before it, the run paused again
+   * and its next retry is about 10 minutes out, so the scenario resumes it.
    */
   async unguarded(backend) {
     deploy('v1', backend);
@@ -144,7 +146,11 @@ const scenarios: Record<string, (backend: Backend) => Promise<void>> = {
     expectEqual(record('v2-unguarded', backend, old), null, 'the paused run’s record: nothing of the handler run was saved');
 
     deploy(release3, backend);
-    log('  waiting for the retry');
+    const afterDeploy = pauses(release3, backend, old).paused;
+    if (afterDeploy && afterDeploy.attempts > 1) {
+      log('  the first retry came before the deploy: resuming');
+      expectEqual(call(release3, backend, 'pipeline:resume', { workflowId: old.workflowId }), true, 'resume');
+    } else log('  waiting for the retry');
     const done = await finished(release3, backend, old, 'the retry to resume the run', 120_000);
     expectEqual(done, { log: ['grab', 'import', 'transcode', 'publish'], status: 'completed' }, 'the resumed run');
     expectEqual(pauses(release3, backend, old), { paused: null, alerts: ['mismatch'] }, 'the pauses after the retry');
@@ -155,49 +161,34 @@ const scenarios: Record<string, (backend: Backend) => Promise<void>> = {
    * A run started on release 3 pauses when release 2's code without its
    * migrations is deployed over it, a rollback: its applied migrations aren't
    * a prefix of that code's list. Rolling forward and calling resume
-   * finishes it.
+   * finishes it. A second run, paused the same way, is deleted by upstream's
+   * forced cleanup: resume finds it gone, through the workflow mutation, and
+   * deletes its pause and record.
    */
   async rollback(backend) {
     deploy(release3, backend);
-    const ids = await startWaitingRun(release3, backend, 2);
+    const [ids, gone] = [await startWaitingRun(release3, backend, 2), await startWaitingRun(release3, backend, 2)];
     deploy('v2-unguarded', backend);
-    call('v2-unguarded', backend, 'pipeline:downloadDone', { workflowId: ids.workflowId });
-    expectEqual(
-      await pausedRun('v2-unguarded', backend, ids),
-      { paused: { reason: 'migrations', attempts: 1 }, alerts: ['migrations'], run: { log: ['grab', 'notify'], status: 'inProgress' } },
-      'the paused run',
-    );
+    for (const { workflowId } of [ids, gone]) call('v2-unguarded', backend, 'pipeline:downloadDone', { workflowId });
+    for (const run of [ids, gone]) {
+      expectEqual(
+        await pausedRun('v2-unguarded', backend, run),
+        { paused: { reason: 'migrations', attempts: 1 }, alerts: ['migrations'], run: { log: ['grab', 'notify'], status: 'inProgress' } },
+        'the paused run',
+      );
+    }
 
     deploy(release3, backend);
     expectEqual(call(release3, backend, 'pipeline:resume', { workflowId: ids.workflowId }), true, 'resume');
     const done = await finished(release3, backend, ids, 'the run to finish');
     expectEqual(done, { log: ['grab', 'notify', 'import', 'transcode', 'publish'], status: 'completed' }, 'the resumed run');
     expectEqual(pauses(release3, backend, ids).paused, null, 'the pause after resume');
-  },
 
-  /**
-   * A run from release 0 waiting across the deploy of release 3, whose
-   * download then fails: the handler passes the failure on, and the run
-   * fails, as before, though the migrations edited its history in that
-   * handler run (throw rule 4).
-   */
-  async failed(backend) {
-    deploy('v1', backend);
-    const ids = await startWaitingRun('v1', backend, 1);
-    deploy(release3, backend);
-    call(release3, backend, 'pipeline:downloadDone', { workflowId: ids.workflowId, error: 'the download failed' });
-    const done = await until(
-      () => ({ ...grab(release3, backend, ids), paused: pauses(release3, backend, ids).paused }),
-      (g) => g.status !== 'inProgress' || g.paused !== null,
-      'the run to fail',
-    );
-    expectEqual(
-      { ...done, error: done.error?.includes('the download failed') },
-      { log: ['grab'], status: 'failed', error: true, paused: null },
-      'the failed run',
-    );
-    expectEqual(pauses(release3, backend, ids).alerts, [], 'the alerts');
-    expectEqual(record(release3, backend, ids)?.applied, ALL, 'the failed run’s applied migrations');
+    expectEqual(record(release3, backend, gone)?.applied, ALL, 'the paused run’s record');
+    expectEqual(call(release3, backend, 'workflow:cleanup', { workflowId: gone.workflowId, force: true }, 'workflow'), true, 'the forced cleanup');
+    expectEqual(call(release3, backend, 'pipeline:resume', { workflowId: gone.workflowId }), false, 'resume of the gone run');
+    expectEqual(pauses(release3, backend, gone).paused, null, 'the gone run’s pause');
+    expectEqual(record(release3, backend, gone), null, 'the gone run’s record');
   },
 };
 

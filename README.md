@@ -131,7 +131,7 @@ A run that can't replay on the current code pauses instead of failing, with the 
 - `migrations`: the ids applied to the run aren't the start of the code's list: a migration was removed, renamed or reordered, or the code was rolled back;
 - `record`: the run's record edits a journal entry that something outside the `WorkflowManager` deleted, such as upstream's standalone `restart({ from })`.
 
-The pause commits nothing of the handler run: no step starts, and the migrations it applied in memory are dropped, so the next attempt migrates again on whatever code is deployed then. `onComplete` doesn't run, and `workflow.status` shows the run as `inProgress`. To find one run's pause, page through `paused` with `workflow` set and look for its `workflowId`, or keep your own flag from `onPause`, as the `alerts` table in `examples/basic` does.
+The pause commits nothing of the handler run: no step starts, and the migrations it applied in memory are dropped, so the next attempt migrates again on whatever code is deployed then. `onComplete` doesn't run, and `workflow.status` shows the run as `inProgress`. To find one run's pause, page through `paused` with `workflow` set and look for its `workflowId`, as `examples/basic` does. What `onPause` records, like that example's `alerts` table, says that the run paused, not that it still is.
 
 **When a throw pauses.** A handler that throws is either reacting to the run, which fails it as upstream would, or tripping over a migration, which pauses it. These rules decide, in order:
 

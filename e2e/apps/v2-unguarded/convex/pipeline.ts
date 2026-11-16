@@ -1,4 +1,4 @@
-import { vWorkflowId, type WorkflowId } from '@dev-marzahn/convex-workflow-migrations';
+import { type PausedRun, vWorkflowId, type WorkflowId } from '@dev-marzahn/convex-workflow-migrations';
 import { v } from 'convex/values';
 
 import { internal } from './_generated/api';
@@ -87,7 +87,13 @@ export const pauses = query({
   args: { workflowId: vWorkflowId },
   returns: v.object({ paused: v.union(v.object({ reason: v.string(), attempts: v.number() }), v.null()), alerts: v.array(v.string()) }),
   handler: async (ctx, { workflowId }) => {
-    const run = (await workflow.paused(ctx)).page.find((paused) => paused.workflowId === workflowId);
+    let run: PausedRun | undefined;
+    let cursor: string | null = null;
+    do {
+      const { page, isDone, continueCursor } = await workflow.paused(ctx, { workflow: 'pipeline:run', cursor });
+      run = page.find((paused) => paused.workflowId === workflowId);
+      cursor = isDone ? null : continueCursor;
+    } while (!run && cursor !== null);
     const alerts = await ctx.db
       .query('alerts')
       .withIndex('workflowId', (q) => q.eq('workflowId', workflowId))
