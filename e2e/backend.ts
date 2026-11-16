@@ -11,12 +11,9 @@ import { setTimeout as sleep } from 'node:timers/promises';
 export const BACKEND_IMAGE = 'ghcr.io/convex/convex-backend:d1fcbeaf939502a23a0f4b7e9095a12e84866294';
 
 export type Backend = {
-  url: string;
   /** Environment for the Convex CLI: this backend, and no other deployment config. */
   env: NodeJS.ProcessEnv;
-  /** The container's name, and the variables another container needs to derive its admin key. */
-  container: string;
-  instance: { name: string; secret: string };
+  /** Removes the container. */
   stop: () => void;
 };
 
@@ -54,7 +51,7 @@ export async function startBackend(name: string, timeoutMs = 120_000): Promise<B
     }
     const adminKey = docker(['exec', name, './generate_admin_key.sh']).trim().split('\n').at(-1)!;
     const env = { ...process.env, CONVEX_SELF_HOSTED_URL: url, CONVEX_SELF_HOSTED_ADMIN_KEY: adminKey, CONVEX_DEPLOYMENT: '', CONVEX_DEPLOY_KEY: '' };
-    return { url, env, container: name, instance, stop };
+    return { env, stop };
   } catch (error) {
     stop();
     throw error;

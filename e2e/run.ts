@@ -18,12 +18,13 @@ import { type Backend, startBackend } from './backend.ts';
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const PREFIX = 'convex-workflow-migrations-e2e';
 
-function sh(cmd: string, args: string[], options: SpawnSyncOptions = {}): string {
+function exec(cmd: string, args: string[], options: SpawnSyncOptions = {}): { stdout: string; stderr: string } {
   const result = spawnSync(cmd, args, { encoding: 'utf8', maxBuffer: 64 << 20, ...options });
-  if (result.status !== 0)
-    throw new Error(`${cmd} ${args.join(' ')} failed:\n${`${String(result.stdout ?? '')}\n${String(result.stderr ?? '')}`.trim().slice(-3000)}`);
-  return String(result.stdout ?? '');
+  const [stdout, stderr] = [String(result.stdout ?? ''), String(result.stderr ?? '')];
+  if (result.status !== 0) throw new Error(`${cmd} ${args.join(' ')} failed:\n${`${stdout}\n${stderr}`.trim().slice(-3000)}`);
+  return { stdout, stderr };
 }
+const sh = (cmd: string, args: string[], options: SpawnSyncOptions = {}) => exec(cmd, args, options).stdout;
 const log = (message: string) => console.log(message);
 
 // ------------------------------------------------------------------ apps ---
@@ -70,11 +71,13 @@ function expectEqual(actual: unknown, expected: unknown, what: string): void {
  * would. Resolved through package.json rather than node_modules/.bin, which a
  * fresh install doesn't link before the first build.
  */
-function cli(app: string, backend: Backend, args: string[]): string {
+function cli(app: string, backend: Backend, args: string[]): { stdout: string; stderr: string } {
   const pkg = join(appDir(app), 'node_modules/@dev-marzahn/convex-workflow-migrations');
   const bin = (JSON.parse(readFileSync(join(pkg, 'package.json'), 'utf8')) as { bin: Record<string, string> }).bin['convex-workflow-migrations']!;
-  return sh(process.execPath, [join(pkg, bin), ...args], { cwd: appDir(app), env: backend.env });
+  return exec(process.execPath, [join(pkg, bin), ...args], { cwd: appDir(app), env: backend.env });
 }
+
+type Exported = { workflowId: string; args: { grabId: string }; steps: { name: string; args: { grabId?: string }; runResult?: unknown }[]; applied?: string[] };
 
 const ALL = ['notify-after-grab', 'import-gets-notified-at', 'prepare-becomes-transcode'];
 
@@ -103,16 +106,19 @@ const scenarios: Record<string, (backend: Backend) => Promise<void>> = {
     const old = await startWaitingRun('v1', backend, 1);
 
     // The export a developer would feed to expectReplays(): release 0's journal, no record yet.
-    const exported = JSON.parse(cli('v3', backend, ['histories', 'pipeline:run'])) as {
-      workflowId: string;
-      steps: { name: string; runResult?: unknown }[];
-      applied?: unknown;
-    }[];
+    const plain = cli('v3', backend, ['histories', 'pipeline:run']);
+    const exported = JSON.parse(plain.stdout) as Exported[];
     expectEqual(
       exported.map((h) => ({ workflowId: h.workflowId, steps: h.steps.map((s) => `${s.name}${s.runResult ? '' : ' (running)'}`), applied: h.applied })),
       [{ workflowId: old.workflowId, steps: ['pipeline:grab', 'downloadDone (running)'], applied: undefined }],
       'the exported histories',
     );
+    expectEqual(plain.stderr.includes('The export holds production data'), true, 'the warning about production data');
+    // Scrubbed: the run's args and every step's.
+    const redacted = cli('v3', backend, ['histories', 'pipeline:run', '--redact', join(ROOT, 'e2e/redact.ts')]);
+    const scrubbed = JSON.parse(redacted.stdout) as Exported[];
+    expectEqual([scrubbed[0]!.args.grabId, ...scrubbed[0]!.steps.map((s) => s.args.grabId)], ['redacted', 'redacted', undefined], 'the redacted grab ids');
+    expectEqual(redacted.stderr.includes('Scrubbed with'), true, 'the note about the scrubbed export');
 
     deploy('v3', backend);
     const fresh = await startWaitingRun('v3', backend, 2);
@@ -136,7 +142,7 @@ const scenarios: Record<string, (backend: Backend) => Promise<void>> = {
     for (const ids of [old, fresh]) expectEqual(pauses('v3', backend, ids), { paused: null, alerts: [] }, 'pauses');
 
     // With a record, the export has the applied migrations.
-    const after = JSON.parse(cli('v3', backend, ['histories', 'pipeline:run', '--recent', '1'])) as { workflowId: string; applied?: string[] }[];
+    const after = JSON.parse(cli('v3', backend, ['histories', 'pipeline:run', '--recent', '1']).stdout) as Exported[];
     expectEqual(after.length, 1, 'histories exported with --recent 1');
     expectEqual(after[0]!.applied, ALL, 'the exported applied migrations');
   },
@@ -200,6 +206,41 @@ const scenarios: Record<string, (backend: Backend) => Promise<void>> = {
       'the run to finish',
     );
     expectEqual(done, { log: ['grab', 'notify', 'import', 'transcode', 'publish'], status: 'completed' }, 'the resumed run');
+  },
+
+  /**
+   * Release 4 makes the workflow take a channel. A run started on release 3
+   * pauses on release 4's code without the migration that gives old runs
+   * one, instead of failing its args check; after release 4 is deployed with
+   * it, resumeAll resumes the run without waiting for its retry.
+   */
+  async args(backend) {
+    deploy('v3', backend);
+    const ids = await startWaitingRun('v3', backend, 2);
+    deploy('v4-unguarded', backend);
+    call('v4-unguarded', backend, 'pipeline:downloadDone', { workflowId: ids.workflowId });
+    const paused = await until(
+      () => ({ ...pauses('v4-unguarded', backend, ids), run: grab('v4-unguarded', backend, ids) }),
+      (p) => p.paused !== null || p.run.status !== 'inProgress',
+      'the run to pause',
+    );
+    expectEqual(
+      paused,
+      { paused: { reason: 'args', attempts: 1 }, alerts: ['args'], run: { log: ['grab', 'notify'], status: 'inProgress' } },
+      'the paused run',
+    );
+
+    deploy('v4', backend);
+    call('v4', backend, 'pipeline:resumeAll', {});
+    // Its scheduled retry is a minute after the pause, later than this.
+    const done = await until(
+      () => grab('v4', backend, ids),
+      (g) => g.status !== 'inProgress',
+      'resumeAll to resume the run',
+      20_000,
+    );
+    expectEqual(done, { log: ['grab', 'notify', 'import', 'transcode', 'publish default'], status: 'completed' }, 'the resumed run');
+    expectEqual(record('v4', backend, ids)?.applied, [...ALL, 'channel-arg'], 'the applied migrations');
   },
 };
 

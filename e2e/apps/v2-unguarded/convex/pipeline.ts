@@ -86,7 +86,7 @@ export const pauses = query({
   args: { workflowId: vWorkflowId },
   returns: v.object({ paused: v.union(v.object({ reason: v.string(), attempts: v.number() }), v.null()), alerts: v.array(v.string()) }),
   handler: async (ctx, { workflowId }) => {
-    const paused = (await workflow.paused(ctx)).find((run) => run.workflowId === workflowId);
+    const paused = (await workflow.paused(ctx)).page.find((run) => run.workflowId === workflowId);
     const alerts = await ctx.db
       .query('pauses')
       .withIndex('workflowId', (q) => q.eq('workflowId', workflowId))
@@ -99,4 +99,13 @@ export const resume = mutation({
   args: { workflowId: vWorkflowId },
   returns: v.boolean(),
   handler: async (ctx, { workflowId }) => await workflow.resume(ctx, workflowId),
+});
+
+export const resumeAll = mutation({
+  args: {},
+  returns: v.null(),
+  handler: async (ctx) => {
+    await workflow.resumeAll(ctx, { workflow: 'pipeline:run' });
+    return null;
+  },
 });

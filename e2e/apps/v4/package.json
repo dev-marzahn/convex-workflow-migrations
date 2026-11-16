@@ -1,0 +1,12 @@
+{
+  "name": "e2e-app-v4",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@convex-dev/workflow": "catalog:",
+    "@convex-dev/workpool": "catalog:",
+    "@dev-marzahn/convex-workflow-migrations": "workspace:*",
+    "convex": "catalog:",
+    "convex-helpers": "catalog:"
+  }
+}
