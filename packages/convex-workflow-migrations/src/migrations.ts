@@ -51,7 +51,7 @@ export type PauseInfo = {
   step?: number;
   /** How many attempts the run has had: the first pause, and every scheduled retry, each counted when it starts. 1 the first time. */
   attempts: number;
-  /** Why the run was paused before, if it was: `onPause` is called again when the reason or the step changes. */
+  /** Why the run was paused before, if it was: `onPause` is called again when the reason, the step or the detail changes. */
   previousReason?: ReplayReason;
 };
 
@@ -209,15 +209,16 @@ export async function recordStart(ctx: MutationCtx, migrations: WorkflowMigratio
 /**
  * Upstream's `journal.load`, for the vendored workflow mutation. If the
  * workflow is gone but the run has a record or a pause, for example a paused
- * child workflow its parent's cleanup deleted, deletes them and returns
- * undefined: its retries would otherwise fail forever. Throws upstream's
- * error for a workflow this package never saw.
+ * child workflow its parent's cleanup deleted, deletes the record and returns
+ * undefined: its retries would otherwise fail forever. The retry or `resume`
+ * that called the workflow mutation ends the pause, as for a finished run.
+ * Throws upstream's error for a workflow this package never saw.
  */
 export async function loadJournal(ctx: MutationCtx, component: WorkflowComponent, migrations: WorkflowMigrations, workflowId: WorkflowId) {
   try {
     return await ctx.runQuery(component.journal.load, { workflowId, shortCircuit: true });
   } catch (error) {
-    if (!isWorkflowNotFound(error, workflowId) || !(await ctx.runMutation(migrations.component.runs.cleanup, { workflowId }))) throw error;
+    if (!isWorkflowNotFound(error, workflowId) || !(await ctx.runMutation(migrations.component.runs.cleanup, { workflowId, keepPause: true }))) throw error;
     console.warn(`Workflow ${workflowId} is gone, so its record in the migrations component was deleted.`);
     return undefined;
   }

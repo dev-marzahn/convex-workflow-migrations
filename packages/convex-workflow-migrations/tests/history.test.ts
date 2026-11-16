@@ -297,15 +297,29 @@ const failed = (step: RecordedStep): RecordedStep => ({ ...step, runResult: { ki
 const atEnd = (h: HistoryView) => h.insertAfter(fn.importFiles, fn.publish, { result: null, atEnd: true });
 test.each([
   ['1: a step past the history started', journal(), () => {}, { started: true }, [], undefined],
-  ['2: a recorded step is left', journal(), () => {}, { next: { position: 1 }, started: false }, [], 'before step 1 of its history'],
-  ['3: the last step it got is a stand-in', journal(), atEnd, { started: false }, ['m'], 'after step 3 of its history, which a migration'],
+  [
+    '2: a recorded step is left',
+    journal(),
+    () => {},
+    { next: { position: 1 }, started: false },
+    [],
+    "The handler threw before step 1 of its history (rule 2: a recorded step is left that the handler hasn't replayed): oops",
+  ],
+  [
+    '3: the last step it got is a stand-in',
+    journal(),
+    atEnd,
+    { started: false },
+    ['m'],
+    'The handler threw after step 3 of its history (rule 3: the last step the handler got is a stand-in, or has a result a migration changed): oops',
+  ],
   [
     '3: the last step it got has a changed result',
     journal(),
     (h: HistoryView) => h.updateResult(fn.importFiles, () => 1),
     { started: false },
     [],
-    'after step 2',
+    'after step 2 of its history (rule 3:',
   ],
   [
     '4: the newest steps include a failure',
@@ -316,12 +330,28 @@ test.each([
     undefined,
   ],
   [
-    '5, not 4: a migration rewrote the failure',
+    '4: a migration renamed the failure',
     [...journal().slice(0, 2), failed(journal()[2]!)],
     (h: HistoryView) => h.rename(fn.importFiles, fn.load),
     { started: false },
     ['m'],
-    'after migrations "m" changed',
+    undefined,
+  ],
+  [
+    '4: a migration gave the failure new args',
+    [...journal().slice(0, 2), failed(journal()[2]!)],
+    (h: HistoryView) => h.updateArgs(fn.importFiles, (args) => ({ ...args, notifiedAt: null })),
+    { started: false },
+    ['m'],
+    undefined,
+  ],
+  [
+    '5, not 4: a migration removed the failure',
+    [...journal().slice(0, 2), failed(journal()[2]!)],
+    (h: HistoryView) => h.remove(fn.importFiles),
+    { started: false },
+    ['m'],
+    'after migrations "m" changed its history (rule 5:',
   ],
   [
     '5, not 4: the failure is last only because a migration removed the steps after it',
@@ -329,9 +359,16 @@ test.each([
     (h: HistoryView) => h.remove(fn.importFiles),
     { started: false },
     ['m'],
-    'after migrations "m" changed',
+    'after migrations "m" changed its history (rule 5:',
   ],
-  ['5: migrations edited the history in this handler run', journal(), () => {}, { started: false }, ['m'], 'after migrations "m" changed its history: oops'],
+  [
+    '5: migrations edited the history in this handler run',
+    journal(),
+    () => {},
+    { started: false },
+    ['m'],
+    'The handler threw after migrations "m" changed its history (rule 5: migrations edited the history in this handler run): oops',
+  ],
   ['6: otherwise', journal(), () => {}, { started: false }, [], undefined],
 ] as const)('throw rule %s', (_, steps, edit, progress, edited, detail) => {
   const h = new HistoryView(steps);

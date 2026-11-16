@@ -7,7 +7,7 @@ import type { FunctionReference, GenericDataModel, GenericMutationCtx, Registere
 
 import type { History, HistoryStep, RecordedHistory, RecordedStep, StepKind } from './history.ts';
 import { type Prepared, prepareRun } from './migrations.ts';
-import { argsValid, REPLAY, ReplayError, replayHandler, type ReplayTarget } from './replay.ts';
+import { argsValid, REPLAY, ReplayError, replayHandler, type ReplayTarget, RULE } from './replay.ts';
 import { setupEnvironment } from './vendor/workflow/environment.ts';
 import type { WorkflowId } from './vendor/workflow/publicTypes.ts';
 import { safeFunctionName } from './vendor/workflow/safeFunctionName.ts';
@@ -110,7 +110,7 @@ async function replayHistory(replay: ReplayTarget, recorded: RecordedHistory, pr
     const result = await replayHandler(replay.definition, prepared, executor, options);
     if (result instanceof ReplayError) return `(${result.reason}): ${result.message}`;
     if (result.type === 'handlerDone' && result.runResult.kind === 'failed' && !prepared.history.endsInFailure()) {
-      return `(fails): The handler threw replaying the history, which fails the run: ${result.runResult.error.split('\n')[0]}`;
+      return `(fails): The handler threw replaying the history, which fails the run (${RULE[6]}): ${result.runResult.error.split('\n')[0]}`;
     }
   } catch (error) {
     if (!(error instanceof Frontier)) throw error;
@@ -123,8 +123,9 @@ async function replayHistory(replay: ReplayTarget, recorded: RecordedHistory, pr
 /**
  * Replays each history, with the migrations of `workflow` (the mutation
  * `workflow.define` returned), against its current handler, as a handler run
- * would, and throws for those that don't replay, with the reason and the
- * migrated history. An `updateResult` that changes its own output when run
+ * would, and throws for those that don't replay, with the reason (for a
+ * handler that throws, the throw rule that applies) and the migrated
+ * history. An `updateResult` that changes its own output when run
  * on it again fails too, and so does a handler that throws (README, "Testing").
  */
 export async function expectReplays(workflow: Workflow, histories: readonly RecordedHistory[]): Promise<void> {

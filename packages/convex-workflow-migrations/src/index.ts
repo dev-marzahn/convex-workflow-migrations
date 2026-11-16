@@ -73,11 +73,11 @@ export type WorkflowManagerOptions = {
   migrationsComponent: MigrationsComponent;
   /**
    * Called when a run pauses instead of failing, in the transaction that
-   * pauses it, and again when a retry pauses it for another reason or at
-   * another step. `ctx` is the workflow mutation's: cast it to your app's
-   * `MutationCtx` to use your tables. An error it throws is logged; the run
-   * stays paused. Required, since nothing else reports a paused run: pass
-   * `null` to opt out.
+   * pauses it, and again when a retry pauses it for another reason, at
+   * another step or with another detail. `ctx` is the workflow mutation's:
+   * cast it to your app's `MutationCtx` to use your tables. An error it
+   * throws is logged; the run stays paused. Required, since nothing else
+   * reports a paused run: pass `null` to opt out.
    */
   onPause: ((ctx: GenericMutationCtx<GenericDataModel>, info: PauseInfo) => void | Promise<void>) | null;
   workpoolOptions?: WorkpoolOptions;
@@ -196,12 +196,15 @@ export class WorkflowManager extends UpstreamWorkflowManager {
 
   /**
    * Retries a paused run now, in one transaction, for example after
-   * deploying a fix. Returns whether it got past its pause; if not, it stays
-   * paused, and its attempts and next retry stay as they were. Throws if the
-   * run isn't paused, and so does an error from the workflow mutation.
+   * deploying a fix. Returns true if the run replayed past its pause.
+   * Otherwise false: either it paused again, and its attempts and next retry
+   * stay as they were, or its pause ended without a replay, because upstream
+   * finished or canceled it past the manager, it's at another generation, or
+   * it's gone. Throws if the run isn't paused, and so does an error from the
+   * workflow mutation.
    */
   public async resume(ctx: MutationCtx | ActionCtx, workflowId: WorkflowId): Promise<boolean> {
-    return !(await ctx.runMutation(this.migrationsComponent.runs.resume, { workflowId }));
+    return await ctx.runMutation(this.migrationsComponent.runs.resume, { workflowId });
   }
 
   /**

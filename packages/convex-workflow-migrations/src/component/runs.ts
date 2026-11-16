@@ -34,19 +34,21 @@ const pauseRow = (ctx: QueryCtx, workflowId: string) =>
 
 /**
  * Calls a paused run's workflow mutation with the generation it paused at, as
- * upstream's workpool calls it after every step. Returns whether the run is
- * still paused. A workflow mutation that returned without replaying (the run
- * finished, or is at another generation) leaves the pause as it was: that
- * ends the pause too.
+ * upstream's workpool calls it after every step. Returns `resumed` if the run
+ * replayed past its pause (its `save` ended the pause), `paused` if it paused
+ * again, and `ended` if the workflow mutation returned without replaying and
+ * left the pause as it was: the run had finished or was canceled past the
+ * manager, is at another generation, or is gone (`cleanup` with `keepPause`).
+ * That ends the pause here.
  */
-async function callHandle(ctx: MutationCtx, paused: Doc<'pauses'>): Promise<boolean> {
+async function callHandle(ctx: MutationCtx, paused: Doc<'pauses'>): Promise<'resumed' | 'paused' | 'ended'> {
   const handle = paused.handle as FunctionHandle<'mutation', { workflowId: string; generationNumber: number }>;
   await ctx.runMutation(handle, { workflowId: paused.workflowId, generationNumber: paused.generationNumber });
   const after = await pauseRow(ctx, paused.workflowId);
-  if (!after) return false;
-  if (after.pausedRuns !== paused.pausedRuns) return true;
+  if (!after) return 'resumed';
+  if (after.pausedRuns !== paused.pausedRuns) return 'paused';
   await ctx.db.delete('pauses', after._id);
-  return false;
+  return 'ended';
 }
 
 /**
@@ -85,16 +87,18 @@ export const save = mutation({
 
 /**
  * Deletes a run's record and its pause: for `WorkflowManager.cleanup`, after
- * upstream's, and for a paused run whose workflow is gone. Returns whether it
- * deleted anything.
+ * upstream's, and for a paused run whose workflow is gone. That one passes
+ * `keepPause`: only a retry or `resume` calls its workflow mutation, and
+ * `callHandle` ends the pause, so it can tell that the run didn't replay.
+ * Returns whether the run had a record or a pause.
  */
 export const cleanup = mutation({
-  args: { workflowId: v.string() },
+  args: { workflowId: v.string(), keepPause: v.optional(v.boolean()) },
   returns: v.boolean(),
-  handler: async (ctx, { workflowId }) => {
+  handler: async (ctx, { workflowId, keepPause }) => {
     const [current, paused] = [await row(ctx, workflowId), await pauseRow(ctx, workflowId)];
     if (current) await ctx.db.delete('runs', current._id);
-    if (paused) await ctx.db.delete('pauses', paused._id);
+    if (paused && !keepPause) await ctx.db.delete('pauses', paused._id);
     return current !== null || paused !== null;
   },
 });
@@ -103,8 +107,9 @@ export const cleanup = mutation({
  * Pauses a run, in the handler run's transaction, which saves nothing else.
  * The first pause counts the first attempt and schedules a retry. A run paused
  * again, by a retry or `resume`, keeps its attempts and its scheduled retry.
- * Returns whether to call `onPause`: on the first pause, and when the reason
- * or the step changed.
+ * Returns whether to call `onPause`: on the first pause, and when the reason,
+ * the step or the detail changed. The detail is the same for the same code,
+ * and a `migration`, `migrations`, `args` or `record` pause has no step.
  */
 export const pause = mutation({
   args: {
@@ -132,7 +137,7 @@ export const pause = mutation({
         lastError: undefined,
         pausedRuns: before.pausedRuns + 1,
       });
-      const notify = before.reason !== pause.reason || before.step !== pause.step;
+      const notify = before.reason !== pause.reason || before.step !== pause.step || before.detail !== fields.detail;
       return { notify, attempts: before.attempts, previousReason: before.reason };
     }
     const at = Date.now();
@@ -193,7 +198,7 @@ export const attempt = mutation({
  * For `WorkflowManager.resume`: calls a paused run's workflow mutation now, in
  * this transaction, so its errors reach the caller. It doesn't count an
  * attempt, and leaves the scheduled retry as it was. Throws if the run isn't
- * paused. Returns whether it's still paused.
+ * paused. Returns whether the run replayed past its pause (`callHandle`).
  */
 export const resume = mutation({
   args: { workflowId: v.string() },
@@ -201,7 +206,7 @@ export const resume = mutation({
   handler: async (ctx, { workflowId }) => {
     const paused = await pauseRow(ctx, workflowId);
     if (!paused) throw new Error(`resume: workflow ${workflowId} isn't paused.`);
-    return await callHandle(ctx, paused);
+    return (await callHandle(ctx, paused)) === 'resumed';
   },
 });
 

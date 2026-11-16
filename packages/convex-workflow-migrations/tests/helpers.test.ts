@@ -134,7 +134,9 @@ test('expectReplays reports the history, the position, both calls and the migrat
 test('expectReplays reports a handler that throws while replaying, as the reason the run would pause or fail, but not one passing on a failure it got', async () => {
   // As at runtime: a recorded step is left that the handler didn't replay (throw rule 2).
   const message = await failure(expectReplays(workflows.badStandIn, [release0Waiting]));
-  expect(message).toContain(`(threw): The handler threw before step 2 of its history: Cannot read properties of null (reading 'at')`);
+  expect(message).toContain(
+    `(threw): The handler threw before step 2 of its history (rule 2: a recorded step is left that the handler hasn't replayed): Cannot read properties of null (reading 'at')`,
+  );
   // Nothing a migration did: at runtime the run fails (rule 6), and the history doesn't replay.
   const throwing = manager.define({
     args: {},
@@ -144,10 +146,12 @@ test('expectReplays reports a handler that throws while replaying, as the reason
     },
   });
   expect(await failure(expectReplays(throwing, [history([{ step: flows.grab }])]))).toContain(
-    '(fails): The handler threw replaying the history, which fails the run: Error: broken handler',
+    '(fails): The handler threw replaying the history, which fails the run (rule 6: no earlier rule applies): Error: broken handler',
   );
   // The download failed, and the handler throws that: the run fails, as it did (rule 4).
   await expectReplays(workflows.current, [history([{ step: flows.grab }, { event: 'downloadDone', error: 'the download failed' }])]);
+  // So does a prepare that failed, though a migration renamed it to transcode (rule 4, not 5).
+  await expectReplays(workflows.current, [history([{ step: flows.grab }, { event: 'downloadDone' }, { step: flows.prepare, error: 'it broke' }])]);
 });
 
 test('expectReplays reports code that returns before the end of the history', async () => {

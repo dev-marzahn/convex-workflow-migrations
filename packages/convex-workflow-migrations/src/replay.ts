@@ -94,6 +94,14 @@ export function returnedEarly(history: HistoryView, { next }: ReplayProgress): R
   return new ReplayError('mismatch', `${MISMATCH(next.position)}: the code returned before it, the history has ${step}`, next.position);
 }
 
+/** The throw rules a pause's `detail` and `expectReplays` name, by their numbers in the README's "Pausing and recovery". */
+export const RULE = {
+  2: "rule 2: a recorded step is left that the handler hasn't replayed",
+  3: 'rule 3: the last step the handler got is a stand-in, or has a result a migration changed',
+  5: 'rule 5: migrations edited the history in this handler run',
+  6: 'rule 6: no earlier rule applies',
+} as const;
+
 /**
  * Whether a handler that threw pauses the run instead of failing it, by the
  * rules in the README's "Pausing and recovery", in their order. The run:
@@ -102,24 +110,25 @@ export function returnedEarly(history: HistoryView, { next }: ReplayProgress): R
  *    step's writes commit;
  * 2. pauses if a recorded step is left that the handler hasn't replayed;
  * 3. pauses if the last step it got is a stand-in or has a changed result;
- * 4. fails if the newest recorded steps include a failure no migration
- *    rewrote: the handler is passing it on;
+ * 4. fails if the newest recorded steps include a failure still in the
+ *    history, renamed or re-argued or not: the handler is passing it on;
  * 5. pauses if migrations edited its history in this handler run (`edited`);
  * 6. fails otherwise.
+ *
+ * A pause's message names its rule (`RULE`).
  */
 export function threwEarly(history: HistoryView, progress: ReplayProgress, error: unknown, edited: readonly string[]): ReplayError | undefined {
   if (error instanceof ReplayError) return error;
   if (progress.started) return undefined;
   const next = progress.next?.position ?? history.length;
-  if (history.recordedFrom(next)) return new ReplayError('threw', `The handler threw before step ${next} of its history: ${message(error)}`, next);
+  if (history.recordedFrom(next)) return new ReplayError('threw', `The handler threw before step ${next} of its history (${RULE[2]}): ${message(error)}`, next);
   if (next > 0 && history.fromMigration(next - 1)) {
-    const detail = `The handler threw after step ${next - 1} of its history, which a migration inserted or changed: ${message(error)}`;
-    return new ReplayError('threw', detail, next - 1);
+    return new ReplayError('threw', `The handler threw after step ${next - 1} of its history (${RULE[3]}): ${message(error)}`, next - 1);
   }
   if (history.endsInFailure()) return undefined;
   if (edited.length > 0) {
     const ids = edited.map((id) => `"${id}"`).join(', ');
-    return new ReplayError('threw', `The handler threw after migrations ${ids} changed its history: ${message(error)}`);
+    return new ReplayError('threw', `The handler threw after migrations ${ids} changed its history (${RULE[5]}): ${message(error)}`);
   }
   return undefined;
 }

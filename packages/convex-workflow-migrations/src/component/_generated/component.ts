@@ -34,7 +34,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
       cleanup: FunctionReference<
         "mutation",
         "internal",
-        { workflowId: string },
+        { keepPause?: boolean; workflowId: string },
         boolean,
         Name
       >;

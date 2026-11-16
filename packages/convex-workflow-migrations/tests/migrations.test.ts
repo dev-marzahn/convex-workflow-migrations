@@ -40,10 +40,13 @@ const flows = anyApi.flows!;
 // Every step records that it ran, with its args.
 const ran: string[] = [];
 const completions: string[] = [];
+/** Set by a test: called as each step runs, after it's recorded in `ran`; it can deploy, or throw to fail the step. */
+let duringStep: ((name: string) => void) | undefined;
 const stepFn = (name: string, returns: unknown = null) =>
   internalMutationGeneric({
     handler: async (_ctx, args: Record<string, unknown>) => {
       ran.push(Object.keys(args).length > 0 ? `${name} ${JSON.stringify(args)}` : name);
+      duringStep?.(name);
       return returns;
     },
   });
@@ -96,6 +99,12 @@ const releases = {
   broken: release({ notify: true }, [
     migration('broken', () => {
       throw new Error('oops');
+    }),
+  ]),
+  // The same migration, throwing something else.
+  brokenOtherwise: release({ notify: true }, [
+    migration('broken', () => {
+      throw new Error('still broken');
     }),
   ]),
   // Release 2 with a stand-in whose result the handler can't read `at` of.
@@ -198,6 +207,7 @@ beforeEach(() => {
   onPauseThrows = false;
   whilePausing = undefined;
   raceCall = undefined;
+  duringStep = undefined;
 });
 afterEach(() => vi.useRealTimers());
 
@@ -330,7 +340,7 @@ test.each([
     'badStandIn',
     [],
     'threw',
-    `The handler threw after migrations "notify-after-grab" changed its history: Cannot read properties of null (reading 'at')`,
+    `The handler threw after migrations "notify-after-grab" changed its history (rule 5: migrations edited the history in this handler run): Cannot read properties of null (reading 'at')`,
     'r2',
   ],
 ] as const)('a run that cannot replay pauses, saves nothing, and resume replays it once the code is fixed: %s', async (_, to, applied, reason, detail, fix) => {
@@ -384,7 +394,8 @@ test('a handler run that pauses starts no step, though another branch calls one 
   startSteps.mockRestore();
   expect(await paused(t, id)).toMatchObject({
     reason: 'threw',
-    detail: 'The handler threw after migrations "notify-after-grab" changed its history: the files are not ready',
+    detail:
+      'The handler threw after migrations "notify-after-grab" changed its history (rule 5: migrations edited the history in this handler run): the files are not ready',
   });
   expect(await steps(t, id)).toEqual(['grab', 'downloadDone']);
   expect(ran).toEqual(['grab']);
@@ -400,6 +411,31 @@ test('a step that fails in the handler run where a migration first applies fails
   expect([await paused(t, id), pauses, completions]).toEqual([undefined, [], ['failed']]);
   expect((await record(t, id))?.applied).toEqual(['notify-after-grab']);
 });
+
+test.each([
+  // Release 3's import-gets-notified-at gives the failed import new args.
+  ['importFiles', 'r1', 'import', ['grab', 'notify', 'import']],
+  // Its prepare-becomes-transcode renames the failed prepare.
+  ['prepare', 'r2', 'prepare', ['grab', 'notify', 'import {"notifiedAt":1234}', 'prepare']],
+] as const)(
+  'a run waiting on %s when release 3 deploys fails when that step fails, though a migration rewrote the step: the handler passes the failure on',
+  async (_, from, failing, log) => {
+    const t = setup();
+    deploy(from);
+    const id = await start(t);
+    // Release 3 deploys while the step runs, and the step fails.
+    duringStep = (name) => {
+      if (name !== failing) return;
+      deploy('r3');
+      throw new Error('the step broke');
+    };
+    await downloadDone(t, id);
+    const result = await status(t, id);
+    expect(result.type === 'failed' && result.error).toContain('the step broke');
+    expect([await paused(t, id), pauses, completions, ran]).toEqual([undefined, [], ['failed'], log]);
+    expect((await record(t, id))?.applied).toEqual(ALL);
+  },
+);
 
 test("a pause's detail is cut, so a huge argument can't make the pause too big to store", async () => {
   const t = setup();
@@ -443,7 +479,7 @@ test('a retry is write-ahead: an attempt whose workflow mutation throws, or that
   expect(await status(t, id)).toEqual(completed);
 });
 
-test('onPause is called again when the reason or the step changes, with the attempts and the reason before; one that throws is logged', async () => {
+test('onPause is called again when the reason, the step or the detail changes, with the attempts and the reason before; one that throws is logged', async () => {
   const t = setup();
   const id = await start(t);
   deploy('unguarded');
@@ -461,12 +497,17 @@ test('onPause is called again when the reason or the step changes, with the atte
   await resume(t, id);
   deploy('broken'); // another reason, and still no step
   await resume(t, id);
+  deploy('brokenOtherwise'); // the same reason, no step, another detail
+  await resume(t, id);
+  await resume(t, id); // the same detail again: no alert
   expect(pauses.map((p) => [p.reason, p.step, p.attempts, p.previousReason])).toEqual([
     ['mismatch', 1, 1, undefined],
     ['mismatch', 0, 1, 'mismatch'],
     ['threw', undefined, 1, 'mismatch'],
     ['migration', undefined, 1, 'threw'],
+    ['migration', undefined, 1, 'migration'],
   ]);
+  expect(pauses.slice(-2).map((p) => p.detail)).toEqual(['Migration "broken" threw: oops', 'Migration "broken" threw: still broken']);
   expect(await status(t, id)).toMatchObject({ type: 'inProgress' });
 });
 
@@ -487,6 +528,27 @@ test('resume retries now, says whether the run got past its pause, and throws fo
   // The retry the pause scheduled finds nothing to do.
   await settle(t, 700_000);
   expect(ran).toEqual(['grab', 'import', 'prepare', 'publish']);
+});
+
+test('resume returns false when the pause ends without a replay: upstream finished or canceled the run past the manager, or it is gone', async () => {
+  const t = setup();
+  const [finished, canceled, gone] = [await start(t), await start(t), await start(t)];
+  deploy('unguarded');
+  await downloadAll(t, [finished, canceled, gone]);
+  await t.run(async (ctx) => {
+    const { workflow } = await ctx.runQuery(components.workflow.workflow.getStatus, { workflowId: finished });
+    const runResult = { kind: 'failed' as const, error: 'gave up' };
+    await ctx.runMutation(components.workflow.workflow.complete, { workflowId: finished, generationNumber: workflow.generationNumber, runResult });
+    // Canceling bumps the generation, so the workflow mutation returns at the generation check.
+    await ctx.runMutation(components.workflow.workflow.cancel, { workflowId: canceled });
+    await ctx.runMutation(components.workflow.workflow.cleanup, { workflowId: gone, force: true });
+  });
+  for (const id of [finished, canceled, gone]) {
+    expect(await resume(t, id)).toBe(false);
+    expect(await paused(t, id)).toBeUndefined();
+  }
+  expect([await status(t, finished), await status(t, canceled)]).toEqual([{ type: 'failed', error: 'gave up' }, { type: 'canceled' }]);
+  expect([(await record(t, finished))?.applied, await record(t, gone)]).toEqual([[], null]);
 });
 
 test("fail completes a paused run as failed and ends its pause, in the caller's transaction", async () => {

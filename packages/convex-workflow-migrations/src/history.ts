@@ -107,8 +107,6 @@ type Node = {
   recorded?: RecordedStep;
   /** A stand-in's result, or a recorded step's as `updateResult` changed it. */
   result?: { value: unknown };
-  /** Whether a `rewrite` changed its name, args or result. */
-  rewritten?: boolean;
 };
 
 const REWRITTEN = ['name', 'args', 'result'] as const;
@@ -271,15 +269,15 @@ export class HistoryView implements History {
   /**
    * Whether the newest recorded steps (the journal entries with its latest
    * start time: those the last handler run that started steps started)
-   * include one still in the history that failed or was canceled, and that no
-   * migration rewrote. Read from the journal, before migrations: if one
-   * removed those steps, the failure that's last now is an older one.
+   * include one still in the history that failed or was canceled. Read from
+   * the journal, before migrations: if one removed those steps, the failure
+   * that's last now is an older one. A migration that renamed such a step or
+   * gave it new args doesn't change that it failed, and `updateResult` throws
+   * on it, so its failure is what replay gives the handler.
    */
   public endsInFailure(): boolean {
     const newest = Math.max(...this.journal.map((step) => step.startedAt));
-    return this.nodes.some(
-      ({ recorded, rewritten }) => recorded?.startedAt === newest && recorded.runResult !== undefined && recorded.runResult.kind !== 'success' && !rewritten,
-    );
+    return this.nodes.some(({ recorded }) => recorded?.startedAt === newest && recorded.runResult !== undefined && recorded.runResult.kind !== 'success');
   }
 
   /**
@@ -351,7 +349,6 @@ export class HistoryView implements History {
       } else if (op.op === 'remove') {
         this.nodes.splice(index, 1);
       } else {
-        node.rewritten = true;
         if (op.name !== undefined) node.name = op.name;
         if (op.args !== undefined) [node.args, node.argsKnown] = [op.args, true];
         if (op.result !== undefined) node.result = { value: op.result };
