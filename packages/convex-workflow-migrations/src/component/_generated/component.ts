@@ -28,48 +28,67 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         "mutation",
         "internal",
         { workflowId: string },
-        number,
-        Name
-      >;
-      deployed: FunctionReference<
-        "query",
-        "internal",
-        {},
-        Array<{ declared: Array<string>; workflow: string }>,
+        boolean,
         Name
       >;
       load: FunctionReference<
         "query",
         "internal",
-        { workflow: string; workflowId: string },
+        { workflowId: string },
         {
-          deployed: Array<string> | null;
-          markers: Array<{ beforeStepId: string; patchId: string }>;
-          run: { known: Array<string>; workflow: string } | null;
-          skips: Array<string>;
-        },
-        Name
-      >;
-      lookup: FunctionReference<
-        "query",
-        "internal",
-        { workflowIds: Array<string> },
-        Array<{
-          run: { known: Array<string>; workflow: string } | null;
-          skips: Array<string>;
-          workflowId: string;
-        }>,
+          applied: Array<string>;
+          overlay: Array<
+            | {
+                anchor: string;
+                args?: any;
+                id: string;
+                kind: "function" | "workflow" | "event" | "sleep";
+                name: string;
+                op: "insert";
+                result: any;
+                where: "after" | "before";
+              }
+            | { op: "remove"; target: string }
+            | {
+                args?: any;
+                name?: string;
+                op: "rewrite";
+                result?: any;
+                target: string;
+              }
+            | { args: any; op: "workflowArgs" }
+          >;
+          workflow: string;
+        } | null,
         Name
       >;
       save: FunctionReference<
         "mutation",
         "internal",
         {
-          deployed?: Array<string>;
-          markers: Array<{ beforeStepId: string; patchId: string }>;
-          run: { known: Array<string>; workflow: string };
-          skips: Array<string>;
-          unskip: Array<string>;
+          applied: Array<string>;
+          overlay: Array<
+            | {
+                anchor: string;
+                args?: any;
+                id: string;
+                kind: "function" | "workflow" | "event" | "sleep";
+                name: string;
+                op: "insert";
+                result: any;
+                where: "after" | "before";
+              }
+            | { op: "remove"; target: string }
+            | {
+                args?: any;
+                name?: string;
+                op: "rewrite";
+                result?: any;
+                target: string;
+              }
+            | { args: any; op: "workflowArgs" }
+          >;
+          workflow: string;
           workflowId: string;
         },
         null,

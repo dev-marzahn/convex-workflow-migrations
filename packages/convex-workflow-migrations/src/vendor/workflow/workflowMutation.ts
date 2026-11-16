@@ -34,10 +34,11 @@ import {
 } from "./types.js";
 import { createWorkflowCtx } from "./workflowContext.js";
 import {
-  PatchState,
-  type DeclaredPatches,
-  type PatchesComponent,
-} from "../../patchState.js";
+  loadRecord,
+  recordStart,
+  type WorkflowMigrations,
+} from "../../migrations.js";
+import { replayHandler } from "../../replay.js";
 
 export type WorkflowArgs<V extends PropertyValidators, Context = unknown> = {
   /**
@@ -116,8 +117,8 @@ export function workflowMutation<
   ReturnsValidator extends Validator<any, "required", any> | void,
 >(
   component: WorkflowComponent,
-  // PATCHES: the patches component, and the patch ids each workflow declares.
-  patches: { component: PatchesComponent; declared: DeclaredPatches },
+  // PATCHES: the migrations component, and this workflow's migrations.
+  migrations: WorkflowMigrations,
   registered: WorkflowDefinition<ArgsValidator, ReturnsValidator> & {
     handler: WorkflowHandler<ArgsValidator, ReturnsValidator>;
   },
@@ -185,6 +186,8 @@ export function workflowMutation<
           startAsync: args.startAsync ?? undefined,
           createOnly: !args.startAsync, // either start async or run inline here
         })) as WorkflowId;
+        // PATCHES: every run starts with a record, written with the run.
+        await recordStart(ctx, migrations, workflowId, metadata.name);
         if (args.startAsync) {
           return workflowId;
         }
@@ -234,21 +237,13 @@ export function workflowMutation<
           `Assertion failed: not blocked but have in-progress journal entry`,
         );
       }
+      // PATCHES: apply the run's pending migrations, in memory. Throws, so
+      // the run fails, if they can't be applied.
+      const run = await loadRecord(ctx, migrations, workflow, journalEntries);
       const channel = new BaseChannel<StepRequest>(
         workpoolOptions.maxParallelism ?? 10,
       );
-      // PATCHES: load this run's records and track patch decisions.
-      const workflowName = (await ctx.meta.getFunctionMetadata()).name;
-      const patchState = new PatchState(
-        journalEntries as JournalEntry[],
-        await ctx.runQuery(patches.component.runs.load, {
-          workflowId,
-          workflow: workflowName,
-        }),
-        workflowName,
-        patches.declared[workflowName] ?? [],
-      );
-      const step = createWorkflowCtx(workflowId, channel, undefined, patchState);
+      const step = createWorkflowCtx(workflowId, channel);
       const executor = new StepExecutor(
         workflowId,
         generationNumber,
@@ -259,74 +254,19 @@ export function workflowMutation<
         Date.now(),
         workpoolOptions,
         // PATCHES:
-        patchState,
+        run.history,
       );
       const restoreEnvironment = setupEnvironment(
         executor.getGenerationState.bind(executor),
         workflowId,
       );
       try {
-        const handlerWorker = async (): Promise<WorkerResult> => {
-          let runResult: RunResult;
-          try {
-            if (registered.args) {
-              validate(asObjectValidator(registered.args), workflow.args, {
-                throw: true,
-                db: ctx.db,
-              });
-            }
-            const returnValue =
-              (await registered.handler(step, workflow.args)) ?? null;
-            runResult = { kind: "success", returnValue };
-            if (registered.returns) {
-              try {
-                validate(asObjectValidator(registered.returns), returnValue, {
-                  throw: true,
-                });
-              } catch (error) {
-                const message =
-                  error instanceof ValidationError
-                    ? error.message
-                    : formatErrorWithStack(error);
-                console.error(
-                  "Workflow handler returned invalid return value: ",
-                  message,
-                );
-                runResult = {
-                  kind: "failed",
-                  error: "Invalid return value: " + message,
-                };
-              }
-            }
-          } catch (error) {
-            const message = formatErrorWithStack(error);
-            console.error(message);
-            runResult = { kind: "failed", error: message };
-          }
-          return { type: "handlerDone", runResult };
-        };
-        const executorWorker = async (): Promise<WorkerResult> => {
-          return await executor.run();
-        };
-        // PATCHES: a replay failure in a run that skipped a removed patch
-        // gets the cause in its message. The mutation still fails.
-        let result: WorkerResult;
-        try {
-          result = await Promise.race([handlerWorker(), executorWorker()]);
-        } catch (error) {
-          const removed = patchState.removedSkips();
-          if (removed.length === 0) throw error;
-          throw new Error(
-            `Workflow patch ${removed.map((id) => `"${id}"`).join(", ")} was removed, but ${workflowName} ${workflowId} passed it ` +
-              `without the patch, so it needs the old branch. Deploy a release that still has it, then restart the run. ` +
-              formatErrorWithStack(error),
-          );
-        }
-        // PATCHES: record what this handler run decided, in its transaction.
-        const update = patchState.update();
-        if (update) {
-          await ctx.runMutation(patches.component.runs.save, { workflowId, ...update });
-        }
+        // PATCHES: upstream's handler and executor workers, in replayHandler
+        // (src/replay.ts), with the args as the migrations left them.
+        const options = { step, console, db: ctx.db };
+        const result = await replayHandler(registered, run.args, executor, options);
+        // PATCHES: save what this handler run applied, in its transaction.
+        await run.save();
         switch (result.type) {
           case "handlerDone": {
             await ctx.runMutation(component.workflow.complete, {

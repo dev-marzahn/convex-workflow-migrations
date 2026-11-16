@@ -6,21 +6,27 @@ The server half, the `workflow` component, is not copied. Apps install it from `
 
 ## Changes
 
-The main changes are marked `PATCHES:`; [`upstream.diff`](upstream.diff) is the complete record, including the import paths and renames that carry no marker.
+The main changes are marked `PATCHES:`; [`upstream.diff`](upstream.diff) is the complete record, including the import paths and renames that carry no marker. The logic the patches call lives outside this directory, in `src/history.ts`, `src/migrations.ts` and `src/replay.ts`, so the copy stays close to upstream. The `/replay` helpers (`src/helpers.ts`) don't go through the workflow mutation: they build the history with `prepareRun`, and `expectReplays()` then calls `replayHandler` itself, with a `StepExecutor` that starts no step.
 
 | File | Change |
 | --- | --- |
-| `workflowContext.ts` | Adds `step.patched(id)` and `step.deprecatePatch(id)`. Every step call goes through `runStep`, which gives it a position (`seq`) at the call site. |
-| `step.ts` | `StepRequest` carries `seq`. After `journal.startSteps`, hands the new steps' ids to `PatchState`, so frontier decisions get their markers. |
-| `workflowMutation.ts` | Reads the workflow's function name and the run's records, and creates a `PatchState` per handler run. Writes what the run decided at the end, in its transaction. Adds the cause to a replay failure of a run that skipped a removed patch. Takes the patches component and the declared patches as a parameter. |
+| `workflowMutation.ts` | Takes a `WorkflowMigrations` parameter (`src/migrations.ts`): the migrations component, the workflow's migrations and its `args` validator. Called directly to create a run, it writes the run's record in the same transaction (`recordStart`), with `startAsync` too. Before replay, loads the run's record and applies its pending migrations in memory (`loadRecord`), which throws, so the run fails, if they can't be applied. Replaces upstream's handler and executor workers with one call of `replayHandler` (`src/replay.ts`), which runs them as upstream does, with the args as the migrations left them. After the replay, saves the record in its transaction if it changed. |
+| `step.ts` | Matches step calls against the history (`HistoryView.replay()` in `src/history.ts`) instead of the raw journal, so `getGenerationState` reads it too: a stand-in resolves its call without sending anything, removed steps are gone, and rewritten steps compare by their new name and args and resolve with their new result. `completeMessage` matches a stand-in inserted without args on its name and kind, and throws `ReplayMismatch`, with the position in the history, for a mismatch. With `checkOnly`, it compares a running step's call without resolving it: a running step blocks replay, which only a history given to `expectReplays()` has. |
+| `workflowContext.ts` | Import paths, and the header comment. |
 | `types.ts` | `JournalEntry` and `Step` derived from the installed component's API (upstream imports them from its schema, which isn't exported). `WorkflowHandler` with this package's `WorkflowCtx`. |
 | `environment.ts`, `logging.ts`, `publicTypes.ts`, `safeFunctionName.ts`, `shared.ts` | Unchanged copies. Upstream doesn't export them. |
 
+## Changing the copy
+
+Keep a change to a vendored file as small as the feature allows, and put its logic outside this directory. Mark it with a `PATCHES:` comment, describe it in the table above, then run `bun run vendor diff` from the repo root, which regenerates `upstream.diff` from the files as they are: the diff is the record of every change, and `tests/vendor.test.ts` fails until it matches.
+
 ## Updating to a new upstream release
 
-1. Bump the exact `@convex-dev/workflow` version in the root catalog and the peer dependency, then `bun install`.
-2. Copy the new release's `src/client/{workflowMutation,step,workflowContext,environment,safeFunctionName,types}.ts`, `src/component/logging.ts`, `src/shared.ts` and `src/types.ts` (as `publicTypes.ts`) into a temporary directory, and keep it.
-3. Copy them over these files too, then apply the changes: from this directory, `patch -p1 < upstream.diff`. Fix conflicts.
-4. Regenerate the diff against the temporary directory: for each file, `diff -u --label upstream/<file> --label vendor/<file> <temporary copy> <file>`, concatenated in the table's order. Unchanged files produce no hunk.
-5. Update the version and commit in this file, the `vendored from @convex-dev/workflow <version>` header comments, and the versions table in the repo's README.md. Find the commit with `npm view @convex-dev/workflow@<version> gitHead`.
-6. `bun run ready` and `bun run e2e`. `packages/convex-workflow-migrations/tests/vendor.test.ts` checks that these files are the installed release plus `upstream.diff`; its file list matches the table above. A type error usually means the component API changed shape.
+[`scripts/vendor.ts`](../../../../../scripts/vendor.ts) does the copying and diffing. Its `FILES` map, which `tests/vendor.test.ts` uses too, lists each vendored file and its source in the upstream package.
+
+1. Set the new version in the root `package.json` catalog and in the package's `peerDependencies`, then `bun install`.
+2. Run `bun run vendor` from the repo root. It copies the installed release's sources over these files, re-applies `upstream.diff`, sets the version in the `vendored from @convex-dev/workflow <version>` header comments, and regenerates the diff.
+3. If a vendored file now imports a file upstream added, add it to `FILES` and to the table above, and run `bun run vendor` again.
+4. If a hunk doesn't apply, the script leaves a `<file>.rej` next to the file it belongs to. Make the change by hand, keeping its `PATCHES:` marker, delete the `.rej` file, then run `bun run vendor diff`.
+5. Update the version and commit at the top of this file, and the versions table in the repo's README.md. Find the commit with `npm view @convex-dev/workflow@<version> gitHead`.
+6. `bun run ready` and `bun run e2e`. `tests/vendor.test.ts` checks that these files are the installed release plus `upstream.diff`, and that the diff is what `bun run vendor diff` writes. A type error usually means the component API changed shape.

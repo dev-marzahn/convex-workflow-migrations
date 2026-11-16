@@ -3,10 +3,8 @@
   "private": true,
   "type": "module",
   "dependencies": {
-    "@convex-dev/migrations": "catalog:",
     "@convex-dev/workflow": "catalog:",
     "@convex-dev/workpool": "catalog:",
-    "@dev-marzahn/convex-release": "catalog:",
     "@dev-marzahn/convex-workflow-migrations": "workspace:*",
     "convex": "catalog:",
     "convex-helpers": "catalog:"

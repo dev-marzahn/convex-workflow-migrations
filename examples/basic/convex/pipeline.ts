@@ -1,49 +1,75 @@
-import { vWorkflowId, type WorkflowId } from '@dev-marzahn/convex-workflow-migrations';
+import { migration, vWorkflowId, type WorkflowId } from '@dev-marzahn/convex-workflow-migrations';
+import { makeFunctionReference } from 'convex/server';
 import { v } from 'convex/values';
 
 import { internal } from './_generated/api';
 import type { Id } from './_generated/dataModel';
-import { internalMutation, mutation } from './_generated/server';
+import { internalMutation, type MutationCtx, mutation } from './_generated/server';
 import { workflow } from './workflow';
 
 // A media pipeline: one run per grab (a download the app started). Grab, wait
-// for the download, import the files, publish them.
+// for the download, import the files, prepare them, publish them.
 //
-// Release 1 shipped exactly that. Release 2 adds two steps, each behind a
-// patch, so runs that release 1 started keep replaying:
-//   - "notify-after-grab": a step *before* the wait. A run that was already
-//     waiting when release 2 went live passed this point without it, and
-//     skips it on every replay.
-//   - "prepare-before-publish": a step *after* the wait. The same waiting run
-//     reaches it for the first time on release 2 code, so it runs it.
+// That was release 0. Each later release changed the steps, and added a
+// migration so the runs already in flight replay on the new code:
+//   1. notify after grab. Runs already past grab count as notified, at no time.
+//   2. import takes when the grab was notified. Runs that imported did so without it.
+//   3. prepare is renamed to transcode.
+// The step functions stay backward compatible, since a step an older release
+// queued runs on the current code: import's new argument is optional, and
+// prepare stays, as an alias of transcode.
 export const run = workflow.define({
   args: { grabId: v.id('grabs') },
+  migrations: [
+    migration('notify-after-grab', (h) => h.insertAfter(internal.pipeline.grab, internal.pipeline.notify, { result: { at: null } })),
+    migration('import-gets-notified-at', (h) =>
+      h.updateArgs(internal.pipeline.importFiles, (args) => ({ ...args, notifiedAt: h.result(internal.pipeline.notify)?.at ?? null })),
+    ),
+    // Named by its path, so the migration keeps compiling once the prepare alias is gone.
+    migration('prepare-becomes-transcode', (h) => h.rename(makeFunctionReference<'mutation'>('pipeline:prepare'), internal.pipeline.transcode)),
+  ],
   handler: async (step, { grabId }): Promise<void> => {
-    await step.runMutation(internal.pipeline.logStep, { grabId, name: 'grab' });
-    if (step.patched('notify-after-grab')) {
-      await step.runMutation(internal.pipeline.logStep, { grabId, name: 'notify' });
-    }
+    await step.runMutation(internal.pipeline.grab, { grabId });
+    const { at } = await step.runMutation(internal.pipeline.notify, { grabId });
     await step.awaitEvent({ name: 'downloadDone' });
-    await step.runMutation(internal.pipeline.logStep, { grabId, name: 'import' });
-    if (step.patched('prepare-before-publish')) {
-      await step.runMutation(internal.pipeline.logStep, { grabId, name: 'prepare' });
-    }
-    await step.runMutation(internal.pipeline.logStep, { grabId, name: 'publish' });
+    await step.runMutation(internal.pipeline.importFiles, { grabId, notifiedAt: at });
+    await step.runMutation(internal.pipeline.transcode, { grabId });
+    await step.runMutation(internal.pipeline.publish, { grabId });
   },
 });
 
-// Stands in for the real steps (worker jobs, file moves). Every step records
+// Stand-ins for the real steps (worker jobs, file moves). Every step records
 // its name, so a test can see what ran.
-export const logStep = internalMutation({
-  args: { grabId: v.id('grabs'), name: v.string() },
-  returns: v.null(),
-  handler: async (ctx, { grabId, name }) => {
-    const grab = await ctx.db.get('grabs', grabId);
-    if (!grab) throw new Error(`Grab ${grabId} not found`);
-    await ctx.db.patch('grabs', grabId, { log: [...grab.log, name] });
-    return null;
+
+async function log(ctx: MutationCtx, grabId: Id<'grabs'>, name: string): Promise<null> {
+  const grab = await ctx.db.get('grabs', grabId);
+  if (!grab) throw new Error(`Grab ${grabId} not found`);
+  await ctx.db.patch('grabs', grabId, { log: [...grab.log, name] });
+  return null;
+}
+
+const step = (name: string) => internalMutation({ args: { grabId: v.id('grabs') }, returns: v.null(), handler: (ctx, { grabId }) => log(ctx, grabId, name) });
+export const grab = step('grab');
+export const notify = internalMutation({
+  args: { grabId: v.id('grabs') },
+  // null for runs that were past this point when it was added: the
+  // migration's stand-in result has to be a value notify could return.
+  returns: v.object({ at: v.union(v.number(), v.null()) }),
+  handler: async (ctx, { grabId }): Promise<{ at: number | null }> => {
+    await log(ctx, grabId, 'notify');
+    return { at: Date.now() };
   },
 });
+export const importFiles = internalMutation({
+  // Optional: an import that release 0 or 1 queued runs here without it.
+  args: { grabId: v.id('grabs'), notifiedAt: v.optional(v.union(v.number(), v.null())) },
+  returns: v.null(),
+  handler: (ctx, { grabId }) => log(ctx, grabId, 'import'),
+});
+export const transcode = step('transcode');
+// For a prepare that release 2 or older queued: it runs as transcode.
+export const prepare = transcode;
+export const publish = step('publish');
 
 export const startGrab = mutation({
   args: { title: v.string() },

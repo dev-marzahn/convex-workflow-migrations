@@ -8,8 +8,6 @@
  * @module
  */
 
-import type * as migrations__generated from "../migrations/_generated.js";
-import type * as patches from "../patches.js";
 import type * as pipeline from "../pipeline.js";
 import type * as workflow from "../workflow.js";
 
@@ -20,8 +18,6 @@ import type {
 } from "convex/server";
 
 declare const fullApi: ApiFromModules<{
-  "migrations/_generated": typeof migrations__generated;
-  patches: typeof patches;
   pipeline: typeof pipeline;
   workflow: typeof workflow;
 }>;
@@ -55,5 +51,4 @@ export declare const internal: FilterApi<
 export declare const components: {
   workflow: import("@convex-dev/workflow/_generated/component.js").ComponentApi<"workflow">;
   workflowMigrations: import("@dev-marzahn/convex-workflow-migrations/_generated/component.js").ComponentApi<"workflowMigrations">;
-  migrations: import("@convex-dev/migrations/_generated/component.js").ComponentApi<"migrations">;
 };

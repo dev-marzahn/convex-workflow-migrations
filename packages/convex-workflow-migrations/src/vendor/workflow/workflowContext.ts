@@ -16,7 +16,6 @@ import type { Validator } from "convex/values";
 import type { EventId, SchedulerOptions, WorkflowId } from "./publicTypes.js";
 import { safeFunctionName } from "./safeFunctionName.js";
 import type { StepRequest } from "./step.js";
-import type { PatchState } from "../../patchState.js";
 import type {
   RunResult,
   TransactionLimits,
@@ -189,75 +188,32 @@ export type WorkflowCtx = {
    * Chaining is supported; later defaults override earlier ones.
    */
   withOptions(defaults: StepDefaults): WorkflowCtx;
-
-  /**
-   * PATCHES: Whether this run takes the code path added by patch `id`.
-   *
-   * The first time a run reaches this call, it returns `true` and records a
-   * marker before the next step. On replay it returns `true` only if the run
-   * has that marker: a run that passed this point under code without the
-   * patch gets `false` on every replay, and that is recorded as a skip. The
-   * decision is remembered per run, so every call with the same `id` returns
-   * the same value. `id` must be declared for the workflow in
-   * convex/patches.ts.
-   *
-   * ```ts
-   * if (step.patched("add-prepare")) {
-   *   await step.runAction(internal.media.prepare, { grabId });
-   * }
-   * ```
-   */
-  patched(id: string): boolean;
-
-  /**
-   * PATCHES: Mark patch `id` as permanent in this code: the old branch is
-   * gone. Records the patch for this run like `patched()`, so code that still
-   * calls `patched(id)` replays it after a rollback. Throws if this run
-   * passed this point without the patch, because it can no longer replay.
-   */
-  deprecatePatch(id: string): void;
 };
-
-// PATCHES: step calls go through this, so each gets its position (seq).
-type RunStep = (request: Omit<StepRequest, "resolve" | "seq">) => Promise<unknown>;
 
 export function createWorkflowCtx(
   workflowId: WorkflowId,
   sender: BaseChannel<StepRequest>,
-  defaults: StepDefaults | undefined,
-  // PATCHES:
-  patchState: PatchState,
+  defaults?: StepDefaults,
 ): WorkflowCtx {
-  // PATCHES: assigned at the call site, before enqueueing can yield.
-  const runStep: RunStep = (request) =>
-    run(sender, { ...request, seq: patchState.nextSeq() });
   return {
     workflowId,
     withOptions: (opts) =>
-      createWorkflowCtx(
-        workflowId,
-        sender,
-        { ...defaults, ...opts },
-        patchState,
-      ),
-    // PATCHES:
-    patched: (id) => patchState.patched(id),
-    deprecatePatch: (id) => patchState.deprecatePatch(id),
+      createWorkflowCtx(workflowId, sender, { ...defaults, ...opts }),
     runQuery: async (query, args, opts?) => {
-      return runFunction(runStep, "query", query, args, opts, defaults);
+      return runFunction(sender, "query", query, args, opts, defaults);
     },
 
     runMutation: async (mutation, args, opts?) => {
-      return runFunction(runStep, "mutation", mutation, args, opts, defaults);
+      return runFunction(sender, "mutation", mutation, args, opts, defaults);
     },
 
     runAction: async (action, args, opts?) => {
-      return runFunction(runStep, "action", action, args, opts, defaults);
+      return runFunction(sender, "action", action, args, opts, defaults);
     },
 
     runWorkflow: async (workflow, args, opts?) => {
       const { name, unstableArgs, ...schedulerOptions } = opts ?? {};
-      return runStep({
+      return run(sender, {
         name: name ?? safeFunctionName(workflow),
         target: {
           kind: "workflow",
@@ -273,7 +229,7 @@ export function createWorkflowCtx(
     },
 
     sleep: async (duration, opts?) => {
-      await runStep({
+      await run(sender, {
         name: opts?.name ?? "sleep",
         target: {
           kind: "sleep",
@@ -288,7 +244,7 @@ export function createWorkflowCtx(
     },
 
     awaitEvent: async (event) => {
-      const result = await runStep({
+      const result = await run(sender, {
         name: event.name ?? event.id ?? "Event",
         target: {
           kind: "event",
@@ -313,7 +269,7 @@ async function runFunction<
     | FunctionReference<FunctionType, FunctionVisibility>
     | FunctionReference_future<FunctionType, FunctionVisibility>,
 >(
-  runStep: RunStep, // PATCHES: was `sender: BaseChannel<StepRequest>`
+  sender: BaseChannel<StepRequest>,
   functionType: FunctionType,
   f: F,
   args: Record<string, unknown> | undefined,
@@ -344,7 +300,7 @@ async function runFunction<
   if (!inline && transactionLimits) {
     throw new Error("Cannot set transaction limits for non-inline functions.");
   }
-  return runStep({
+  return run(sender, {
     name: name ?? safeFunctionName(f),
     target: {
       kind: "function",

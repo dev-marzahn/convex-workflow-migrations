@@ -3,34 +3,53 @@ import { v } from 'convex/values';
 
 import { internal } from './_generated/api';
 import type { Id } from './_generated/dataModel';
-import { internalMutation, mutation, query } from './_generated/server';
+import { internalMutation, type MutationCtx, mutation, query } from './_generated/server';
 import { workflow } from './workflow';
 
-// Release 2 without patches: the same new step before the wait, unguarded.
-// Runs that release 1 left waiting fail on their next replay.
+// Release 2's code without its migrations: the same new step before the wait,
+// unguarded. Runs that release 0 left waiting fail with a journal entry
+// mismatch on their next replay.
 export const run = workflow.define({
   args: { grabId: v.id('grabs') },
   handler: async (step, { grabId }): Promise<void> => {
-    await step.runMutation(internal.pipeline.logStep, { grabId, name: 'grab' });
-    await step.runMutation(internal.pipeline.logStep, { grabId, name: 'notify' });
+    await step.runMutation(internal.pipeline.grab, { grabId });
+    const { at } = await step.runMutation(internal.pipeline.notify, { grabId });
     await step.awaitEvent({ name: 'downloadDone' });
-    await step.runMutation(internal.pipeline.logStep, { grabId, name: 'import' });
-    await step.runMutation(internal.pipeline.logStep, { grabId, name: 'publish' });
+    await step.runMutation(internal.pipeline.importFiles, { grabId, notifiedAt: at });
+    await step.runMutation(internal.pipeline.prepare, { grabId });
+    await step.runMutation(internal.pipeline.publish, { grabId });
   },
 });
+
+// The steps. Each records its name on the grab.
+
+async function log(ctx: MutationCtx, grabId: Id<'grabs'>, name: string): Promise<null> {
+  const grab = await ctx.db.get('grabs', grabId);
+  if (!grab) throw new Error(`Grab ${grabId} not found`);
+  await ctx.db.patch('grabs', grabId, { log: [...grab.log, name] });
+  return null;
+}
+
+const step = (name: string) => internalMutation({ args: { grabId: v.id('grabs') }, returns: v.null(), handler: (ctx, { grabId }) => log(ctx, grabId, name) });
+export const grab = step('grab');
+export const notify = internalMutation({
+  args: { grabId: v.id('grabs') },
+  returns: v.object({ at: v.union(v.number(), v.null()) }),
+  handler: async (ctx, { grabId }): Promise<{ at: number | null }> => {
+    await log(ctx, grabId, 'notify');
+    return { at: Date.now() };
+  },
+});
+export const importFiles = internalMutation({
+  // Optional: an import that release 0 or 1 queued runs here without it.
+  args: { grabId: v.id('grabs'), notifiedAt: v.optional(v.union(v.number(), v.null())) },
+  returns: v.null(),
+  handler: (ctx, { grabId }) => log(ctx, grabId, 'import'),
+});
+export const prepare = step('prepare');
+export const publish = step('publish');
 
 // Everything below is the same in every fixture release.
-
-export const logStep = internalMutation({
-  args: { grabId: v.id('grabs'), name: v.string() },
-  returns: v.null(),
-  handler: async (ctx, { grabId, name }) => {
-    const grab = await ctx.db.get('grabs', grabId);
-    if (!grab) throw new Error(`Grab ${grabId} not found`);
-    await ctx.db.patch('grabs', grabId, { log: [...grab.log, name] });
-    return null;
-  },
-});
 
 export const startGrab = mutation({
   args: { title: v.string() },
@@ -52,7 +71,7 @@ export const downloadDone = mutation({
   },
 });
 
-export const grab = query({
+export const status = query({
   args: { grabId: v.id('grabs') },
   returns: v.object({ log: v.array(v.string()), status: v.string(), error: v.optional(v.string()) }),
   handler: async (ctx, { grabId }) => {
