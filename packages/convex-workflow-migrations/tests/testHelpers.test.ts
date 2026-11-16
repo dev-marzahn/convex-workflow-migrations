@@ -89,6 +89,15 @@ const functions = {
       await step.runMutation(flows.grab, {});
     },
   }),
+  // No longer waits for the download after notify, and no longer catches notify's failure.
+  dropsWait: manager.define({
+    args: {},
+    migrations: [migration('drop-wait', (h) => h.remove({ event: 'downloadDone' }))],
+    handler: async (step) => {
+      await step.runMutation(flows.grab, {});
+      await step.runMutation(flows.notify, {});
+    },
+  }),
   // Inserts child as a function, then calls it as a workflow.
   childAsWorkflow: manager.define({
     args: {},
@@ -196,19 +205,26 @@ test("expectReplays passes a failed run's rethrow after its history, and reports
   await expectReplays(t, ref('rethrows'), [failed, { ...failed, outcome: undefined }]);
   const message = await failure(expectReplays(t, ref('rethrows'), [{ ...failed, outcome: 'success' }]));
   expect(message).toContain('(threw): The run succeeded, but the handler now fails after replaying its history: Error: grab failed');
-  // The migrations edit this history (a stand-in after grab), and the handler passes grab's failure on: it fails, as it did.
-  await expectReplays(t, ref('current'), [failed]);
+  // The migrations edit this history (a stand-in after grab), and the handler passes the wait's failure on: it fails, as it did.
+  await expectReplays(t, ref('current'), [history([{ step: flows.grab }, { event: 'downloadDone', error: 'the download failed' }], { outcome: 'failed' })]);
 });
 
 test('expectReplays fails, not pauses, a run whose newest step failed, though migrations edited its history', async () => {
   const t = setup();
   // Waiting for the download when the release with the migrations shipped, and then the download failed.
   const waitFailed = history([{ step: flows.grab }, { event: 'downloadDone', error: 'the download failed' }]);
-  const grabFailed = history([{ step: flows.grab, error: 'grab failed' }]);
-  await expectReplays(t, ref('current'), [waitFailed, grabFailed]);
+  await expectReplays(t, ref('current'), [waitFailed]);
   // A migration that renamed the failed step may be why it fails: that pauses.
   const renamed = await failure(expectReplays(t, ref('renamesGrab'), [history([{ step: flows.fetch, error: 'fetch failed' }])]));
   expect(renamed).toContain('(threw): The handler threw after migrations "fetch-becomes-grab" changed its history');
+});
+
+test('expectReplays pauses a throw on a failure that is last only because a migration removed the steps after it', async () => {
+  // The old code caught notify's failure and waited for the download; the new code no longer waits, and no longer catches it.
+  const caught = history([{ step: flows.grab }, { step: flows.notify, error: 'mail bounced' }, { event: 'downloadDone' }]);
+  const message = await failure(expectReplays(setup(), ref('dropsWait'), [caught]));
+  expect(message).toContain('(threw): The handler threw after migrations "drop-wait" changed its history: ');
+  expect(message).toContain('mail bounced');
 });
 
 test('a redacted export replays: the overlay is scrubbed with the steps and the run args', async () => {

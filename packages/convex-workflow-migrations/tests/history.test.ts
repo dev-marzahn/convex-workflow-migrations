@@ -115,8 +115,29 @@ test('a running step can be inserted around, but not removed, renamed or given o
   expect(() => h.rename({ event: 'downloadDone' }, { event: 'done' })).toThrow('still running');
   expect(() => h.updateArgs(h.steps[1]!, () => ({}))).toThrow('still running');
   h.insertBefore({ event: 'downloadDone' }, fn.notify, { result: null });
-  h.insertAfter({ event: 'downloadDone' }, fn.after, { result: null });
+  // Nothing follows the running step, so this one needs atEnd.
+  h.insertAfter({ event: 'downloadDone' }, fn.after, { result: null, atEnd: true });
   expect(names(h)).toEqual(['grab', 'notify', 'downloadDone (running)', 'after']);
+});
+
+test('an insert where no journal entry follows does nothing, so the run makes the call; atEnd inserts it anyway', () => {
+  // grab ran across the deploy: its result came in, and the run hasn't got further.
+  const h = new HistoryView([done('j0', 'grab')]);
+  h.insertAfter(fn.grab, fn.notify, { result: null });
+  expect(names(h)).toEqual(['grab']);
+  // Only stand-ins after the anchor count as nothing.
+  h.insertAfter(fn.grab, fn.log, { result: null, atEnd: true });
+  h.insertAfter(fn.grab, fn.notify, { result: null });
+  h.insertBefore(fn.log, fn.check, { result: null });
+  expect(names(h)).toEqual(['grab', 'log']);
+  h.insertBefore(fn.log, fn.check, { result: null, atEnd: true });
+  expect(names(h)).toEqual(['grab', 'check', 'log']);
+  expect(h.overlay().map((op) => (op.op === 'insert' ? op.id : op.op))).toEqual(['+1', '+2']);
+  // insertBefore a journal entry always has one after it.
+  const waiting = new HistoryView([done('j0', 'grab'), event('j1', 'downloadDone', true)]);
+  waiting.insertAfter(fn.grab, fn.notify, { result: null });
+  waiting.insertBefore({ event: 'downloadDone' }, fn.log, { result: null });
+  expect(names(waiting)).toEqual(['grab', 'notify', 'log', 'downloadDone (running)']);
 });
 
 test('rename keeps the kind of step', () => {
@@ -292,7 +313,7 @@ test('threwEarly: which throws pause the run and which fail it', () => {
   expect(threwEarly(h, { next: { position: 1 }, started: true }, error, ctx)).toBeUndefined();
   // Right after a stand-in, with only stand-ins left: pause; before them, after a recorded step: fail.
   const standIns = new HistoryView([done('j0', 'grab')]);
-  standIns.insertAfter(fn.grab, fn.notify, { result: null });
+  standIns.insertAfter(fn.grab, fn.notify, { result: null, atEnd: true });
   expect(threwEarly(standIns, { started: false }, error, ctx)).toMatchObject({ reason: 'threw', position: 1 });
   expect(threwEarly(standIns, { next: { position: 1 }, started: false }, error, ctx)).toBeUndefined();
   // For a run that failed, only a recorded step left counts.
@@ -310,6 +331,10 @@ test('threwEarly: which throws pause the run and which fail it', () => {
   // An older failure, which the handler caught then, doesn't count.
   const older = new HistoryView([{ ...done('j0', 'grab'), runResult: { kind: 'failed', error: 'no' } }, done('j1', 'retry')]);
   expect(threwEarly(older, { started: false }, error, { ...ctx, editedNow: ['m'] })).toMatchObject({ reason: 'threw' });
+  // Nor does one that is last only because a migration removed the steps after it: the newest steps are the journal's.
+  const caught = new HistoryView([done('j0', 'grab'), { ...done('j1', 'notify'), runResult: { kind: 'failed', error: 'no' } }, event('j2', 'downloadDone')]);
+  caught.remove({ event: 'downloadDone' });
+  expect(threwEarly(caught, { started: false }, error, { ...ctx, editedNow: ['m'] })).toMatchObject({ reason: 'threw' });
   // Args that don't validate: pause a run with history, fail a new one.
   expect(threwEarly(h, { next: { position: 0 }, started: false }, error, { ...ctx, validated: false })).toMatchObject({ reason: 'args' });
   expect(threwEarly(new HistoryView([]), { started: false }, error, { ...ctx, validated: false, hasHistory: false })).toBeUndefined();

@@ -95,9 +95,11 @@ export type StepArgs<R> = R extends { workflow: infer W extends WorkflowFunction
 /**
  * How to insert a finished stand-in: replay resolves the call with `result`
  * and runs nothing. `args`, if given, must match the call's. `name` matches a
- * call made with a custom `name` option.
+ * call made with a custom `name` option. Without `atEnd`, an insert where no
+ * journal entry follows does nothing, so the run makes the call for real;
+ * with `atEnd: true`, the stand-in goes in there too.
  */
-export type InsertOptions<R> = { result: StepResult<R>; args?: StepArgs<R>; name?: string };
+export type InsertOptions<R> = { result: StepResult<R>; args?: StepArgs<R>; name?: string; atEnd?: boolean };
 
 /** A run's history, as the previous migration left it. See the README's "Writing migrations". */
 export interface History {
@@ -109,9 +111,9 @@ export interface History {
   has(step: StepRef): boolean;
   /** The result of the only step that is `step`, or `undefined` if there's none or it hasn't succeeded. Throws if several match. */
   result<R extends StepRef>(step: R): StepResult<R> | undefined;
-  /** Inserts `step` after `anchor`. Does nothing if `anchor` isn't in the history. */
+  /** Inserts `step` after `anchor`. Does nothing if `anchor` isn't in the history, or, without `atEnd`, if no journal entry follows it. */
   insertAfter<R extends StepRef>(anchor: StepSelector, step: R, options: InsertOptions<R>): void;
-  /** Inserts `step` before `anchor`. Does nothing if `anchor` isn't in the history. */
+  /** Inserts `step` before `anchor`. Does nothing if `anchor` isn't in the history, or, without `atEnd`, if no journal entry follows the stand-in. */
   insertBefore<R extends StepRef>(anchor: StepSelector, step: R, options: InsertOptions<R>): void;
   /** Drops a step the code no longer calls. */
   remove(step: StepSelector): void;
@@ -213,7 +215,11 @@ export class HistoryView implements History {
    * `args`. Operations whose step is gone from the journal (a restart deleted
    * it) are dropped.
    */
-  public constructor(journal: readonly RecordedStep[], overlay: readonly OverlayOp[] = [], args: unknown = {}) {
+  public constructor(
+    private readonly journal: readonly RecordedStep[],
+    overlay: readonly OverlayOp[] = [],
+    args: unknown = {},
+  ) {
     this.order = new Map(journal.map((step, i) => [step.id, i]));
     this.nodes = journal.map((step) => ({ id: step.id, name: step.name, kind: step.kind, args: step.args, argsKnown: true, recorded: step }));
     this.args = clone(args);
@@ -378,18 +384,19 @@ export class HistoryView implements History {
   }
 
   /**
-   * Whether the handler, having got the steps before `next` and no recorded
-   * step after them, got a failure to pass on: the step before `next` is a
-   * journal entry, and among the newest recorded steps (the ones started with
-   * it, in the same handler run) one failed or was canceled, and no
-   * migration renamed it or gave it other args or another result.
+   * Whether the handler, having got every recorded step of the history, got
+   * a failure to pass on: among the newest recorded steps, the journal
+   * entries started together in the last handler run that started steps,
+   * one is still in the history, failed or was canceled, and no migration
+   * renamed it or gave it other args or another result. The newest steps are
+   * read from the journal, before migrations: if a migration removed them,
+   * the failure the handler got is an older one, which the old code caught.
    */
-  public endsInFailure(next: number): boolean {
-    const last = this.nodes[next - 1]?.recorded;
-    if (!last) return false;
+  public endsInFailure(): boolean {
+    if (this.journal.length === 0) return false;
+    const newest = this.journal.reduce((max, step) => Math.max(max, step.startedAt), -Infinity);
     return this.nodes.some(
-      (node) =>
-        node.recorded?.startedAt === last.startedAt && node.recorded.runResult !== undefined && node.recorded.runResult.kind !== 'success' && !node.rewritten,
+      (node) => node.recorded?.startedAt === newest && node.recorded.runResult !== undefined && node.recorded.runResult.kind !== 'success' && !node.rewritten,
     );
   }
 
@@ -442,8 +449,11 @@ export class HistoryView implements History {
     const { name: refName, kind: refKind } = target(step);
     const name = options.name ?? refName;
     const kind = refKind === 'function or workflow' ? 'function' : refKind;
-    const id = `+${this.nextId++}`;
     if (!('result' in options)) throw new Error(`${action}(${describe(anchor)}, ${name}): pass { result } for the stand-in.`);
+    // Nothing recorded after it: the run hasn't got past this point, so it makes the call for real.
+    const index = this.nodes.indexOf(at);
+    if (options.atEnd !== true && !this.recordedFrom(where === 'after' ? index + 1 : index)) return;
+    const id = `+${this.nextId++}`;
     const op: InsertOp = { op: 'insert', id, where, anchor: at.id, name, kind, result: clone(options.result ?? null) };
     if (options.args !== undefined) op.args = clone(options.args);
     this.push(op);
@@ -646,7 +656,8 @@ export type ThrowContext = { validated: boolean; hasHistory: boolean; editedNow:
  * 2. pauses if a recorded step is left that the handler hasn't replayed;
  * 3. pauses if the last step it got is a stand-in, or has a result a
  *    migration changed;
- * 4. fails if the newest recorded steps, which it got last, include one
+ * 4. fails if the newest recorded steps (the journal entries started in the
+ *    last handler run that started steps) include one still in the history
  *    that failed or was canceled and that no migration rewrote: the handler
  *    is passing that failure on;
  * 5. pauses if migrations edited its history in this handler run;
@@ -673,7 +684,7 @@ export function threwEarly(history: HistoryView, progress: ReplayProgress, error
       next - 1,
     );
   }
-  if (history.endsInFailure(next)) return undefined;
+  if (history.endsInFailure()) return undefined;
   if (context.editedNow.length > 0) {
     const ids = context.editedNow.map((id) => `"${id}"`).join(', ');
     return new ReplayPause('threw', `The handler threw after migrations ${ids} changed its history: ${message(error)}`);

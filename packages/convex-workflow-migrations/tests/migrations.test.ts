@@ -88,6 +88,8 @@ function withChannel(migrations: Migration[]) {
 const releases = {
   r0: release({}, []),
   r1: release({ notify: true }, [m1]),
+  // Release 1 for a step old runs must never make, even those that hadn't got past grab.
+  r1AtEnd: release({ notify: true }, [migration('notify-after-grab', (h) => h.insertAfter(flows.grab, flows.notify, { result: { at: null }, atEnd: true }))]),
   r2: release({ notify: true, notifiedAt: true }, [m1, m2]),
   r3: release({ notify: true, notifiedAt: true, transcode: true }, [m1, m2, m3]),
   // Release 1's change without its migration.
@@ -236,6 +238,26 @@ test('a new run starts with every migration applied and never migrates', async (
   await downloadDone(t, id);
   expect(ran).toEqual(['grab', 'notify', 'import {"notifiedAt":1234}', 'transcode', 'publish']);
   expect((await record(t, id))?.overlay).toEqual([]);
+});
+
+test('a run whose anchor step was running across the deploy makes the inserted call for real; atEnd gives it the stand-in', async () => {
+  for (const [name, notified] of [
+    ['r1', true],
+    ['r1AtEnd', false],
+  ] as const) {
+    const t = setup();
+    ran.length = 0;
+    deploy('r0');
+    // Started, but grab hasn't run: the run is waiting at it when the deploy lands.
+    const id = await t.run((ctx) => manager.start(ctx, pipeline, {}));
+    expect(ran).toEqual([]);
+    deploy(name);
+    await settle(t);
+    await downloadDone(t, id);
+    expect(await status(t, id)).toEqual(completed);
+    expect(ran).toEqual(notified ? ['grab', 'notify', 'import', 'prepare', 'publish'] : ['grab', 'import', 'prepare', 'publish']);
+    expect((await record(t, id))?.overlay.map((op) => op.op)).toEqual(notified ? [] : ['insert']);
+  }
 });
 
 test('a stand-in resolves the call without running it or adding a journal entry', async () => {
