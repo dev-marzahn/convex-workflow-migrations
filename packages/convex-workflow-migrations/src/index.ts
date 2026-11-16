@@ -98,9 +98,11 @@ export type WorkflowManagerOptions = {
   /** The migrations component, `components.workflowMigrations`. */
   migrationsComponent: MigrationsComponent;
   /**
-   * Called once when a run pauses, in the transaction that pauses it. An
-   * error it throws is logged, and what it wrote before is kept; the run
-   * stays paused.
+   * Called when a run pauses, in the transaction that pauses it, and again
+   * when a retry pauses it for another reason or at another step. `ctx` is
+   * the workflow mutation's: cast it to your app's `MutationCtx` to use your
+   * tables. An error it throws is logged, and what it wrote before is kept;
+   * the run stays paused.
    */
   onPause?(ctx: GenericMutationCtx<GenericDataModel>, info: PauseInfo): void | Promise<void>;
   workpoolOptions?: WorkpoolOptions;
@@ -175,11 +177,11 @@ export class WorkflowManager extends UpstreamWorkflowManager {
   }
 
   /**
-   * Schedules a retry, now, of every paused run, or of one workflow's (by its
-   * function name). Each retry is its own transaction, and a retry that
-   * throws counts as another failed attempt, as a scheduled one does. Call it
-   * after deploying a fix, for example from an internal mutation run after
-   * the deploy.
+   * Schedules one retry of every paused run, or of one workflow's (by its
+   * function name), starting now, 100 ms apart. Each retry is its own
+   * transaction, and a retry that throws counts as another failed attempt,
+   * as a scheduled one does. Call it after deploying a fix, for example from
+   * an internal mutation run after the deploy.
    */
   public async resumeAll(ctx: MutationCtx | ActionCtx, opts?: { workflow?: string }): Promise<void> {
     await ctx.runMutation(this.migrationsComponent.runs.resumeAll, opts?.workflow === undefined ? {} : { workflow: opts.workflow });

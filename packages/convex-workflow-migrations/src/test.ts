@@ -88,13 +88,14 @@ async function run(
 
 /**
  * Replays each history, with the workflow's migrations, against its current
- * handler, in convex-test, by the rules a handler run follows: a mismatch, an
- * early return, a throw before the history is used up, and args that don't
- * validate all fail. Runs no steps: replay stops where the history ends or at
- * a running step. A throw after the history is used up passes, unless the
- * history says the run succeeded. A truncated history fails. Throws if a
- * history doesn't replay, with the history, the position, and the call the
- * code made and the step the history has there.
+ * handler, in convex-test, by the rules a handler run follows (README,
+ * "Pausing and recovery"): a mismatch, an early return, a throw that would
+ * pause the run, and args that don't validate all fail. Runs no steps:
+ * replay stops where the history ends or at a running step. A handler run
+ * that would fail the run passes, unless the history's `outcome` says the
+ * run succeeded. A truncated history fails. Throws if a history doesn't
+ * replay, with the history, the position, and the call the code made and the
+ * step the history has there.
  */
 export async function expectReplays(
   t: TestConvex<any>,

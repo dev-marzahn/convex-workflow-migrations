@@ -13,16 +13,24 @@ bun install
 bun run ready   # build, then lint, format check and type check, then unit tests
 ```
 
-The repo uses [Vite+](https://viteplus.dev): `vp check` runs Oxfmt, Oxlint and the TypeScript 7 type check, and `vp check --fix` formats. CI runs `bun run ready` and the end-to-end tests on every pull request.
+The repo uses [Vite+](https://viteplus.dev): `vp check` runs Oxfmt, Oxlint and the TypeScript 7 type check, and `bunx vp check --fix` formats. CI runs `bun run ready` and the end-to-end tests on every pull request.
 
 ## Repository
 
-| Path                                  | Contents                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `packages/convex-workflow-migrations` | The npm package: the `WorkflowManager` (`src/index.ts`); the history view and its edits (`src/history.ts`); migrations and what a handler run does with a run's record (`src/migrations.ts`); the migrations component (`src/component`); the vendored `@convex-dev/workflow` client (`src/vendor/workflow`); the `histories` CLI (`src/cli.ts`); the convex-test helpers (`src/test.ts`, with the replay they hand to the workflow mutation in `src/testing.ts`). |
-| `examples/basic`                      | An app with a workflow that has three migrations, and its tests.                                                                                                                                                                                                                                                                                                                                                                                                   |
-| `e2e/`                                | Fixture apps v1 (release 0, plain `@convex-dev/workflow`), v2 (releases 1 and 2: adopts the package, two migrations), v3 (release 3: a third migration, the list of all three), v4 (release 4: a new required workflow arg, and `updateWorkflowArgs`), and v2-unguarded and v4-unguarded (v2's and v4's code without their new migrations); the `--redact` module the `skip` scenario uses; and the script that deploys them over each other on a real backend.    |
-| `scripts/codegen.ts`                  | Rewrites every `_generated/` folder.                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| Path                                  | Contents                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `packages/convex-workflow-migrations` | The npm package: the `WorkflowManager` (`src/index.ts`); the history view and its edits (`src/history.ts`); migrations and what a handler run does with a run's record (`src/migrations.ts`); the replay of the handler and the pause rules, which runs and `expectReplays` share (`src/replay.ts`); the migrations component (`src/component`); the vendored `@convex-dev/workflow` client (`src/vendor/workflow`); the `histories` CLI (`src/cli.ts`, with `--redact` in `src/redact.ts`); the convex-test helpers (`src/test.ts`, with the replay they hand to the workflow mutation in `src/testing.ts`). |
+| `examples/basic`                      | An app with a workflow that has three migrations, and its tests.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `e2e/`                                | The fixture apps (below); the `--redact` module the scenarios use; and the script that deploys the apps over each other on a real backend.                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `scripts/codegen.ts`                  | Rewrites every `_generated/` folder.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+
+The e2e fixture apps are the README's pipeline at its releases: release 0 is `v1`, releases 1 and 2 are `v2`, release 3 is `v3` and release 4 is `v4`.
+
+- `v1`: release 0, plain `@convex-dev/workflow`: grab, wait for the download, import, prepare, publish.
+- `v2`: releases 1 and 2: adopts the package, and adds notify (`notify-after-grab`) and import's `notifiedAt` (`import-gets-notified-at`).
+- `v3`: release 3: renames prepare to transcode (`prepare-becomes-transcode`), and lists all three migrations.
+- `v4`: release 4: a new required workflow arg, `channel` (`channel-arg`, with `updateWorkflowArgs`).
+- `v2-unguarded` and `v4-unguarded`: v2's and v4's code without their new migrations.
 
 ## Codegen
 
@@ -38,41 +46,44 @@ Component codegen pulls deployment state, so the script starts a throwaway backe
 
 ```sh
 bun run e2e             # all scenarios, about two minutes
-bun run e2e skip        # only the named scenarios: skip, unguarded, rollback, args
+bun run e2e skip        # only the named scenarios: skip, failed, unguarded, rollback, args
 ```
 
 The script builds the package first. Each scenario starts a fresh backend and leaves a run waiting on `awaitEvent`:
 
-- `skip` starts the run on v1, exports its history with `convex-workflow-migrations histories` from v3, plain and with `--redact`, deploys v3, sends the event, and checks that the run replays through all three migrations and that a run started on v3 has every id applied.
-- `unguarded` starts the run on v1, deploys v2-unguarded, sends the event, and checks that the run pauses (reported once to `onPause`) instead of failing; then deploys v2 and waits for the scheduled retry, a minute later, to finish the run.
+- `skip` starts the run on v1, exports its history with `convex-workflow-migrations histories` from v3, plain and with `--redact`, deploys v3, sends the event, and checks that the run replays through all three migrations and that a run started on v3 has every id applied. Then it exports with `--redact` again, now that the run has a record, and checks its overlay is scrubbed, and that `--max-runs 1` refuses to export without `--allow-partial`.
+- `failed` starts the run on v1, deploys v3, and fails the download: the run fails instead of pausing, though the deploy's migrations edited its history.
+- `unguarded` starts two runs on v1, deploys v2-unguarded, sends the events, and checks that the runs pause (reported once to `onPause`) instead of failing. It deletes the second run's workflow, as a parent's cleanup would; then deploys v2 and waits for the scheduled retries, about a minute later, to finish the first run and delete the second's record.
 - `rollback` starts the run on v3, deploys v2, sends the event, and checks that the run pauses with `migrations`; then deploys v3 again and resumes it with `resume`.
-- `args` starts the run on v3, deploys v4-unguarded, sends the event, and checks that the run pauses with `args`; then deploys v4 and resumes it with `resumeAll`, before its scheduled retry.
+- `args` starts the run on v3, deploys v4-unguarded, sends the event, and checks that the run pauses with `args`; then deploys v4 and resumes it with `resumeAll`, before its scheduled retry, and checks that `--redact` scrubs the migrated workflow args.
 
 ## The component across versions
 
-A deployment's `runs` rows, its scheduled `runs:retry` calls, and what `runs:load` returns outlive the version of this package that wrote them: the next release reads the rows and runs the scheduled retries, and the `histories` CLI of whatever version a developer has installed reads `runs:load`. So from one version to the next:
+A deployment's `runs` rows, its scheduled `runs:retry` and `runs:resumeAll` calls, and what `runs:load` returns outlive the version of this package that wrote them: the next release reads the rows and runs the scheduled calls, and the `histories` CLI of whatever version a developer has installed reads `runs:load`. So from one version to the next:
 
 - keep every field of `runs` and of its overlay operations readable, adding only optional fields (Convex refuses a schema that existing rows don't match, so the push fails otherwise);
-- keep `runs:retry` callable with `{ workflowId }` and `runs:resumeAll` with `{ workflow?, cursor }`, and `runs:load`'s result shape a superset of the last one;
+- keep `runs:retry` callable with `{ workflowId, due? }` (a pause schedules it with `{ workflowId }`, `resumeAll` with `due: true`) and `runs:resumeAll` with `{ workflow?, cursor, numItems? }`, and `runs:load`'s result shape a superset of the last one;
 - keep the stored `paused.handle` called with `{ workflowId, generationNumber }`, upstream's workflow mutation arguments;
-- when a row's meaning changes in a way an older version would misread, raise `FORMAT` in `src/component/schema.ts`: a version that finds a row with a higher `format` pauses the run instead of reading it, so a rollback can't corrupt it.
+- when a row's meaning changes in a way an older version would misread, raise `FORMAT` in `src/component/schema.ts`. The workflow mutation of a version that finds a row with a higher `format` pauses the run instead of reading it, and the CLI refuses to export it, so a rollback can't corrupt it. That holds only while the newer row still matches the older version's schema; if it doesn't, the older version's push fails instead.
 
 ## Updating @convex-dev/workflow
 
 The package carries a copy of one upstream release's client code. A weekly job (`.github/workflows/upstream.yml`) fails when a newer upstream release is out. To move to it:
 
 1. Set the new version in the root `package.json` catalog and in the package's `peerDependencies`, then `bun install`.
-2. Follow the steps in [`VENDORED.md`](packages/convex-workflow-migrations/src/vendor/workflow/VENDORED.md): copy the new upstream files, re-apply `upstream.diff`, regenerate it.
+2. Follow the steps in [`VENDORED.md`](packages/convex-workflow-migrations/src/vendor/workflow/VENDORED.md): copy the new upstream files, re-apply `upstream.diff`, update the versions, then regenerate the diff.
 3. `bun run ready` and `bun run e2e`. `packages/convex-workflow-migrations/tests/vendor.test.ts` fails until the copy is the installed release plus the diff, and `packages/convex-workflow-migrations/tests/exports.test.ts` fails if upstream added a value or type export this package doesn't re-export or leave out on purpose.
-4. Add a row to the versions table in README.md and a line to CHANGELOG.md. Users must install the new upstream version with it, so this is a release with a new first number.
+4. Add a row to the versions table in README.md, update its install command, and add a line to CHANGELOG.md. Users must install the new upstream version with it, so this is a release with a new first number.
 
 ## Backend version
 
-`e2e/backend.ts` pins the Convex backend build the tests use: the one [convex-release](https://github.com/dev-marzahn/convex-release) (the migrations and release-image tool this repo's layout follows) pins in its `images/Dockerfile`. Today that's `ghcr.io/convex/convex-backend:d1fcbeaf939502a23a0f4b7e9095a12e84866294`, from convex-release 100.1.0. Move them together: update `e2e/backend.ts` and this paragraph, which `packages/convex-workflow-migrations/tests/backend.test.ts` checks against each other, then run `bun run e2e`.
+[convex-release](https://github.com/dev-marzahn/convex-release) is the tool this repo's layout follows. Its "migrations" are data migrations: numbered files that change a Convex app's stored documents, run in order when a deployment upgrades; they're unrelated to this package's workflow migrations. It also seeds deployments and builds self-hosted Docker images. Each of its versions pins a Convex backend build, which its images ship and its tests run against. The e2e tests and codegen run against the same build, which `BACKEND_IMAGE` in [`e2e/backend.ts`](e2e/backend.ts) names; that's the only place this repo names it. `packages/convex-workflow-migrations/tests/backend.test.ts` reads the pin from the installed `@dev-marzahn/convex-release` (its README, the only place it records the pin) and fails until the two match.
+
+The pin moves when convex-release moves it: bump `@dev-marzahn/convex-release` in the root `package.json` catalog, run `bun install`, set `BACKEND_IMAGE` to the build the test names, then run `bun run e2e`.
 
 ## Pull requests
 
-- Run `bun run ready` before you push. Run `bun run e2e` too if you touched the vendored client, the component, `src/index.ts`, `src/history.ts`, `src/migrations.ts` or `src/cli.ts`.
+- Run `bun run ready` before you push. Run `bun run e2e` too if you touched the vendored client, the component, `src/index.ts`, `src/history.ts`, `src/migrations.ts`, `src/replay.ts` or `src/cli.ts`.
 - Add a test for a bug fix or a new option.
 - Add a line under "Unreleased" in [CHANGELOG.md](CHANGELOG.md) for a change users will notice.
 - If you change how the package behaves, update [README.md](README.md) in the same pull request. It's the only README: packing the package copies it, and `LICENSE`, into `packages/convex-workflow-migrations`.

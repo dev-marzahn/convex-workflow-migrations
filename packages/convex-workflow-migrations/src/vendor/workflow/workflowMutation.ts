@@ -278,8 +278,8 @@ export function workflowMutation<
       let paused: ReplayPause | undefined;
       try {
         // PATCHES: upstream's handler and executor workers, in replayHandler
-        // (src/replay.ts). A replay that can't go on pauses the run, which
-        // commits nothing of the handler run.
+        // (src/replay.ts), which returns a pause by the README's rules
+        // ("Pausing and recovery"). A pause commits nothing of the run.
         const options = { step, console, db: ctx.db };
         const result = await replayHandler(registered, run, executor, options);
         if (result instanceof ReplayPause) {
