@@ -121,6 +121,9 @@ export function threwEarly(history: HistoryView, progress: ReplayProgress, error
   return undefined; // rule 6
 }
 
+/** What upstream's race returns; `invalidReturn` marks a failure from the `returns` validator, not a throw. */
+export type ReplayResult = WorkerResult & { invalidReturn?: true };
+
 /**
  * Runs the handler on the history's args, racing it against the executor as
  * upstream's workflow mutation does. Returns what upstream's race returns, or
@@ -133,10 +136,10 @@ export async function replayHandler(
   { history, edited }: Pick<Prepared, 'history' | 'edited'>,
   executor: StepExecutor,
   options: { step: WorkflowCtx; console: { error: (...args: unknown[]) => void }; db?: GenericDatabaseReader<any> },
-): Promise<WorkerResult | ReplayError> {
+): Promise<ReplayResult | ReplayError> {
   const { console } = options;
   const args = history.workflowArgs as unknown;
-  const handlerWorker = async (): Promise<WorkerResult> => {
+  const handlerWorker = async (): Promise<ReplayResult> => {
     try {
       argsValid(registered, args, options.db, true);
     } catch (error) {
@@ -154,7 +157,7 @@ export async function replayHandler(
         } catch (error) {
           const message = error instanceof ValidationError ? error.message : formatErrorWithStack(error);
           console.error('Workflow handler returned invalid return value: ', message);
-          runResult = { kind: 'failed', error: `Invalid return value: ${message}` };
+          return { type: 'handlerDone', runResult: { kind: 'failed', error: `Invalid return value: ${message}` }, invalidReturn: true };
         }
       }
     } catch (error) {

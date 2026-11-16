@@ -154,6 +154,28 @@ test('expectReplays reports a handler that throws while replaying, as the reason
   await expectReplays(workflows.current, [history([{ step: flows.grab }, { event: 'downloadDone' }, { step: flows.prepare, error: 'it broke' }])]);
 });
 
+test('expectReplays reports a return value its returns validator rejects as (returns), also after a failure', async () => {
+  const givesUp = manager.define({
+    args: {},
+    returns: v.number(),
+    handler: async (step: WorkflowCtx): Promise<number> => {
+      await step.runMutation(flows.grab, {});
+      try {
+        await step.awaitEvent({ name: 'downloadDone' });
+      } catch {
+        return 'gave up' as unknown as number;
+      }
+      return 'done' as unknown as number;
+    },
+  });
+  const report =
+    "(returns): The handler's return value doesn't match its returns validator, which fails the run: Invalid return value: Validator error: Expected `number`, got `string`";
+  for (const download of [{}, { error: 'the download failed' }]) {
+    const message = await failure(expectReplays(givesUp, [history([{ step: flows.grab }, { event: 'downloadDone', ...download }])]));
+    expect(message).toContain(report);
+  }
+});
+
 test('expectReplays reports code that returns before the end of the history', async () => {
   const short = manager.define({ args: {}, handler: async (step: WorkflowCtx) => void (await step.runMutation(flows.grab, {})) });
   expect(await failure(expectReplays(short, [release0Waiting]))).toContain(

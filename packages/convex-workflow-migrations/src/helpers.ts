@@ -93,9 +93,10 @@ class ReplayOnly extends StepExecutor {
 /**
  * Replays the migrated history, and returns why it doesn't replay, if it
  * doesn't: why the run would pause, by the same rules as at runtime, or that
- * the handler throws and the run would fail, unless it's passing on a failure
- * among the newest recorded steps (throw rule 4). It starts no step: replay
- * stops where the history ends, or at a running step.
+ * the run would fail, because the handler throws, unless it's passing on a
+ * failure among the newest recorded steps (throw rule 4), or because its
+ * return value fails its `returns` validator. It starts no step: replay stops
+ * where the history ends, or at a running step.
  */
 async function replayHistory(replay: ReplayTarget, recorded: RecordedHistory, prepared: Prepared): Promise<string | undefined> {
   const workflowId = (recorded.workflowId ?? 'history') as WorkflowId;
@@ -109,8 +110,10 @@ async function replayHistory(replay: ReplayTarget, recorded: RecordedHistory, pr
     const options = { step: createWorkflowCtx(workflowId, channel), console: { error: () => {} } };
     const result = await replayHandler(replay.definition, prepared, executor, options);
     if (result instanceof ReplayError) return `(${result.reason}): ${result.message}`;
-    if (result.type === 'handlerDone' && result.runResult.kind === 'failed' && !prepared.history.endsInFailure()) {
-      return `(fails): The handler threw replaying the history, which fails the run (${RULE[6]}): ${result.runResult.error.split('\n')[0]}`;
+    if (result.type === 'handlerDone' && result.runResult.kind === 'failed') {
+      const error = result.runResult.error.split('\n')[0];
+      if (result.invalidReturn) return `(returns): The handler's return value doesn't match its returns validator, which fails the run: ${error}`;
+      if (!prepared.history.endsInFailure()) return `(fails): The handler threw replaying the history, which fails the run (${RULE[6]}): ${error}`;
     }
   } catch (error) {
     if (!(error instanceof Frontier)) throw error;
@@ -127,7 +130,8 @@ async function replayHistory(replay: ReplayTarget, recorded: RecordedHistory, pr
  * handler that throws, the throw rule that applies) and the migrated
  * history. An `updateResult` or `updateWorkflowArgs` that changes its own
  * output when run on it again fails too, and so does a handler that throws,
- * unless it's passing on a failure (throw rule 4; README, "Testing").
+ * unless it's passing on a failure (throw rule 4; README, "Testing"), or
+ * returns a value its `returns` validator rejects.
  */
 export async function expectReplays(workflow: Workflow, histories: readonly RecordedHistory[]): Promise<void> {
   const replay = target(workflow, 'expectReplays');
