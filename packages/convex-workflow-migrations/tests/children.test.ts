@@ -1,11 +1,20 @@
 // Child workflows, and restarting canceled runs, on convex-test. As in
 // migrations.test.ts, `deploy(name)` swaps the registered functions.
 import { convexTest } from 'convex-test';
-import { anyApi, componentsGeneric, createFunctionHandle, defineSchema, type FunctionReference, internalMutationGeneric, queryGeneric } from 'convex/server';
+import {
+  anyApi,
+  componentsGeneric,
+  createFunctionHandle,
+  defineSchema,
+  defineTable,
+  type FunctionReference,
+  internalMutationGeneric,
+  queryGeneric,
+} from 'convex/server';
 import { v } from 'convex/values';
 import { afterEach, beforeEach, expect, test, vi } from 'vite-plus/test';
 
-import { FORGET_BATCH } from '../src/component/schema.ts';
+import { FORGET_BATCH, JOURNAL_READ } from '../src/component/schema.ts';
 import { migration, type MigrationsComponent, type WorkflowComponent, type WorkflowCtx, type WorkflowId, WorkflowManager } from '../src/index.ts';
 import migrationsTest from '../src/test.ts';
 
@@ -30,6 +39,9 @@ const channelArg = migration('channel-arg', (h) => h.updateWorkflowArgs((args) =
 const journals: Record<string, { step: { name: string; args: object; inProgress: boolean; kind?: string; workflowId?: string } }[]> = {};
 /** The made-up runs whose journals are too big to load whole: `journal.load` returns what fit, with `ok: false`. */
 const tooBig = new Set<string>();
+/** How many half-MiB documents of `blobs` the made-up `journal.load` of a run reads, so its journal takes that much of the read budget. */
+const journalBlobs: Record<string, number> = {};
+const BLOB = 'x'.repeat((1 << 19) - 100);
 
 const releases = {
   // The parent runs a child, which runs a grandchild; each waits for an event.
@@ -150,19 +162,30 @@ const functions: Record<string, unknown> = {
   twig: releases.twig,
   journal: queryGeneric({
     args: { workflowId: v.string() },
-    handler: async (_ctx, { workflowId }) => {
+    handler: async (ctx, { workflowId }) => {
       const journalEntries = journals[workflowId];
       if (!journalEntries) throw new Error(`Workflow not found: ${workflowId}`);
+      await ctx.db.query('blobs').take(journalBlobs[workflowId] ?? 0);
       return { journalEntries, ok: !tooBig.has(workflowId) };
+    },
+  }),
+  // A cleanup from a mutation, in one transaction: forget, as the manager's cleanup calls it, then upstream's cleanup reading the
+  // journal again, as much as a whole one.
+  cleanupInMutation: internalMutationGeneric({
+    args: { workflowId: v.string(), journal: v.string() },
+    handler: async (ctx, { workflowId, journal }) => {
+      await ctx.runMutation(components.workflowMigrations.runs.forget, { workflowIds: [workflowId], journal, reserve: JOURNAL_READ });
+      await ctx.db.query('blobs').take(18);
     },
   }),
 };
 const deploy = (name: 'child' | 'waits' | 'kid', release: keyof typeof releases) => void (functions[name] = releases[release]);
 
-/** With `transactionLimits`, convex-test enforces Convex's per-transaction limits, with these lowered. */
-function setup(transactionLimits?: { documentsRead: number }) {
+/** With `transactionLimits`, convex-test enforces Convex's per-transaction limits, with these lowered if given. */
+function setup(transactionLimits?: true | { documentsRead: number }) {
   const modules = { './_generated/api.ts': async () => ({}), './flows.ts': async () => functions };
-  const t = convexTest({ schema: defineSchema({}), modules, ...(transactionLimits ? { transactionLimits } : {}) });
+  const schema = defineSchema({ blobs: defineTable({ data: v.string() }) });
+  const t = convexTest({ schema, modules, ...(transactionLimits ? { transactionLimits } : {}) });
   migrationsTest.register(t);
   return t;
 }
@@ -193,6 +216,7 @@ beforeEach(() => {
   deploy('kid', 'kid');
   ran.length = 0;
   for (const id of Object.keys(journals)) delete journals[id];
+  for (const id of Object.keys(journalBlobs)) delete journalBlobs[id];
   tooBig.clear();
 });
 afterEach(() => vi.useRealTimers());
@@ -428,6 +452,73 @@ test('a journal too big to load whole names only the children in the part that l
   );
   warn.mockRestore();
   expect(await record(t, 'c')).toBeNull();
+});
+
+/**
+ * Runs from before adoption, each with a journal that reads that many half-MiB documents and names one child, which has a record.
+ * There are 18 documents: as much as upstream's `journal.load` reads at most.
+ */
+async function bigJournals(t: T, runs: Record<string, number>) {
+  await t.run(async (ctx) => {
+    for (let i = 0; i < 18; i++) await ctx.db.insert('blobs', { data: BLOB });
+    for (const [id, blobs] of Object.entries(runs)) {
+      journals[id] = [{ step: { name: 'flows:child', args: {}, inProgress: false, kind: 'workflow', workflowId: `${id}-child` } }];
+      journalBlobs[id] = blobs;
+      await ctx.runMutation(components.workflowMigrations.runs.save, {
+        workflowId: `${id}-child`,
+        workflow: 'flows:child',
+        applied: [],
+        overlay: [],
+        done: true,
+      });
+    }
+  });
+}
+
+test("forget reads a journal only with enough of the transaction's read budget left for a whole one: the next batch reads the rest", async () => {
+  // Convex's 16 MiB read limit, enforced. Two journals near upstream's 8 MiB limit don't fit in one transaction.
+  const t = setup(true);
+  await bigJournals(t, { a: 15, b: 18 });
+  const journal = await t.run(() => createFunctionHandle(flows.journal));
+  await t.run((ctx) => ctx.runMutation(components.workflowMigrations.runs.forget, { workflowIds: ['a', 'b'], journal }));
+  expect(await record(t, 'a-child')).not.toBeNull();
+  await settle(t, 1_000);
+  for (const id of ['a-child', 'b-child']) expect(await record(t, id)).toBeNull();
+});
+
+test('forget with reserve, as cleanup from a mutation calls it, leaves upstream’s cleanup its read budget: a journal too big for the rest names no children', async () => {
+  const t = setup(true);
+  await bigJournals(t, { big: 15, small: 2 });
+  const journal = await t.run(() => createFunctionHandle(flows.journal));
+  const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  for (const workflowId of ['big', 'small']) await t.mutation(flows.cleanupInMutation, { workflowId, journal });
+  await settle(t, 1_000);
+  expect(warn.mock.calls.map(([message]) => String(message)).filter((message) => message.startsWith('Workflow big'))).toEqual([
+    expect.stringContaining(
+      "Workflow big's journal is too big to read in the transaction that cleans it up, which upstream's cleanup reads it in too: the records of its child workflows from before adoption are left.",
+    ),
+  ]);
+  warn.mockRestore();
+  expect(await record(t, 'big-child')).not.toBeNull();
+  expect(await record(t, 'small-child')).toBeNull();
+
+  // The manager's cleanup passes it from a mutation, where upstream's cleanup follows in the same transaction; not from an action.
+  for (const fromAction of [false, true]) {
+    const id = await t.run((ctx) => manager.start(ctx, flows.twig as Ref, {}));
+    await settle(t, 1_000);
+    const forgets: unknown[] = [];
+    // The ctx, with its runMutation calls of runs:forget, the only ones cleanup makes with a journal, recorded.
+    const spied = <C extends object>(ctx: C): C =>
+      Object.assign(Object.create(ctx) as C, {
+        runMutation: (ref: unknown, args: unknown) => {
+          if (typeof args === 'object' && args !== null && 'journal' in args) forgets.push(args);
+          return (ctx as unknown as { runMutation: (ref: unknown, args: unknown) => unknown }).runMutation(ref, args);
+        },
+      });
+    if (fromAction) await t.action((ctx) => manager.cleanup(spied(ctx), id));
+    else await t.run((ctx) => manager.cleanup(spied(ctx), id));
+    expect(forgets).toEqual([{ workflowIds: [id], journal: expect.any(String), ...(fromAction ? {} : { reserve: JOURNAL_READ }) }]);
+  }
 });
 
 test("runs:cleanup, for a run whose workflow is gone, passes the journal handle on: its linked children's unlinked children go too", async () => {

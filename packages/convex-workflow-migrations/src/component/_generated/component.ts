@@ -88,6 +88,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         {
           from?: { cursor: string | null; workflowId: string };
           journal?: string;
+          reserve?: number;
           workflowIds: Array<string>;
         },
         null,

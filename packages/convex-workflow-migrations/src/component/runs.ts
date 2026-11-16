@@ -15,7 +15,19 @@ import { api } from './_generated/api.js';
 import type { Doc } from './_generated/dataModel.js';
 import type { MutationCtx, QueryCtx } from './_generated/server.js';
 import { mutation, query } from './_generated/server.js';
-import { capDetail, DETAIL_LIMIT, FORGET_BATCH, FORMAT, isWorkflowNotFound, vOrigin, vOverlayOp, vPaused, vPausedPage, vPauseReason } from './schema.js';
+import {
+  capDetail,
+  DETAIL_LIMIT,
+  FORGET_BATCH,
+  FORMAT,
+  isWorkflowNotFound,
+  JOURNAL_READ,
+  vOrigin,
+  vOverlayOp,
+  vPaused,
+  vPausedPage,
+  vPauseReason,
+} from './schema.js';
 
 /** Milliseconds before each retry of a paused run: 1 minute, 10 minutes, 1 hour, then every 6 hours, each ±`JITTER`. */
 export const BACKOFF_MS = [60_000, 600_000, 3_600_000, 21_600_000] as const;
@@ -536,18 +548,23 @@ export const cleanup = mutation({
  * adopted this package, whose children aren't linked, the `runWorkflow`
  * entries of its journal, read through `journal` (a handle to upstream's
  * `journal.load`) before the run's own record goes. It works in batches: when
- * the transaction has used about half of a Convex limit, it schedules itself
- * for the rest (`from` is the run whose children it was listing), and it
- * schedules the children it found, `FORGET_BATCH` per call.
+ * the transaction has used about half of a Convex limit, or has too little of
+ * its read budget left to read a whole journal, it schedules itself for the
+ * rest (`from` is the run whose children it was listing), and it schedules the
+ * children it found, `FORGET_BATCH` per call. With `reserve`, for
+ * `WorkflowManager.cleanup` from a mutation, whose transaction then has
+ * upstream's cleanup read the run's journal too, it leaves that many bytes of
+ * the read budget unread (`unlinkedChildren`).
  */
 export const forget = mutation({
   args: {
     workflowIds: v.array(v.string()),
     from: v.optional(vListing),
     journal: v.optional(v.string()),
+    reserve: v.optional(v.number()),
   },
   returns: v.null(),
-  handler: async (ctx, { workflowIds, from, journal }) => {
+  handler: async (ctx, { workflowIds, from, journal, reserve }) => {
     // Far below Convex's 8,192 elements per array: callers pass, and it schedules, batches.
     if (workflowIds.length > FORGET_BATCH) throw new Error(`forget: at most ${FORGET_BATCH} runs per call, got ${workflowIds.length}.`);
     const queue = [...workflowIds];
@@ -563,10 +580,16 @@ export const forget = mutation({
         for (const child of page.page) found.add(child.workflowId);
         listing = page.isDone ? undefined : { workflowId: parent, cursor: page.continueCursor };
       } else {
-        const workflowId = queue.shift()!;
+        const workflowId = queue[0]!;
         const [current, paused] = [await row(ctx, workflowId), await pauseRow(ctx, workflowId)];
         // Its journal first: `cleanup` from a mutation deletes it later in this transaction.
-        if (journal && (!current || current.origin === 'adopted')) for (const child of await unlinkedChildren(ctx, journal, workflowId)) found.add(child);
+        if (journal && (!current || current.origin === 'adopted')) {
+          const children = await unlinkedChildren(ctx, journal, workflowId, reserve);
+          // Too little of the read budget left: the next batch reads it.
+          if (!children) break;
+          for (const child of children) found.add(child);
+        }
+        queue.shift();
         if (current) await ctx.db.delete('runs', current._id);
         if (paused) await ctx.db.delete('pauses', paused._id);
         listing = { workflowId, cursor: null };
@@ -588,16 +611,34 @@ export const forget = mutation({
  * The child workflows a run's journal started that aren't linked to it: none
  * if its workflow is gone. Raw entries, so ones without a kind, from older
  * upstream versions, count as function calls. A journal too big to load
- * whole names only the children in the part that loaded; it says so.
+ * whole names only the children in the part that loaded; it says so. It
+ * reads the journal only if the transaction's read budget left can hold a
+ * whole one (`JOURNAL_READ`), and otherwise returns undefined. With `reserve`,
+ * it reads it anyway, limited to the budget left past `reserve`, and a
+ * journal too big for that names no children; it says so.
  */
-async function unlinkedChildren(ctx: MutationCtx, journal: string, workflowId: string): Promise<string[]> {
+async function unlinkedChildren(ctx: MutationCtx, journal: string, workflowId: string, reserve?: number): Promise<string[] | undefined> {
   type Loaded = { journalEntries: { step: { kind?: string; workflowId?: string } }[]; ok: boolean };
+  const handle = journal as FunctionHandle<'query', { workflowId: string }, Loaded>;
+  const { remaining } = (await ctx.meta.getTransactionMetrics()).bytesRead;
+  if (reserve === undefined && remaining < JOURNAL_READ) return undefined;
+  // The read that crosses the limit counts the document it read, of up to 1 MiB.
+  const limit = reserve === undefined ? undefined : remaining - reserve - (1 << 20);
   let loaded: Loaded;
   try {
-    loaded = await ctx.runQuery(journal as FunctionHandle<'query', { workflowId: string }, Loaded>, { workflowId });
+    if (limit !== undefined && limit <= 0) throw new Error('no read budget left');
+    loaded =
+      limit === undefined
+        ? await ctx.runQuery(handle, { workflowId })
+        : await ctx.runQuery(handle, { workflowId }, { transactionLimits: { bytesRead: limit } });
   } catch (error) {
     if (isWorkflowNotFound(error, workflowId)) return [];
-    throw error;
+    if (limit === undefined) throw error;
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(
+      `Workflow ${workflowId}'s journal is too big to read in the transaction that cleans it up, which upstream's cleanup reads it in too: the records of its child workflows from before adoption are left. ${message}`,
+    );
+    return [];
   }
   const entries = loaded.journalEntries;
   if (loaded.ok === false) {

@@ -116,6 +116,13 @@ export const FORMAT = 1;
 export const FORGET_BATCH = 500;
 
 /**
+ * The most of a transaction's read budget that reading a run's journal through
+ * upstream's `journal.load` takes: it stops past upstream's `MAX_JOURNAL_SIZE`,
+ * 8 MiB, so 8 MiB and the entry that crosses it.
+ */
+export const JOURNAL_READ = (8 << 20) + (1 << 20);
+
+/**
  * The longest pause `detail`, in characters. A mismatch's two calls are each
  * cut to this length before they're put together, so its detail can be
  * about twice as long, about 16 KiB. The row's detail is cut to three times

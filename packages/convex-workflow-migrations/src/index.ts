@@ -19,7 +19,7 @@ import {
 } from 'convex/server';
 import type { Infer, PropertyValidators, Validator } from 'convex/values';
 
-import { FORGET_BATCH, FORMAT, isWorkflowNotFound, type vPausedPage, type vPausedRun } from './component/schema.ts';
+import { FORGET_BATCH, FORMAT, isWorkflowNotFound, JOURNAL_READ, type vPausedPage, type vPausedRun } from './component/schema.ts';
 import { HistoryView, type OverlayOp, type StepRef } from './history.ts';
 import { checkMigrations, type Migration, type MigrationsComponent, type PauseInfo, recordedStep, type WorkflowMigrations } from './migrations.ts';
 import { REPLAY, type ReplayTarget } from './replay.ts';
@@ -356,17 +356,22 @@ export class WorkflowManager extends UpstreamWorkflowManager {
       await ctx.runMutation(this.migrationsComponent.runs.forget, { workflowIds: [workflowId] });
       return false;
     }
-    // Before upstream deletes the journal, which names the children of a run from before adoption.
-    if (finished) await this.forget(ctx, [workflowId]);
+    // Before upstream deletes the journal, which names the children of a run from before adoption. From a mutation, upstream's
+    // cleanup reads the journal again in the same transaction: forget leaves it the read budget for that.
+    if (finished) await this.forget(ctx, [workflowId], 'db' in ctx ? JOURNAL_READ : undefined);
     return await super.cleanup(ctx, workflowId);
   }
 
-  /** Deletes the records of these runs and of their descendants, through `runs.forget`, which can read upstream's journals. */
-  private async forget(ctx: MutationCtx | ActionCtx, workflowIds: readonly string[]): Promise<void> {
+  /**
+   * Deletes the records of these runs and of their descendants, through `runs.forget`, which can read upstream's journals;
+   * `reserve` is the read budget it leaves for the caller's transaction.
+   */
+  private async forget(ctx: MutationCtx | ActionCtx, workflowIds: readonly string[], reserve?: number): Promise<void> {
     if (workflowIds.length === 0) return;
     const journal = await createFunctionHandle(this.component.journal.load);
     for (let i = 0; i < workflowIds.length; i += FORGET_BATCH) {
-      await ctx.runMutation(this.migrationsComponent.runs.forget, { workflowIds: workflowIds.slice(i, i + FORGET_BATCH), journal });
+      const batch = { workflowIds: workflowIds.slice(i, i + FORGET_BATCH), journal };
+      await ctx.runMutation(this.migrationsComponent.runs.forget, reserve === undefined ? batch : { ...batch, reserve });
     }
   }
 
