@@ -24,11 +24,35 @@ import type { FunctionReference } from "convex/server";
 export type ComponentApi<Name extends string | undefined = string | undefined> =
   {
     runs: {
+      claim: FunctionReference<
+        "mutation",
+        "internal",
+        { workflowId: string },
+        {
+          detail: string;
+          generationNumber: number;
+          reason:
+            | "mismatch"
+            | "args"
+            | "threw"
+            | "migration"
+            | "migrations"
+            | "overlay";
+        },
+        Name
+      >;
       cleanup: FunctionReference<
         "mutation",
         "internal",
         { workflowId: string },
         number,
+        Name
+      >;
+      cleanupMany: FunctionReference<
+        "mutation",
+        "internal",
+        { workflowIds: Array<string> },
+        null,
         Name
       >;
       list: FunctionReference<
@@ -52,6 +76,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
             at: number;
             attempts: number;
             detail: string;
+            lastError?: string;
             nextAttemptAt: number;
             reason:
               | "mismatch"
@@ -59,8 +84,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
               | "threw"
               | "migration"
               | "migrations"
-              | "overlay"
-              | "error";
+              | "overlay";
             step?: number;
             workflow: string;
             workflowId: string;
@@ -98,11 +122,14 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
             | { args: any; op: "workflowArgs" }
           >;
           paused?: {
+            appliedCount: number;
             at: number;
             attempts: number;
+            claimedUntil?: number;
             detail: string;
             generationNumber: number;
             handle: string;
+            lastError?: string;
             nextAttemptAt: number;
             reason:
               | "mismatch"
@@ -110,11 +137,12 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
               | "threw"
               | "migration"
               | "migrations"
-              | "overlay"
-              | "error";
+              | "overlay";
             step?: number;
+            stepId?: string;
           };
-          restart?: number | string;
+          restart?: string;
+          restartFrom?: number;
           workflow: string;
         } | null,
         Name
@@ -123,6 +151,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         "mutation",
         "internal",
         {
+          appliedCount: number;
           detail: string;
           generationNumber: number;
           handle: string;
@@ -132,9 +161,9 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
             | "threw"
             | "migration"
             | "migrations"
-            | "overlay"
-            | "error";
+            | "overlay";
           step?: number;
+          stepId?: string;
           workflow: string;
           workflowId: string;
         },
@@ -147,8 +176,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
             | "threw"
             | "migration"
             | "migrations"
-            | "overlay"
-            | "error";
+            | "overlay";
         },
         Name
       >;
@@ -162,7 +190,12 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
       resumeAll: FunctionReference<
         "mutation",
         "internal",
-        { cursor?: string | null; numItems?: number; workflow?: string },
+        {
+          cursor?: string | null;
+          numItems?: number;
+          until?: number;
+          workflow?: string;
+        },
         null,
         Name
       >;

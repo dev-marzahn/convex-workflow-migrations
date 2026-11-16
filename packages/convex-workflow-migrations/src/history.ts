@@ -4,7 +4,7 @@
 import type { FunctionArgs, FunctionReference, FunctionReturnType } from 'convex/server';
 import { convexToJson, getConvexSize, type Infer, jsonToConvex, type Value } from 'convex/values';
 
-import { capDetail, type vOverlayOp, type vStepKind } from './component/schema.ts';
+import { capDetail, type vOverlayOp, type vPauseReason, type vStepKind } from './component/schema.ts';
 import { safeFunctionName } from './vendor/workflow/safeFunctionName.ts';
 import type { RunResult, WorkflowReturnType } from './vendor/workflow/types.ts';
 
@@ -205,6 +205,8 @@ export class HistoryView implements History {
   private readonly order: ReadonlyMap<string, number>;
   private args: unknown;
   private nextId = 1;
+  /** Stand-ins of the stored overlay whose anchor is gone from the journal. */
+  private readonly dropped = new Set<string>();
   /** The migration running now, and the operations each one added and the edits it made. */
   private migrating: string | typeof RESTART | undefined;
   private readonly origin = new Map<OverlayOp, string | typeof RESTART>();
@@ -225,7 +227,7 @@ export class HistoryView implements History {
     this.args = clone(args);
     for (const op of overlay) {
       if ('id' in op) this.nextId = Math.max(this.nextId, Number(op.id.slice(1)) + 1 || 0);
-      this.apply(clone(op));
+      if (!this.apply(clone(op)) && op.op === 'insert') this.dropped.add(op.id);
     }
   }
 
@@ -378,6 +380,11 @@ export class HistoryView implements History {
     return node !== undefined && (node.standIn !== undefined || node.result !== undefined);
   }
 
+  /** The id of the first journal entry at `position` or after it, if there's one. */
+  public recordedAt(position: number): string | undefined {
+    return this.nodes.slice(position).find((node) => node.recorded)?.id;
+  }
+
   /** Whether the step at `position` or a later one is a journal entry. */
   public recordedFrom(position: number): boolean {
     return this.nodes.slice(position).some((node) => node.recorded);
@@ -398,6 +405,16 @@ export class HistoryView implements History {
     return this.nodes.some(
       (node) => node.recorded?.startedAt === newest && node.recorded.runResult !== undefined && node.recorded.runResult.kind !== 'success' && !node.rewritten,
     );
+  }
+
+  /**
+   * Whether the step with id `id` is gone because upstream deleted it from
+   * the journal (as its `restart({ from })` does), rather than because a
+   * migration removed it: a journal entry that isn't in the journal any
+   * more, or a stand-in dropped with the step it was anchored to.
+   */
+  public deleted(id: string): boolean {
+    return id.startsWith('+') ? this.dropped.has(id) : !this.order.has(id);
   }
 
   /** The position of the step with id `id`, or -1 if the history doesn't have it. */
@@ -563,7 +580,7 @@ export class HistoryView implements History {
 }
 
 /** Why a run pauses instead of replaying, or instead of completing. */
-export type PauseReason = 'mismatch' | 'args' | 'threw' | 'migration' | 'migrations' | 'overlay' | 'error';
+export type PauseReason = Infer<typeof vPauseReason>;
 
 /**
  * The run can't replay on this code: it pauses. `position` is where in the

@@ -84,18 +84,28 @@ const list = (ids: readonly string[]) => (ids.length === 0 ? 'none' : ids.map((i
 const message = (error: unknown) => (error instanceof Error ? error.message : String(error));
 const kib = (bytes: number) => `${Math.ceil(bytes / 1024)} KiB`;
 
+/** What `prepareHistory` reads from a run's record. */
+export type StoredRecord = {
+  applied: readonly string[];
+  overlay: readonly OverlayOp[];
+  /** From `restart`: the id of the step to remove the history from. */
+  restart?: string;
+  /** From `restartFrom`: the position to remove the history from, in the history the pause saw. */
+  restartFrom?: number;
+  /** The pause `restartFrom`'s position was read from. */
+  pause?: { step?: number; stepId?: string; appliedCount: number };
+  format?: number;
+};
+
 /**
  * Builds the history from the journal and the stored overlay and applies the
- * migrations the run hasn't had, in memory. `restart` then removes every
- * step from that position on (from `restartFrom`), or from that step on
- * (from `restart`, by id).
+ * migrations the run hasn't had, in memory. Then `restart` removes every
+ * step from that step on (by id), and `restartFrom` from that position on.
+ * Throws if `restartFrom` is past the end of the history, or the history
+ * changed since the pause it was read from: a release added migrations, or
+ * the paused step moved.
  */
-export function prepareHistory(
-  journal: readonly RecordedStep[],
-  stored: { applied: readonly string[]; overlay: readonly OverlayOp[]; restart?: number | string; format?: number },
-  migrations: readonly Migration[],
-  args: unknown,
-): Prepared {
+export function prepareHistory(journal: readonly RecordedStep[], stored: StoredRecord, migrations: readonly Migration[], args: unknown): Prepared {
   const applied = [...stored.applied];
   const ran: Prepared['ran'] = [];
   if ((stored.format ?? 1) > FORMAT) {
@@ -129,19 +139,40 @@ export function prepareHistory(
   }
   if (stored.restart !== undefined) {
     // From `restart`, the id of the step it named: where that step is now.
-    const position = typeof stored.restart === 'number' ? stored.restart : history.position(stored.restart);
-    if (position < 0) {
+    const position = history.position(stored.restart);
+    if (position >= 0) {
+      try {
+        history.truncate(position);
+      } catch (error) {
+        return blocked(new ReplayPause('migration', message(error)));
+      }
+    } else if (!history.deleted(stored.restart)) {
       const detail = `Can't restart from step ${stored.restart}: a migration removed it. Use restartFrom with a position in the history.`;
       return blocked(new ReplayPause('migration', detail));
     }
+    // Otherwise upstream's restart deleted the step's journal entry, and every step from there on with it.
+  }
+  if (stored.restartFrom !== undefined) {
+    const { pause, restartFrom } = stored;
+    if (
+      pause &&
+      (pause.appliedCount !== applied.length || (pause.step !== undefined && pause.stepId !== undefined && history.idAt(pause.step) !== pause.stepId))
+    ) {
+      throw new Error(
+        `restartFrom: the history changed since the run paused (a release added migrations, or the steps before step ${pause.step ?? 0} changed), so its positions moved. Call resume, then read the position from paused again.`,
+      );
+    }
+    if (restartFrom >= history.length) {
+      throw new Error(`restartFrom: the history has ${history.length} steps, so step must be below ${history.length}, got ${restartFrom}.`);
+    }
     try {
-      history.truncate(position);
+      history.truncate(restartFrom);
     } catch (error) {
       return blocked(new ReplayPause('migration', message(error)));
     }
   }
   // The stored overlay fit; only what this handler run added can make it too big to save.
-  if (ran.length > 0 || stored.restart !== undefined) {
+  if (ran.length > 0 || stored.restart !== undefined || stored.restartFrom !== undefined) {
     const { bytes, added, largest } = history.size();
     if (bytes > OVERLAY_LIMIT) {
       const causes: string[] = [];
@@ -184,7 +215,7 @@ export class RunRecord implements Replay {
     private readonly migrations: WorkflowMigrations,
     private readonly workflowId: WorkflowId,
     private readonly workflow: string,
-    private readonly stored: { applied: readonly string[]; overlay: readonly OverlayOp[]; dirty: boolean },
+    private readonly stored: { applied: readonly string[]; overlay: readonly OverlayOp[]; dirty: boolean; exists: boolean },
     private readonly prepared: Prepared,
     /** Whether the run has journal entries: it isn't new. */
     public readonly hasHistory: boolean,
@@ -206,14 +237,17 @@ export class RunRecord implements Replay {
     // starts with every migration applied.
     const applied = row ? row.applied : journal.length === 0 ? migrations.list.map((m) => m.id) : [];
     const overlay = row?.overlay ?? [];
-    const prepared = prepareHistory(
-      journal.map(recordedStep),
-      { applied, overlay, ...(row?.restart === undefined ? {} : { restart: row.restart }), ...(row ? { format: row.format } : {}) },
-      migrations.list,
-      args,
-    );
-    const dirty = !row || row.workflow !== workflow || row.paused !== undefined || row.restart !== undefined || row.format !== FORMAT;
-    return new RunRecord(migrations, workflowId, workflow, { applied, overlay, dirty }, prepared, journal.length > 0);
+    const stored: StoredRecord = { applied, overlay };
+    if (row) {
+      stored.format = row.format;
+      if (row.restart !== undefined) stored.restart = row.restart;
+      if (row.restartFrom !== undefined) stored.restartFrom = row.restartFrom;
+      if (row.paused) stored.pause = row.paused;
+    }
+    const prepared = prepareHistory(journal.map(recordedStep), stored, migrations.list, args);
+    const dirty =
+      !row || row.workflow !== workflow || row.paused !== undefined || row.restart !== undefined || row.restartFrom !== undefined || row.format !== FORMAT;
+    return new RunRecord(migrations, workflowId, workflow, { applied, overlay, dirty, exists: row !== null }, prepared, journal.length > 0);
   }
 
   /** The history to replay against. */
@@ -242,6 +276,8 @@ export class RunRecord implements Replay {
     const overlay = history.overlay();
     const same = this.stored.applied.length === applied.length && this.stored.applied.every((id, i) => applied[i] === id);
     if (!this.stored.dirty && same && sameOverlay(this.stored.overlay, overlay)) return;
+    // A missing record already means nothing applied and no overlay.
+    if (!this.stored.exists && applied.length === 0 && overlay.length === 0) return;
     await ctx.runMutation(this.migrations.component.runs.save, { workflowId: this.workflowId, workflow: this.workflow, applied, overlay });
   }
 
@@ -254,11 +290,14 @@ export class RunRecord implements Replay {
    */
   public async pause(ctx: MutationCtx, generationNumber: number, cause: ReplayPause, console: Logger): Promise<void> {
     const pause = { reason: cause.reason, detail: cause.detail, ...(cause.position === undefined ? {} : { step: cause.position }) };
+    const stepId = cause.position === undefined ? undefined : this.prepared.history.idAt(cause.position);
     const handle = await createFunctionHandle(makeFunctionReference<'mutation'>(this.workflow));
     const { notify, attempts, previousReason } = await ctx.runMutation(this.migrations.component.runs.pause, {
       workflowId: this.workflowId,
       workflow: this.workflow,
       ...pause,
+      ...(stepId === undefined ? {} : { stepId }),
+      appliedCount: this.prepared.applied.length,
       handle,
       generationNumber,
     });

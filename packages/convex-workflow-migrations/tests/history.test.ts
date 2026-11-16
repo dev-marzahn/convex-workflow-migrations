@@ -375,8 +375,43 @@ test('prepareHistory refuses a record from a newer format, and an overlay over t
   const full = new HistoryView(journal());
   full.insertAfter(fn.grab, fn.notify, { result: 'x'.repeat(OVERLAY_LIMIT - empty.size().bytes - 10) });
   expect(full.size().bytes).toBeLessThan(OVERLAY_LIMIT);
-  const restarted = prepareHistory(journal(), { applied: [], overlay: full.overlay(), restart: 2 }, [], {});
+  const restarted = prepareHistory(journal(), { applied: [], overlay: full.overlay(), restartFrom: 2 }, [], {});
   expect(restarted.blocked?.detail).toMatch(/ KiB limit\. The restart added the most, 1 KiB\. Most of it was stored before, \d+ KiB\.$/);
+});
+
+test("prepareHistory's restartFrom checks the position still means what the pause saw", () => {
+  const notify = migration('notify', (h) => h.insertAfter(fn.grab, fn.notify, { result: null }));
+  const log = migration('log', (h) => h.insertAfter({ event: 'downloadDone' }, fn.log, { result: null }));
+  const stored = { applied: [], overlay: [] };
+  // Paused at the stand-in, position 1, with one migration applied.
+  const pause = { step: 1, stepId: '+1', appliedCount: 1 };
+  expect(names(prepareHistory(journal(), { ...stored, restartFrom: 1, pause }, [notify], {}).history)).toEqual(['grab']);
+  // A release added a migration: the count changed.
+  expect(() => prepareHistory(journal(), { ...stored, restartFrom: 1, pause }, [notify, log], {})).toThrow(
+    'restartFrom: the history changed since the run paused',
+  );
+  // The paused step moved: another step is at its position.
+  const moved = { step: 1, stepId: 'j1', appliedCount: 1 };
+  expect(() => prepareHistory(journal(), { ...stored, restartFrom: 2, pause: moved }, [notify], {})).toThrow('the history changed since the run paused');
+  // A pause without a step only checks the count.
+  expect(names(prepareHistory(journal(), { ...stored, restartFrom: 2, pause: { appliedCount: 1 } }, [notify], {}).history)).toEqual(['grab', 'notify']);
+  expect(() => prepareHistory(journal(), { ...stored, restartFrom: 4 }, [notify], {})).toThrow('step must be below 4, got 4');
+});
+
+test("prepareHistory's restart: a step upstream deleted leaves nothing to cut, a step a migration removed pauses", () => {
+  const drop = migration('drop-wait', (h) => h.remove({ event: 'downloadDone' }));
+  // Upstream's restart deleted the wait and import; the stand-in after the wait went with them.
+  const overlay: OverlayOp[] = [
+    { op: 'insert', id: '+1', where: 'after', anchor: 'j0', name: 'flows:notify', kind: 'function', result: null },
+    { op: 'insert', id: '+2', where: 'after', anchor: 'j1', name: 'flows:check', kind: 'function', result: null },
+  ];
+  const kept = journal().slice(0, 1);
+  for (const restart of ['j1', '+2']) {
+    const prepared = prepareHistory(kept, { applied: [], overlay, restart }, [], {});
+    expect(prepared.blocked).toBeUndefined();
+    expect(names(prepared.history)).toEqual(['grab', 'notify']);
+  }
+  expect(prepareHistory(journal(), { applied: [], overlay: [], restart: 'j1' }, [drop], {}).blocked?.detail).toContain('a migration removed it');
 });
 
 test('redactHistory passes every step and the run args through redact', async () => {
