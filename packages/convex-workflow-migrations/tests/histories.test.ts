@@ -2,7 +2,7 @@
 // The `histories` CLI's reads, against a fake `convex run`.
 import { expect, test } from 'vite-plus/test';
 
-import { collectRuns, type PublicWorkflow, type Query, READS, runHistory } from '../src/histories.ts';
+import { collectRuns, MAX_RUNS, MAX_SCAN, type PublicWorkflow, type Query, READS, readRuns, runHistory } from '../src/histories.ts';
 
 /** Pages like Convex: a full page says it isn't done, even when nothing follows it. */
 function paginate<T>(items: readonly T[], { numItems, cursor }: { numItems: number; cursor: string | null }) {
@@ -69,29 +69,87 @@ test('the running runs come from the component; upstream is scanned only for run
   const { query, calls } = deployment(runs);
   const collected = collectRuns(query, both, 'p:run', { maxRuns: 1000, recent: 2 });
   expect(collected.running).toEqual(['p2', 'a0', ...runs.slice(5).map((run) => run.workflowId), 'p0']);
+  expect(collected.live).toEqual(['p2', 'a0', ...runs.slice(5).map((run) => run.workflowId)]);
   expect(collected.finished).toEqual(['a1', 'p1']);
-  expect(collected).toMatchObject({ scanned: 3, more: false, last: 'p2' });
+  expect(collected).toMatchObject({ scanned: 3, last: 'p2' });
+  expect(collected.stopped).toBeUndefined();
   // One page of the oldest runs, not every run.
   expect(calls.filter((call) => call.path === 'workflow:listByName' && call.order === 'asc')).toHaveLength(1);
   expect(calls.filter((call) => call.path === 'runs:origins')).toHaveLength(1);
 });
 
-test('--max-runs bounds the scan of runs from before adoption alone; exactly that many is not more', () => {
-  const before = (n: number): Run[] => Array.from({ length: n }, (_, i) => ({ workflowId: `p${i}`, args: {} }));
-  const after = Array.from({ length: 150 }, (_, i): Run => ({ workflowId: `a${i}`, args: {}, origin: 'start', live: true }));
+const before = (n: number, running = true): Run[] =>
+  Array.from({ length: n }, (_, i) => ({ workflowId: `p${i}`, args: {}, ...(running ? {} : { runResult: done }) }));
+const after = Array.from({ length: 150 }, (_, i): Run => ({ workflowId: `a${i}`, args: {}, origin: 'start', live: true }));
+
+test('--max-runs bounds the running runs from before adoption; exactly that many is not more', () => {
   for (const maxRuns of [1, 2, 100, 150]) {
     const exact = collectRuns(deployment([...before(maxRuns), ...after]).query, both, 'p:run', { maxRuns, recent: 0 });
-    expect(exact).toMatchObject({ scanned: maxRuns, more: false });
+    expect(exact).toMatchObject({ scanned: maxRuns });
+    expect(exact.stopped).toBeUndefined();
     // Every live run, whatever --max-runs is.
     expect(exact.running).toHaveLength(150 + maxRuns);
     const over = collectRuns(deployment([...before(maxRuns + 1), ...after]).query, both, 'p:run', { maxRuns, recent: 0 });
-    expect(over).toMatchObject({ scanned: maxRuns, more: true, last: `p${maxRuns - 1}` });
+    expect(over).toMatchObject({ scanned: maxRuns, stopped: 'max-runs', last: `p${maxRuns - 1}` });
     // The newer ones from before adoption are the ones left out.
     expect(over.running).not.toContain(`p${maxRuns}`);
   }
   // Without the migrations component, every run is from before adoption.
-  expect(collectRuns(deployment(after).query, { workflow: 'workflow' }, 'p:run', { maxRuns: 150, recent: 0 })).toMatchObject({ scanned: 150, more: false });
-  expect(collectRuns(deployment(after).query, { workflow: 'workflow' }, 'p:run', { maxRuns: 149, recent: 0 })).toMatchObject({ more: true });
+  expect(collectRuns(deployment(after).query, { workflow: 'workflow' }, 'p:run', { maxRuns: 150, recent: 0 })).toMatchObject({ scanned: 150 });
+  expect(collectRuns(deployment(after).query, { workflow: 'workflow' }, 'p:run', { maxRuns: 149, recent: 0 })).toMatchObject({ stopped: 'max-runs' });
+});
+
+test('finished runs from before adoption count toward --max-scan, not --max-runs: 1,500 of them export with the defaults', () => {
+  // An app that adopted the package with 1,500 old runs it never cleaned up, all finished, and one still running.
+  const runs = [...before(1500, false), { workflowId: 'old', args: {} }, ...after];
+  const { query, calls } = deployment(runs);
+  const collected = collectRuns(query, both, 'p:run', { maxRuns: MAX_RUNS, recent: 0 });
+  expect(collected).toMatchObject({ scanned: 1501, last: 'old' });
+  expect(collected.stopped).toBeUndefined();
+  expect(collected.running).toContain('old');
+  expect(collected.running).toHaveLength(151);
+  // 16 pages of 100: one origins call each.
+  expect(calls.filter((call) => call.path === 'runs:origins')).toHaveLength(16);
+  // --max-runs 1 is enough: only one is running.
+  expect(collectRuns(deployment(runs).query, both, 'p:run', { maxRuns: 1, recent: 0 }).stopped).toBeUndefined();
+});
+
+test('--max-scan bounds the runs from before adoption it reads, finished ones included; exactly that many is not more', () => {
+  expect(MAX_SCAN).toBeGreaterThan(MAX_RUNS);
+  for (const maxScan of [1, 100, 1500]) {
+    const exact = collectRuns(deployment([...before(maxScan, false), ...after]).query, both, 'p:run', { maxRuns: 1, maxScan, recent: 0 });
+    expect(exact).toMatchObject({ scanned: maxScan });
+    expect(exact.stopped).toBeUndefined();
+    const over = collectRuns(deployment([...before(maxScan, false), { workflowId: 'late', args: {} }, ...after]).query, both, 'p:run', {
+      maxRuns: 1,
+      maxScan,
+      recent: 0,
+    });
+    expect(over).toMatchObject({ scanned: maxScan, stopped: 'max-scan', last: `p${maxScan - 1}` });
+    // A running run past the cap is the one it can't see.
+    expect(over.running).not.toContain('late');
+    expect(over.running).toHaveLength(150);
+  }
+  // It asks for no more than it may read: a page of maxScan + 1 at most.
+  const { query, calls } = deployment([...before(10, false), ...after]);
+  collectRuns(query, both, 'p:run', { maxRuns: 1, maxScan: 5, recent: 0 });
+  expect(calls.filter((call) => call.path === 'workflow:listByName' && call.order === 'asc').map((call) => call.numItems)).toEqual([6]);
+});
+
+test('readRuns counts the live runs that had finished past the manager, and exports only the running and the recent finished ones', () => {
+  const runs: Run[] = [
+    { workflowId: 'running', args: {}, origin: 'start', live: true },
+    // Canceled with its parent past the manager: still live in the component.
+    { workflowId: 'stale', args: {}, origin: 'child', live: true, runResult: { kind: 'canceled' } },
+    { workflowId: 'recent', args: {}, origin: 'start', runResult: done },
+  ];
+  const { query } = deployment(runs);
+  const collected = collectRuns(query, both, 'p:run', { maxRuns: 1, recent: 1 });
+  expect(collected).toMatchObject({ live: ['running', 'stale'], finished: ['recent'] });
+  const { histories, finishedLive } = readRuns(query, both, 'p:run', collected, 10);
+  expect(finishedLive).toBe(1);
+  // Newest first.
+  expect(histories.map((h) => h.workflowId)).toEqual(['recent', 'running']);
 });
 
 test('a run with exactly --max-steps steps is not truncated; one more is, and so is a journal too big to load', () => {
