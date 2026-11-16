@@ -6,7 +6,7 @@ Fixes go into the latest release. Upgrade to it before you report.
 
 ## Reporting a vulnerability
 
-Don't open a public issue. Report it through [GitHub's private vulnerability reporting](https://github.com/dev-marzahn/convex-workflow-patches/security/advisories/new) with the version, the steps to reproduce it and what an attacker gains.
+Don't open a public issue. Report it through [GitHub's private vulnerability reporting](https://github.com/dev-marzahn/convex-workflow-migrations/security/advisories/new) with the version, the steps to reproduce it and what an attacker gains.
 
 ## Scope
 

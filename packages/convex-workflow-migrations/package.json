@@ -11,15 +11,15 @@
     "versioning",
     "workflow"
   ],
-  "homepage": "https://github.com/dev-marzahn/convex-workflow-patches#readme",
+  "homepage": "https://github.com/dev-marzahn/convex-workflow-migrations#readme",
   "bugs": {
-    "url": "https://github.com/dev-marzahn/convex-workflow-patches/issues"
+    "url": "https://github.com/dev-marzahn/convex-workflow-migrations/issues"
   },
   "license": "MPL-2.0 AND Apache-2.0",
   "author": "Leon Marzahn",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/dev-marzahn/convex-workflow-patches.git",
+    "url": "git+https://github.com/dev-marzahn/convex-workflow-migrations.git",
     "directory": "packages/convex-workflow-migrations"
   },
   "bin": {
