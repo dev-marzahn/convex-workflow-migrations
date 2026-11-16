@@ -1,12 +1,12 @@
 /// <reference types="vite/client" />
-import migrationsTest, { expectEdits, expectReplays, history, migrate } from '@dev-marzahn/convex-workflow-migrations/test';
+// The current code from scratch, on convex-test with both components. This
+// needs vite.config.ts: the edge-runtime environment, and the packages whose
+// test helpers use import.meta.glob inlined, /test among them.
+import migrationsTest from '@dev-marzahn/convex-workflow-migrations/test';
 import { convexTest } from 'convex-test';
-import { makeFunctionReference } from 'convex/server';
 import { afterEach, beforeEach, expect, test, vi } from 'vite-plus/test';
 
-import { api, internal } from './_generated/api';
-import type { Id } from './_generated/dataModel';
-import { run } from './pipeline';
+import { api } from './_generated/api';
 import schema from './schema';
 
 const modules = import.meta.glob('./**/*.ts');
@@ -20,50 +20,6 @@ function setup() {
 beforeEach(() => vi.useFakeTimers());
 afterEach(() => vi.useRealTimers());
 
-// Histories the older releases recorded, as `npx convex-workflow-migrations
-// histories pipeline:run` exports them, or built by hand.
-const grabId = 'k57' as Id<'grabs'>;
-const prepare = makeFunctionReference<'mutation'>('pipeline:prepare');
-const release0 = {
-  waiting: history(
-    [
-      { step: internal.pipeline.grab, args: { grabId } },
-      { event: 'downloadDone', status: 'running' },
-    ],
-    { args: { grabId } },
-  ),
-  preparing: history(
-    [
-      { step: internal.pipeline.grab, args: { grabId } },
-      { event: 'downloadDone' },
-      { step: internal.pipeline.importFiles, args: { grabId } },
-      { step: prepare, args: { grabId } },
-    ],
-    { args: { grabId } },
-  ),
-};
-const release2Waiting = history(
-  [
-    { step: internal.pipeline.grab, args: { grabId } },
-    { step: internal.pipeline.notify, args: { grabId }, result: { at: 1700000000000 } },
-    { event: 'downloadDone', status: 'running' },
-  ],
-  { args: { grabId }, applied: ['notify-after-grab', 'import-gets-notified-at'] },
-);
-
-// The replay tests need no Convex backend: they take the workflow mutation itself.
-test('runs from every older release replay on the current code', async () => {
-  await expectReplays(run, [release0.waiting, release0.preparing, release2Waiting]);
-});
-
-test('a run from release 0 gets a stand-in notify and imports without a time', async () => {
-  const migrated = await migrate(run, release0.preparing);
-  expect(migrated.steps.map((step) => step.name)).toEqual(['pipeline:grab', 'pipeline:notify', 'downloadDone', 'pipeline:importFiles', 'pipeline:transcode']);
-  expect(migrated.steps[3]?.args).toEqual({ grabId, notifiedAt: null });
-  await expectEdits(migrated);
-});
-
-// The current code from scratch, on convex-test with both components.
 test('a grab started on the current release runs every step', async () => {
   const t = setup();
   const { grabId, workflowId } = await t.mutation(api.pipeline.startGrab, { title: 'Some Show S01E01' });

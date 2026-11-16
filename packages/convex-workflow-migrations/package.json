@@ -41,6 +41,10 @@
     "./_generated/component.js": {
       "types": "./dist/component/_generated/component.d.ts"
     },
+    "./replay": {
+      "types": "./dist/helpers.d.ts",
+      "default": "./dist/helpers.js"
+    },
     "./test": {
       "types": "./dist/test.d.ts",
       "default": "./dist/test.js"

@@ -1,14 +1,18 @@
 // @vitest-environment node
 // Every upstream export is re-exported, replaced or left out on purpose.
 // Values are checked at runtime; types don't exist then, so their names are
-// read from upstream's declarations and this package's source.
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+// read from upstream's declarations and this package's source. And the
+// package's subpaths: /replay needs no Vitest configuration, and /test
+// re-exports it.
+import { existsSync, readFileSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
 
 import * as upstream from '@convex-dev/workflow';
 import { expect, test } from 'vite-plus/test';
 
+import * as replay from '../src/helpers.ts';
 import * as ours from '../src/index.ts';
+import * as withRegister from '../src/test.ts';
 
 /** Upstream exports this package replaces with its own. */
 const REPLACED = ['WorkflowManager'];
@@ -53,4 +57,41 @@ test('every upstream type export is re-exported or left out', () => {
   const upstreamNames = [...exportedNames(readFileSync(UPSTREAM_TYPES, 'utf8'))];
   expect(upstreamNames.length).toBeGreaterThan(10);
   expect(upstreamNames.filter((name) => !names.has(name) && !(name in LEFT_OUT))).toEqual([]);
+});
+
+const SRC = join(import.meta.dirname, '../src');
+const exportsMap = (JSON.parse(readFileSync(join(import.meta.dirname, '../package.json'), 'utf8')) as { exports: Record<string, unknown> }).exports;
+
+test('/replay serves the replay helpers, built from src/helpers.ts, and /test re-exports every one of them', () => {
+  expect(exportsMap['./replay']).toEqual({ types: './dist/helpers.d.ts', default: './dist/helpers.js' });
+  expect(Object.keys(replay).sort()).toEqual(['expectEdits', 'expectReplays', 'history', 'migrate']);
+  for (const name of Object.keys(replay)) expect((withRegister as Record<string, unknown>)[name], name).toBe((replay as Record<string, unknown>)[name]);
+  const testTypes = exportedNames(readFileSync(join(SRC, 'test.ts'), 'utf8'));
+  for (const name of exportedNames(readFileSync(join(SRC, 'helpers.ts'), 'utf8'))) expect(testTypes.has(name), name).toBe(true);
+});
+
+/** Every file of this package that `file` imports, and those files' imports, as source paths. */
+function importClosure(file: string, seen = new Set<string>()): Set<string> {
+  if (seen.has(file)) return seen;
+  seen.add(file);
+  for (const [, spec] of readFileSync(file, 'utf8').matchAll(/^(?:import|export)[^'"]*from\s+['"](\.[^'"]+)['"]/gm)) {
+    const path = resolve(dirname(file), spec!).replace(/\.js$/, '.ts');
+    if (existsSync(path)) importClosure(path, seen);
+  }
+  return seen;
+}
+
+test('/replay imports nothing that needs Vitest configuration: no import.meta.glob, no convex-test, no upstream /test', () => {
+  const closure = [...importClosure(join(SRC, 'helpers.ts'))];
+  expect(closure.length).toBeGreaterThan(5);
+  for (const file of closure) {
+    const source = readFileSync(file, 'utf8');
+    expect(source, file).not.toMatch(/import\.meta\.glob\(/);
+    expect(source, file).not.toMatch(/from ['"]convex-test['"]/);
+    expect(source, file).not.toMatch(/from ['"]@convex-dev\/(workflow|workpool)\/test['"]/);
+  }
+  // The check finds what /test imports.
+  const test_ = readFileSync(join(SRC, 'test.ts'), 'utf8');
+  expect(test_).toMatch(/import\.meta\.glob\(/);
+  expect(test_).toMatch(/from 'convex-test'/);
 });
