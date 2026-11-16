@@ -231,7 +231,7 @@
            createOnly: !args.startAsync, // either start async or run inline here
          })) as WorkflowId;
 +        // PATCHES: every run starts with a record, written with the run.
-+        await recordStart(ctx, migrations, workflowId, metadata.name);
++        await recordStart(ctx, migrations, workflowId);
          if (args.startAsync) {
            return workflowId;
          }

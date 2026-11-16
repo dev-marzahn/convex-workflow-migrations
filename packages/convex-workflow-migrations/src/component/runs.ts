@@ -21,7 +21,7 @@ export const load = query({
   returns: v.union(vRecord, v.null()),
   handler: async (ctx, { workflowId }) => {
     const found = await row(ctx, workflowId);
-    return found && { workflow: found.workflow, applied: found.applied, overlay: found.overlay };
+    return found && { applied: found.applied, overlay: found.overlay };
   },
 });
 

@@ -31,8 +31,6 @@ export const vOverlayOp = v.union(
 );
 
 export const vRecord = v.object({
-  // The workflow's function name.
-  workflow: v.string(),
   // The migration ids applied to the history, in order: a prefix of the workflow's list.
   applied: v.array(v.string()),
   overlay: v.array(vOverlayOp),

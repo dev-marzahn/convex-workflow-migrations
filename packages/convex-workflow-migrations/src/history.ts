@@ -123,6 +123,9 @@ function target(ref: StepRef): { name: string; kind: StepKind | 'function or wor
   return { name: safeFunctionName(ref), kind: 'function or workflow' };
 }
 
+const sameKind = (kind: StepKind, wanted: StepKind | 'function or workflow') =>
+  wanted === 'function or workflow' ? kind === 'function' || kind === 'workflow' : kind === wanted;
+
 function describe(step: StepSelector): string {
   if (isHistoryStep(step)) return `${step.name} (${step.id})`;
   const { name, kind } = target(step);
@@ -134,8 +137,6 @@ export class HistoryView implements History {
   private ops: OverlayOp[] = [];
   private args: unknown;
   private nextId = 1;
-  /** How many edits migrations have made to this view. */
-  private edits = 0;
 
   /**
    * The journal with `overlay` applied in order, and `args` as the run
@@ -185,16 +186,15 @@ export class HistoryView implements History {
 
   public remove(step: StepSelector): void {
     const node = this.find(step, 'remove');
-    if (node) this.push({ op: 'remove', target: node.id });
+    if (node) this.apply({ op: 'remove', target: node.id });
   }
 
   public rename(step: StepSelector, to: StepRef, options: { name?: string } = {}): void {
     const node = this.find(step, 'rename');
     if (!node) return;
     const { name, kind } = target(to);
-    const same = kind === 'function or workflow' ? node.kind === 'function' || node.kind === 'workflow' : node.kind === kind;
-    if (!same) throw new Error(`rename(${describe(step)}, ${describe(to)}): the step's kind (${node.kind}) must stay the same.`);
-    this.push({ op: 'rewrite', target: node.id, name: options.name ?? name });
+    if (!sameKind(node.kind, kind)) throw new Error(`rename(${describe(step)}, ${describe(to)}): the step's kind (${node.kind}) must stay the same.`);
+    this.apply({ op: 'rewrite', target: node.id, name: options.name ?? name });
   }
 
   public updateArgs<R extends StepRef>(step: R | HistoryStep, update: (args: any) => StepArgs<R>): void {
@@ -202,7 +202,7 @@ export class HistoryView implements History {
     if (!node) return;
     const args = update(clone(node.args ?? {}));
     if (args === undefined || (args as unknown) instanceof Promise) throw new Error(`updateArgs(${describe(step)}): the update must return the new args.`);
-    if (!node.argsKnown || json(args) !== json(node.args)) this.push({ op: 'rewrite', target: node.id, args: clone(args) });
+    if (!node.argsKnown || json(args) !== json(node.args)) this.apply({ op: 'rewrite', target: node.id, args: clone(args) });
   }
 
   public updateResult<R extends StepRef>(step: R | HistoryStep, update: (result: any) => StepResult<R>): void {
@@ -216,14 +216,14 @@ export class HistoryView implements History {
     if (result === undefined || (result as unknown) instanceof Promise)
       throw new Error(`updateResult(${describe(step)}): the update must return the new result.`);
     this.rerun(`updateResult(${describe(step)})`, update, result);
-    if (json(result) !== json(current.result)) this.push({ op: 'rewrite', target: node.id, result: clone(result) });
+    if (json(result) !== json(current.result)) this.apply({ op: 'rewrite', target: node.id, result: clone(result) });
   }
 
   public updateWorkflowArgs(update: (args: any) => unknown): void {
     const args = update(this.workflowArgs);
     if (args === undefined || args instanceof Promise) throw new Error('updateWorkflowArgs: the update must return the new args.');
     this.rerun('updateWorkflowArgs', update, args);
-    if (json(args) !== json(this.args)) this.push({ op: 'workflowArgs', args: clone(args) });
+    if (json(args) !== json(this.args)) this.apply({ op: 'workflowArgs', args: clone(args) });
   }
 
   /** With `strict`, throws if `update`, run again on its own `output`, changes it. */
@@ -234,13 +234,6 @@ export class HistoryView implements History {
       `${action}: run again on its own output, the update changed it (${json(output)} became ${again}). ` +
         "It may be in the new shape already, as a step can finish on the new code: leave such a value as it is, for example r => ('size' in r ? r : { ...r, size: null }).",
     );
-  }
-
-  /** Runs a migration's `migrate` on this view. Returns how many edits it made. */
-  public migrateAs(migrate: () => void): number {
-    const before = this.edits;
-    migrate();
-    return this.edits - before;
   }
 
   /** The operations to store: the overlay as loaded, plus this handler run's, without the ones later ones superseded. */
@@ -281,7 +274,7 @@ export class HistoryView implements History {
     const kind = refKind === 'function or workflow' ? 'function' : refKind;
     const op: OverlayOp = { op: 'insert', id: `+${this.nextId++}`, where, anchor: at.id, name, kind, result: clone(options.result ?? null) };
     if (options.args !== undefined) op.args = clone(options.args);
-    this.push(op);
+    this.apply(op);
   }
 
   /** The step `selector` names, or undefined if none is in the history. Throws if a reference matches several, or a step from `h.steps` was removed. */
@@ -298,14 +291,7 @@ export class HistoryView implements History {
 
   private matches(node: Node, ref: StepRef): boolean {
     const { name, kind } = target(ref);
-    if (node.name !== name) return false;
-    return kind === 'function or workflow' ? node.kind === 'function' || node.kind === 'workflow' : node.kind === kind;
-  }
-
-  /** Applies and keeps a migration's edit. */
-  private push(op: OverlayOp): void {
-    this.apply(op);
-    this.edits++;
+    return node.name === name && sameKind(node.kind, kind);
   }
 
   /** Applies one operation and keeps it, in place of the earlier ones it supersedes. Only a stored one can name a step the history lacks. */

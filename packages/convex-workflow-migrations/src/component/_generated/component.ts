@@ -58,7 +58,6 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
               }
             | { args: any; op: "workflowArgs" }
           >;
-          workflow: string;
         } | null,
         Name
       >;
@@ -88,7 +87,6 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
               }
             | { args: any; op: "workflowArgs" }
           >;
-          workflow: string;
           workflowId: string;
         },
         null,

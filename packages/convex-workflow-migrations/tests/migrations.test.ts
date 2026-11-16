@@ -147,7 +147,7 @@ test('a run from release 0 replays on release 3, which lists the migrations of r
   const t = setup();
   const id = await start(t);
   expect(ran).toEqual(['grab']);
-  expect(await record(t, id)).toEqual({ workflow: 'flows:pipeline', applied: [], overlay: [] });
+  expect(await record(t, id)).toEqual({ applied: [], overlay: [] });
   deploy('r3'); // releases 1 and 2 were never deployed
   await downloadDone(t, id);
   expect(await status(t, id)).toEqual(completed);
@@ -168,7 +168,7 @@ test('a run waiting on release 2 replays on release 3: each migration applies on
   await downloadDone(t, id);
   expect(await status(t, id)).toEqual(completed);
   expect(ran).toEqual(['grab', 'notify', 'import {"notifiedAt":1234}', 'transcode', 'publish']);
-  expect(await record(t, id)).toEqual({ workflow: 'flows:pipeline', applied: ALL, overlay: [] });
+  expect(await record(t, id)).toEqual({ applied: ALL, overlay: [] });
 });
 
 test('a queued run gets its record when it is created, so a release that changes its args before its first handler run migrates it', async () => {
@@ -178,7 +178,7 @@ test('a queued run gets its record when it is created, so a release that changes
     await manager.start(ctx, flows.pipeline as Ref, {}, { startAsync: true }),
     (await ctx.runMutation(flows.pipeline as Ref, { args: {}, startAsync: true } as never)) as WorkflowId,
   ]);
-  for (const id of ids) expect(await record(t, id)).toEqual({ workflow: 'flows:pipeline', applied: [], overlay: [] });
+  for (const id of ids) expect(await record(t, id)).toEqual({ applied: [], overlay: [] });
   expect(ran).toEqual([]);
   // The release that adds the channel lands before they first run: their args still pass, and its migration gives them one,
   // because the record says they're from before it.
@@ -207,7 +207,7 @@ test('a queued child has no record: at its first handler run, its args pick its 
   expect((await record(t, child))?.applied).toEqual(['channel-arg']);
   // A child whose args pass is from the current code: nothing applies.
   const fresh = await start(t, { channel: 'main' });
-  expect(await record(t, fresh)).toEqual({ workflow: 'flows:pipeline', applied: ['channel-arg'], overlay: [] });
+  expect(await record(t, fresh)).toEqual({ applied: ['channel-arg'], overlay: [] });
 });
 
 test.each([

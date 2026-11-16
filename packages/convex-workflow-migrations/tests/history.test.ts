@@ -246,14 +246,15 @@ test('journal entries from old upstream versions without a kind count as functio
   expect(recordedStep(entry as unknown as JournalEntry)).toMatchObject({ id: 'j0', kind: 'function', startedAt: 5 });
 });
 
-test('prepareHistory applies the pending migrations, counting their edits, and refuses what it cannot apply', () => {
+test('prepareHistory applies the pending migrations, and refuses what it cannot apply', () => {
   const notify = migration('notify', (h) => h.insertAfter(fn.grab, fn.notify, { result: null }));
   const none = migration('none', (h) => h.remove(fn.missing));
   const prepared = prepareHistory(journal(), { applied: ['notify'], overlay: [] }, [notify, none], {});
-  expect([prepared.applied, prepared.ran]).toEqual([['notify', 'none'], [{ id: 'none', edits: 0 }]]);
-  expect(prepareHistory(journal(), { applied: [], overlay: [] }, [notify, none], {}).ran).toEqual([
-    { id: 'notify', edits: 1 },
-    { id: 'none', edits: 0 },
+  expect([prepared.applied, prepared.ran]).toEqual([['notify', 'none'], ['none']]);
+  const all = prepareHistory(journal(), { applied: [], overlay: [] }, [notify, none], {});
+  expect([all.ran, names(all.history)]).toEqual([
+    ['notify', 'none'],
+    ['grab', 'notify', 'downloadDone', 'importFiles'],
   ]);
   // Applied ids that aren't a prefix of the list: removed, reordered, or a rollback.
   expect(() => prepareHistory(journal(), { applied: ['none'], overlay: [] }, [notify, none], {})).toThrow(
@@ -283,7 +284,7 @@ test('prepareRun: applied ids are used; without them, the journal or the args de
     channel: 'default',
   });
   // None, with journal entries: from before the first migration, so every migration applies.
-  expect(prepareRun(journal(), { overlay: [] }, list, {}, hasChannel).ran.map((m) => m.id)).toEqual(['notify', 'channel']);
+  expect(prepareRun(journal(), { overlay: [] }, list, {}, hasChannel).ran).toEqual(['notify', 'channel']);
   // None, and an empty journal (a queued child): args that pass mean the code that started it is this one.
   const current = prepareRun([], { overlay: [] }, list, { channel: 'main' }, hasChannel);
   expect([current.applied, current.ran, current.history.workflowArgs]).toEqual([['notify', 'channel'], [], { channel: 'main' }]);

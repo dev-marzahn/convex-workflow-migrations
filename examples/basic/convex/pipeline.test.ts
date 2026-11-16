@@ -2,7 +2,7 @@
 // Histories the older releases recorded, replayed against the current code
 // with the helpers from /replay: no Convex backend, no convex-test, and no
 // Vitest configuration needed.
-import { expectEdits, expectReplays, history, migrate } from '@dev-marzahn/convex-workflow-migrations/replay';
+import { expectReplays, history, migrate } from '@dev-marzahn/convex-workflow-migrations/replay';
 import { makeFunctionReference } from 'convex/server';
 import { expect, test } from 'vite-plus/test';
 
@@ -44,9 +44,8 @@ test('runs from every older release replay on the current code', async () => {
   await expectReplays(run, [release0.waiting, release0.preparing, release2Waiting]);
 });
 
-test('a run from release 0 gets a stand-in notify and imports without a time', async () => {
-  const migrated = await migrate(run, release0.preparing);
+test('a run from release 0 gets a stand-in notify and imports without a time', () => {
+  const migrated = migrate(run, release0.preparing);
   expect(migrated.steps.map((step) => step.name)).toEqual(['pipeline:grab', 'pipeline:notify', 'downloadDone', 'pipeline:importFiles', 'pipeline:transcode']);
   expect(migrated.steps[3]?.args).toEqual({ grabId, notifiedAt: null });
-  await expectEdits(migrated);
 });

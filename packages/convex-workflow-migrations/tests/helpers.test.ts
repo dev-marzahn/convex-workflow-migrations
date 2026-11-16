@@ -4,7 +4,7 @@ import { anyApi, componentsGeneric } from 'convex/server';
 import { v } from 'convex/values';
 import { expect, test } from 'vite-plus/test';
 
-import { expectEdits, expectReplays, history, migrate } from '../src/helpers.ts';
+import { expectReplays, history, migrate } from '../src/helpers.ts';
 import { migration, type MigrationsComponent, type WorkflowComponent, type WorkflowCtx, WorkflowManager } from '../src/index.ts';
 
 const components = componentsGeneric() as unknown as { workflow: WorkflowComponent; workflowMigrations: MigrationsComponent };
@@ -105,7 +105,7 @@ test('the helpers take the workflow mutation, not a function reference', async (
   await expect(expectReplays(flows.current as never, [release0Waiting])).rejects.toThrow(
     "expectReplays takes a workflow that this package's WorkflowManager defined: the mutation workflow.define returned, not a function reference.",
   );
-  await expect(migrate(flows.current as never, release0Waiting)).rejects.toThrow('migrate takes a workflow');
+  expect(() => migrate(flows.current as never, release0Waiting)).toThrow('migrate takes a workflow');
 });
 
 test('expectReplays reports the history, the position, both calls and the migrated history when one does not replay', async () => {
@@ -146,11 +146,11 @@ test('expectReplays checks the workflow args as the migrations leave them; an em
   const message = await failure(expectReplays(workflows.withArgUnguarded, [release0Waiting]));
   expect(message).toContain("(args): The workflow's args, as its migrations leave them, don't match its args validator");
   // A child its parent started before the release that added quality: the args lack it, so every migration applies.
-  expect((await migrate(workflows.withArg, history([], { args: {} }))).workflowArgs).toEqual({ quality: 'hd' });
+  expect(migrate(workflows.withArg, history([], { args: {} })).workflowArgs).toEqual({ quality: 'hd' });
   // Args that pass mean the code that started it is the current one: updateWorkflowArgs doesn't run.
-  expect((await migrate(workflows.withArg, history([], { args: { quality: 'sd' } }))).workflowArgs).toEqual({ quality: 'sd' });
+  expect(migrate(workflows.withArg, history([], { args: { quality: 'sd' } })).workflowArgs).toEqual({ quality: 'sd' });
   // A queued run's record has the ids it started with: the pending ones apply.
-  expect((await migrate(workflows.withArg, history([], { args: { quality: 'sd' }, applied: [] }))).workflowArgs).toEqual({ quality: 'hd' });
+  expect(migrate(workflows.withArg, history([], { args: { quality: 'sd' }, applied: [] })).workflowArgs).toEqual({ quality: 'hd' });
 });
 
 test('expectReplays and migrate fail an updateResult that changes its own output, since a step can finish on the new code', async () => {
@@ -167,33 +167,17 @@ test('expectReplays and migrate fail an updateResult that changes its own output
   expect(message).toContain(
     '(migration): Migration "grab-wraps" threw: updateResult(flows:grab): run again on its own output, the update changed it ({"value":"file"} became {"value":{"value":"file"}})',
   );
-  await expect(migrate(workflows.wraps, finishedOnNewCode)).rejects.toThrow('run again on its own output, the update changed it');
+  expect(() => migrate(workflows.wraps, finishedOnNewCode)).toThrow('run again on its own output, the update changed it');
   await expectReplays(workflows.normalizes, [oldShape, finishedOnNewCode]);
-  expect((await migrate(workflows.normalizes, finishedOnNewCode)).result(flows.grab)).toEqual({ value: 'file' });
-  // A result already in the new shape stays as it is: the edit stores nothing.
-  await expect(expectEdits(migrate(workflows.normalizes, finishedOnNewCode))).rejects.toThrow('"grab-wraps" changed nothing');
+  expect(migrate(workflows.normalizes, finishedOnNewCode).result(flows.grab)).toEqual({ value: 'file' });
 });
 
-test('migrate returns the history after the migrations', async () => {
-  const migrated = await migrate(workflows.current, release0Done);
+test('migrate returns the history after the migrations', () => {
+  const migrated = migrate(workflows.current, release0Done);
   expect(migrated.steps.map((s) => s.name)).toEqual(['flows:grab', 'flows:notify', 'downloadDone', 'flows:transcode']);
   expect(migrated.result(flows.notify)).toEqual({ at: null });
   // Already applied: nothing changes.
-  const current = await migrate(workflows.current, { ...release0Done, applied: ['notify-after-grab', 'prepare-becomes-transcode'] });
+  const current = migrate(workflows.current, { ...release0Done, applied: ['notify-after-grab', 'prepare-becomes-transcode'] });
   expect(current.steps.map((s) => s.name)).toEqual(['flows:grab', 'downloadDone', 'flows:prepare']);
-  await expect(migrate(workflows.unguarded, { ...release0Done, applied: ['gone'] })).rejects.toThrow('The run has migrations "gone" applied');
-});
-
-test('expectEdits passes when the migrations changed the history, and names the ones that did nothing', async () => {
-  await expectEdits(migrate(workflows.current, release0Done));
-  await expectEdits(migrate(workflows.current, release0Done), ['prepare-becomes-transcode']);
-  // A run waiting before prepare: the rename has nothing to rename.
-  const message = await failure(expectEdits(migrate(workflows.current, release0Waiting)));
-  expect(message).toContain('"prepare-becomes-transcode" changed nothing');
-  expect(message).not.toContain('"notify-after-grab"');
-  const applied = await failure(expectEdits(migrate(workflows.current, { ...release0Done, applied: ['notify-after-grab'] }), ['notify-after-grab']));
-  expect(applied).toContain('"notify-after-grab" didn\'t run');
-  const all = await failure(expectEdits(migrate(workflows.current, { ...release0Done, applied: ['notify-after-grab', 'prepare-becomes-transcode'] })));
-  expect(all).toContain('no migration ran: the history has them all applied');
-  await expect(expectEdits(release0Done as never)).rejects.toThrow('expectEdits takes the history migrate() returns.');
+  expect(() => migrate(workflows.unguarded, { ...release0Done, applied: ['gone'] })).toThrow('The run has migrations "gone" applied');
 });

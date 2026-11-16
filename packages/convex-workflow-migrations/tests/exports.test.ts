@@ -2,8 +2,7 @@
 // Every upstream export is re-exported, replaced or left out on purpose.
 // Values are checked at runtime; types don't exist then, so their names are
 // read from upstream's declarations and this package's source. And the
-// package's subpaths: /replay needs no Vitest configuration, and /test
-// re-exports it.
+// package's subpaths: /replay needs no Vitest configuration.
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 
@@ -22,6 +21,9 @@ const LEFT_OUT = {
   restart: 'takes a journal position on a run whose migrations edited its history; use workflow.restart, which refuses that',
   cleanup: "leaves the run's record behind; use workflow.cleanup",
 };
+/** What the main entry exports besides upstream's names, and what /replay exports, types included. */
+const ADDED = 'History HistoryStep InsertOptions Migration MigrationsComponent StepArgs StepRef StepResult StepSelector WorkflowManagerOptions migration';
+const REPLAY_NAMES = 'History HistoryOptions HistoryStep RecordedHistory RecordedStep StepSpec expectReplays history migrate';
 
 const UPSTREAM_TYPES = join(import.meta.dirname, '../node_modules/@convex-dev/workflow/dist/client/index.d.ts');
 const OURS = join(import.meta.dirname, '../src/index.ts');
@@ -40,7 +42,8 @@ function exportedNames(source: string): Set<string> {
       if (name) names.add(name);
     }
   }
-  for (const [, name] of source.matchAll(/^export (?:declare )?(?:type|interface|class|function|const|abstract class) (\w+)/gm)) names.add(name!);
+  for (const [, name] of source.matchAll(/^export (?:declare )?(?:type|interface|class|function|async function|const|abstract class) (\w+)/gm))
+    names.add(name!);
   return names;
 }
 
@@ -61,12 +64,14 @@ test('every upstream type export is re-exported or left out', () => {
 const SRC = join(import.meta.dirname, '../src');
 const exportsMap = (JSON.parse(readFileSync(join(import.meta.dirname, '../package.json'), 'utf8')) as { exports: Record<string, unknown> }).exports;
 
-test('/replay serves the replay helpers, built from src/helpers.ts, and /test re-exports every one of them', () => {
+test('what each entry adds: the migration API to upstream, the replay helpers in /replay, and only register in /test', () => {
+  const upstreamNames = exportedNames(readFileSync(UPSTREAM_TYPES, 'utf8'));
+  const added = [...exportedNames(readFileSync(OURS, 'utf8'))].filter((name) => !upstreamNames.has(name) && !(name in upstream));
+  expect(added.sort().join(' ')).toBe(ADDED);
   expect(exportsMap['./replay']).toEqual({ types: './dist/helpers.d.ts', default: './dist/helpers.js' });
-  expect(Object.keys(replay).sort()).toEqual(['expectEdits', 'expectReplays', 'history', 'migrate']);
-  for (const name of Object.keys(replay)) expect((withRegister as Record<string, unknown>)[name], name).toBe((replay as Record<string, unknown>)[name]);
-  const testTypes = exportedNames(readFileSync(join(SRC, 'test.ts'), 'utf8'));
-  for (const name of exportedNames(readFileSync(join(SRC, 'helpers.ts'), 'utf8'))) expect(testTypes.has(name), name).toBe(true);
+  expect(Object.keys(replay).sort()).toEqual(['expectReplays', 'history', 'migrate']);
+  expect([...exportedNames(readFileSync(join(SRC, 'helpers.ts'), 'utf8'))].sort().join(' ')).toBe(REPLAY_NAMES);
+  expect(Object.keys(withRegister).sort()).toEqual(['default', 'register']);
 });
 
 /** Every file of this package that `file` imports, and those files' imports, as source paths. */

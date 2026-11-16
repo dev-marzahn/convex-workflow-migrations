@@ -26,8 +26,7 @@ export type { CallbackOptions, EventId, RunOptions, RunResult, StepDefaults, Wor
 export type { WorkflowId, WorkflowMutationResult, WorkflowStatus, WorkflowStep } from '@convex-dev/workflow';
 export { migration } from './migrations.ts';
 export type { Migration, MigrationsComponent } from './migrations.ts';
-export type { History, HistoryStep, InsertOptions, OverlayOp, RecordedHistory, RecordedStep, StepArgs, StepRef, StepResult, StepSelector } from './history.ts';
-export type { ReplayReason } from './replay.ts';
+export type { History, HistoryStep, InsertOptions, StepArgs, StepRef, StepResult, StepSelector } from './history.ts';
 export type { WorkflowHandler } from './vendor/workflow/types.ts';
 export type { WorkflowCtx } from './vendor/workflow/workflowContext.ts';
 export type { WorkflowArgs } from './vendor/workflow/workflowMutation.ts';

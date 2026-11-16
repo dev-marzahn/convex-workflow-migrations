@@ -1,7 +1,7 @@
-// The replay helpers of /replay, re-exported from /test. They replay histories
-// without Convex, with the workflow mutation's `prepareRun` and
-// `replayHandler`. This module imports neither convex-test nor anything that
-// uses import.meta.glob, so tests that use only these need no Vitest setup.
+// The replay helpers of /replay. They replay histories without Convex, with
+// the workflow mutation's `prepareRun` and `replayHandler`. This module
+// imports neither convex-test nor anything that uses import.meta.glob, so
+// tests that use only these need no Vitest setup.
 import { BaseChannel } from 'async-channel';
 import type { FunctionReference, GenericDataModel, GenericMutationCtx, RegisteredMutation } from 'convex/server';
 
@@ -37,12 +37,12 @@ export function history(steps: readonly StepSpec[], options: HistoryOptions = {}
   return {
     ...(options.workflowId === undefined ? {} : { workflowId: options.workflowId }),
     args: options.args ?? {},
-    steps: steps.map((spec, i) => recordedStep(spec, i)),
+    steps: steps.map((spec, i) => specToStep(spec, i)),
     ...(options.applied === undefined ? {} : { applied: options.applied }),
   };
 }
 
-function recordedStep(spec: StepSpec, i: number): RecordedStep {
+function specToStep(spec: StepSpec, i: number): RecordedStep {
   let name: string, kind: StepKind, args: unknown;
   if ('event' in spec) [name, kind, args] = [spec.event, 'event', {}];
   else if ('sleep' in spec) [name, kind, args] = [spec.sleep, 'sleep', {}];
@@ -141,34 +141,9 @@ export async function expectReplays(workflow: Workflow, histories: readonly Reco
   if (failures.length > 0) throw new Error(`${failures.length} of ${histories.length} histories don't replay on the current handler:\n${failures.join('\n')}`);
 }
 
-/** The migrations each history `migrate()` returned had applied, with how many edits each made, for `expectEdits`. */
-const migrated = new WeakMap<History, Prepared['ran']>();
-
 /** The history after the workflow's migrations, for testing a migration. Throws if they can't be applied. */
-export async function migrate(workflow: Workflow, recorded: RecordedHistory): Promise<History> {
-  const { history, ran } = prepare(target(workflow, 'migrate'), recorded);
-  migrated.set(history, ran);
-  return history;
-}
-
-/**
- * Throws unless the migrations that `migrate()` applied each changed the
- * history, or, with `ids`, unless those ones ran and did: a migration that
- * names a step the history doesn't have does nothing. Without `ids`, it also
- * throws when no migration ran.
- */
-export async function expectEdits(history: History | Promise<History>, ids?: readonly string[]): Promise<void> {
-  const resolved = await history;
-  const ran = migrated.get(resolved);
-  if (!ran) throw new Error('expectEdits takes the history migrate() returns.');
-  const edits = new Map(ran.map((m) => [m.id, m.edits]));
-  const problems = (ids ?? [...edits.keys()]).flatMap((id) => {
-    const count = edits.get(id);
-    if (count === undefined) return [`"${id}" didn't run: it isn't in the workflow's list, or the history has it applied already`];
-    return count === 0 ? [`"${id}" changed nothing: the steps it names aren't in the history by those names, or already are as it leaves them`] : [];
-  });
-  if (ids === undefined && edits.size === 0) problems.push('no migration ran: the history has them all applied');
-  if (problems.length > 0) throw new Error(`Migrations didn't edit the history: ${problems.join('; ')}.\n  migrated history: ${summary(resolved.steps)}`);
+export function migrate(workflow: Workflow, recorded: RecordedHistory): History {
+  return prepare(target(workflow, 'migrate'), recorded).history;
 }
 
 export type { History, HistoryStep, RecordedHistory, RecordedStep } from './history.ts';

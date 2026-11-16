@@ -65,11 +65,15 @@ export type ReplayTarget = { definition: ReplayDefinition; migrations: readonly 
 export const REPLAY = Symbol.for('@dev-marzahn/convex-workflow-migrations/replay');
 
 type ObjectValidator = PropertyValidators | Validator<any, 'required', any>;
-const message = (error: unknown) => (error instanceof Error ? error.message : String(error));
+export const message = (error: unknown) => (error instanceof Error ? error.message : String(error));
 
-/** Whether `args` pass the workflow's `args` validator, if it has one. With `db`, ids are checked against it, as upstream checks them. */
-export function argsValid(definition: { args?: unknown }, args: unknown, db?: GenericDatabaseReader<any>): boolean {
-  return !definition.args || validate(asObjectValidator(definition.args as ObjectValidator), args, db ? { db } : {});
+/**
+ * Whether `args` pass the workflow's `args` validator, if it has one. With
+ * `db`, ids are checked against it, as upstream checks them. With `throws`,
+ * it throws why they don't pass instead of returning false.
+ */
+export function argsValid(definition: { args?: unknown }, args: unknown, db?: GenericDatabaseReader<any>, throws = false): boolean {
+  return !definition.args || validate(asObjectValidator(definition.args as ObjectValidator), args, { throw: throws, ...(db ? { db } : {}) });
 }
 
 /**
@@ -89,12 +93,10 @@ export async function replayHandler(
   const { console } = options;
   const args = history.workflowArgs as unknown;
   const handlerWorker = async (): Promise<WorkerResult> => {
-    if (registered.args) {
-      try {
-        validate(asObjectValidator(registered.args as ObjectValidator), args, { throw: true, ...(options.db ? { db: options.db } : {}) });
-      } catch (error) {
-        throw new ReplayError('args', `The workflow's args, as its migrations leave them, don't match its args validator: ${message(error)}`);
-      }
+    try {
+      argsValid(registered, args, options.db, true);
+    } catch (error) {
+      throw new ReplayError('args', `The workflow's args, as its migrations leave them, don't match its args validator: ${message(error)}`);
     }
     let runResult: RunResult;
     try {
@@ -114,7 +116,7 @@ export async function replayHandler(
       console.error(message);
       // Likely a wrong migration: the run fails without saving it as applied, so restart applies the fixed one.
       if (ran.length > 0 && history.steps.at(-1)?.error === undefined) {
-        const ids = ran.map((m) => `"${m.id}"`).join(', ');
+        const ids = ran.map((id) => `"${id}"`).join(', ');
         throw new ReplayError('migration', `The handler threw replaying the history as migrations ${ids} leave it: ${message.split('\n')[0]}`);
       }
       runResult = { kind: 'failed', error: message };

@@ -96,7 +96,7 @@ const scenarios: Record<string, (backend: Backend) => Promise<void>> = {
     deploy('v3', backend);
     expectEqual(record('v3', backend, old), null, 'the release 0 run’s record before its next handler run');
     const fresh = await startWaitingRun('v3', backend, 2);
-    expectEqual(record('v3', backend, fresh), { workflow: 'pipeline:run', applied: ALL, overlay: [] }, 'the release 3 run’s record');
+    expectEqual(record('v3', backend, fresh), { applied: ALL, overlay: [] }, 'the release 3 run’s record');
     for (const ids of [old, fresh]) call('v3', backend, 'pipeline:downloadDone', { workflowId: ids.workflowId });
 
     // notify is a stand-in for the old run: it was past that point.

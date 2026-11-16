@@ -1,7 +1,7 @@
 /// <reference types="vite/client" />
-// @dev-marzahn/convex-workflow-migrations/test: `register` for convex-test,
-// and the replay helpers of /replay. Through `@convex-dev/workflow/test` and
-// `modules`, it uses import.meta.glob, so Vitest has to inline it.
+// @dev-marzahn/convex-workflow-migrations/test: `register` for convex-test.
+// Through `@convex-dev/workflow/test` and `modules`, it uses
+// import.meta.glob, so Vitest has to inline it.
 import workflowTest from '@convex-dev/workflow/test';
 import type { TestConvex } from 'convex-test';
 import type { GenericSchema, SchemaDefinition } from 'convex/server';
@@ -23,8 +23,5 @@ export function register<Schema extends SchemaDefinition<GenericSchema, boolean>
   workflowTest.register(t, names.workflow ?? 'workflow');
   t.registerComponent(names.migrations ?? 'workflowMigrations', schema, modules);
 }
-
-export { expectEdits, expectReplays, history, migrate } from './helpers.ts';
-export type { History, HistoryOptions, HistoryStep, RecordedHistory, RecordedStep, StepSpec } from './helpers.ts';
 
 export default { register, schema, modules };

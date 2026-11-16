@@ -5,7 +5,7 @@ import type { GenericDataModel, GenericMutationCtx } from 'convex/server';
 
 import type { ComponentApi } from './component/_generated/component.js';
 import { type History, HistoryView, json, type OverlayOp, type RecordedStep } from './history.ts';
-import { argsValid, ReplayError } from './replay.ts';
+import { argsValid, message, ReplayError } from './replay.ts';
 import type { WorkflowId } from './vendor/workflow/publicTypes.ts';
 import type { JournalEntry } from './vendor/workflow/types.ts';
 
@@ -38,11 +38,10 @@ export function checkMigrations(migrations: readonly Migration[] = []): readonly
 /** What the vendored workflow mutation gets from the manager: the migrations component, the workflow's migrations, and its `args` validator. */
 export type WorkflowMigrations = { component: MigrationsComponent; list: readonly Migration[]; args?: unknown };
 
-/** A history with the run's pending migrations applied: the ids applied now, and how many edits each migration made. */
-export type Prepared = { history: HistoryView; applied: string[]; ran: { id: string; edits: number }[] };
+/** A history with the run's pending migrations applied: every applied id, and the ids applied now (`ran`). */
+export type Prepared = { history: HistoryView; applied: string[]; ran: string[] };
 
 const quoted = (ids: readonly string[]) => (ids.length === 0 ? 'none' : ids.map((id) => `"${id}"`).join(', '));
-const message = (error: unknown) => (error instanceof Error ? error.message : String(error));
 
 /**
  * Builds the history from the journal and the stored overlay, and applies
@@ -67,19 +66,15 @@ export function prepareHistory(
         'a migration was removed, renamed or reordered, or this code is older than the code the run ran on.',
     );
   }
-  const ran: Prepared['ran'] = [];
+  const ran = ids.slice(applied.length);
   for (const m of migrations.slice(applied.length)) {
     try {
-      const edits = history.migrateAs(() => {
-        if ((m.migrate(history) as unknown) instanceof Promise) throw new Error('it returned a promise; migrations are synchronous');
-      });
-      ran.push({ id: m.id, edits });
+      if ((m.migrate(history) as unknown) instanceof Promise) throw new Error('it returned a promise; migrations are synchronous');
     } catch (error) {
       throw new ReplayError('migration', `Migration "${m.id}" threw: ${message(error)}`);
     }
-    applied.push(m.id);
   }
-  return { history, applied, ran };
+  return { history, applied: [...applied, ...ran], ran };
 }
 
 /**
@@ -118,8 +113,6 @@ export function recordedStep(entry: JournalEntry): RecordedStep {
   };
 }
 
-type MutationCtx = GenericMutationCtx<GenericDataModel>;
-
 /**
  * For the vendored workflow mutation, once per handler run, before replay:
  * loads the run's record and applies its pending migrations, or throws a
@@ -127,20 +120,24 @@ type MutationCtx = GenericMutationCtx<GenericDataModel>;
  * which stores what changed, after a replay that matched. Convex's document
  * size limit makes `save` throw for an overlay too big to store.
  */
-export async function loadRecord(ctx: MutationCtx, migrations: WorkflowMigrations, run: { _id: string; args: unknown }, journal: readonly JournalEntry[]) {
+export async function loadRecord(
+  ctx: GenericMutationCtx<GenericDataModel>,
+  migrations: WorkflowMigrations,
+  run: { _id: string; args: unknown },
+  journal: readonly JournalEntry[],
+) {
   const workflowId = run._id as WorkflowId;
-  const workflow = (await ctx.meta.getFunctionMetadata()).name;
   const row = await ctx.runQuery(migrations.component.runs.load, { workflowId });
   const valid = (args: unknown) => argsValid({ args: migrations.args }, args, ctx.db);
   const prepared = prepareRun(journal.map(recordedStep), { applied: row?.applied, overlay: row?.overlay ?? [] }, migrations.list, run.args, valid);
   const save = async () => {
-    const record = { workflow, applied: prepared.applied, overlay: prepared.history.overlay() };
+    const record = { applied: prepared.applied, overlay: prepared.history.overlay() };
     if (!row || json(row) !== json(record)) await ctx.runMutation(migrations.component.runs.save, { workflowId, ...record });
   };
   return { ...prepared, save };
 }
 
 /** For the vendored workflow mutation, in the transaction that creates a run: its record, with every migration applied. */
-export async function recordStart(ctx: MutationCtx, migrations: WorkflowMigrations, workflowId: WorkflowId, workflow: string): Promise<void> {
-  await ctx.runMutation(migrations.component.runs.save, { workflowId, workflow, applied: migrations.list.map((m) => m.id), overlay: [] });
+export async function recordStart(ctx: GenericMutationCtx<GenericDataModel>, migrations: WorkflowMigrations, workflowId: WorkflowId): Promise<void> {
+  await ctx.runMutation(migrations.component.runs.save, { workflowId, applied: migrations.list.map((m) => m.id), overlay: [] });
 }
