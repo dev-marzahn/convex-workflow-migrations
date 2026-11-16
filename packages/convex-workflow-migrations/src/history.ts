@@ -119,8 +119,8 @@ export interface History {
   insertBefore<R extends StepRef>(anchor: StepSelector, step: R, options: InsertOptions<R>): void;
   /** Drops a step the code no longer calls. */
   remove(step: StepSelector): void;
-  /** The step now counts as a call to `to`, which must be the same kind of step. */
-  rename(step: StepSelector, to: StepRef): void;
+  /** The step now counts as a call to `to`, which must be the same kind of step; `name` for a call made with a custom `name` option. */
+  rename(step: StepSelector, to: StepRef, options?: { name?: string }): void;
   /** The args the current code passes. For matching only: the step ran with its old args. */
   updateArgs<R extends StepRef>(step: R | HistoryStep, update: (args: any) => StepArgs<R>): void;
   /** The result replay gives the call instead of the recorded one, for a step whose return value changed shape. The step must have succeeded. */
@@ -209,9 +209,11 @@ export class HistoryView implements History {
   private edits = 0;
 
   /**
-   * The journal with `overlay` applied in order, for a run started with
-   * `args`. Operations whose step is gone from the journal (a restart deleted
-   * it) are dropped.
+   * The journal with `overlay` applied in order, and `args`, the workflow's
+   * arguments as the run recorded them, before any `workflowArgs` edit.
+   * Operations whose step is gone from the journal are dropped: upstream's
+   * `restart({ from })` deletes journal entries, and this package's `restart`
+   * passes it one only for a run with a step still marked running.
    */
   public constructor(
     private readonly journal: readonly RecordedStep[],
@@ -261,13 +263,13 @@ export class HistoryView implements History {
     if (node) this.push({ op: 'remove', target: node.id });
   }
 
-  public rename(step: StepSelector, to: StepRef): void {
+  public rename(step: StepSelector, to: StepRef, options: { name?: string } = {}): void {
     const node = this.editable(step, 'rename');
     if (!node) return;
     const { name, kind } = target(to);
     const same = kind === 'function or workflow' ? node.kind === 'function' || node.kind === 'workflow' : node.kind === kind;
     if (!same) throw new Error(`rename(${describe(step)}, ${describe(to)}): the step's kind (${node.kind}) must stay the same.`);
-    this.push({ op: 'rewrite', target: node.id, name });
+    this.push({ op: 'rewrite', target: node.id, name: options.name ?? name });
   }
 
   public updateArgs<R extends StepRef>(step: R | HistoryStep, update: (args: any) => StepArgs<R>): void {

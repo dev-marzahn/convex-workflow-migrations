@@ -2,7 +2,7 @@
 import { anyApi } from 'convex/server';
 import { expect, test } from 'vite-plus/test';
 
-import { DETAIL_LIMIT } from '../src/component/schema.ts';
+import { capDetail, DETAIL_LIMIT } from '../src/component/schema.ts';
 import { HistoryView, type OverlayOp, type RecordedStep, ReplayMismatch, ReplayPause } from '../src/history.ts';
 import { migration, OVERLAY_LIMIT, prepareHistory, recordedStep } from '../src/migrations.ts';
 import { redactHistory } from '../src/redact.ts';
@@ -148,6 +148,18 @@ test('rename keeps the kind of step', () => {
   expect(() => h.rename(fn.grab, { workflow: fn.child })).toThrow("the step's kind (function) must stay the same");
   h.rename({ event: 'downloadDone' }, { event: 'filesReady' });
   expect(h.has({ event: 'filesReady' })).toBe(true);
+  // To a call made with a custom name option: matched by that name, of the reference's kind.
+  h.rename(fn.grab, fn.fetch, { name: 'fetch the files' });
+  expect(h.steps[0]).toMatchObject({ name: 'fetch the files', kind: 'function' });
+  expect(h.replay(0)[0]!.step.name).toBe('fetch the files');
+});
+
+test('capDetail never cuts inside a surrogate pair', () => {
+  const emoji = '\u{1F4E6}'; // two UTF-16 code units
+  expect(capDetail(`ab${emoji}cd`, 4)).toBe('ab…');
+  expect(capDetail(`abc${emoji}`, 4)).toBe('abc…');
+  expect(capDetail(`a${emoji}bc`, 4)).toBe(`a${emoji}…`);
+  expect(capDetail('abcd', 4)).toBe('abcd');
 });
 
 test('insert needs a result', () => {
