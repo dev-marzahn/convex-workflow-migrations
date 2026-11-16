@@ -10,7 +10,7 @@ import { internal } from './_generated/api';
 import type { Id } from './_generated/dataModel';
 import { run } from './pipeline';
 
-// As `npx convex-workflow-migrations histories pipeline:run` exports them, or built by hand.
+// Built by hand, as the older releases recorded them.
 const grabId = 'k57' as Id<'grabs'>;
 const prepare = makeFunctionReference<'mutation'>('pipeline:prepare');
 const release0 = {

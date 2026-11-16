@@ -87,11 +87,11 @@ export interface History {
   insertBefore<R extends StepRef>(anchor: StepSelector, step: R, options: InsertOptions<R>): void;
   /** Drops a step the code no longer calls. */
   remove(step: StepSelector): void;
-  /** The step now counts as a call to `to`, of the same kind; `name` for a call made with a custom `name` option. */
+  /** The step now counts as a call to `to`, which must be of its kind (throws otherwise); `name` for a call made with a custom `name` option. */
   rename(step: StepSelector, to: StepRef, options?: { name?: string }): void;
   /** The args the current code passes. For matching only: the step ran with its old args. */
   updateArgs<R extends StepRef>(step: R | HistoryStep, update: (args: any) => StepArgs<R>): void;
-  /** The result replay gives the call, for a step whose return value changed shape. The step must have succeeded; a running one is left as it is. */
+  /** The result replay gives the call, for a step whose return value changed shape. Throws for a failed or canceled step; leaves a running one as it is. */
   updateResult<R extends StepRef>(step: R | HistoryStep, update: (result: any) => StepResult<R>): void;
   /** The workflow's arguments as the current `args` validator expects them. Replay passes these; the run keeps its own. */
   updateWorkflowArgs(update: (args: any) => unknown): void;

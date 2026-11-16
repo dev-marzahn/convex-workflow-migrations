@@ -3,6 +3,7 @@
 // them. The vendored workflow mutation and the /replay helpers both call
 // `replayHandler`, so the two can't drift apart. A run that can't replay
 // fails, as upstream's does on a journal mismatch; `ReplayError` says why.
+// Inline, the error throws to the caller instead.
 import type { WorkpoolOptions } from '@convex-dev/workpool';
 import { validate, ValidationError } from 'convex-helpers/validators';
 import type { GenericDatabaseReader } from 'convex/server';
@@ -18,7 +19,11 @@ import type { WorkflowCtx } from './vendor/workflow/workflowContext.ts';
 /** Why a run can't replay on the current code. */
 export type ReplayReason = 'mismatch' | 'args' | 'migration' | 'migrations' | 'record';
 
-/** The run can't replay on the current code: the workflow mutation throws it, and upstream fails the run with its message. */
+/**
+ * The run can't replay on the current code: the workflow mutation throws it,
+ * and upstream's workpool fails the run with its message. Inline (`restart`
+ * without `startAsync`), it throws to the caller instead of failing the run.
+ */
 export class ReplayError extends Error {
   public constructor(
     public readonly reason: ReplayReason,
@@ -80,8 +85,9 @@ export function argsValid(definition: { args?: unknown }, args: unknown, db?: Ge
  * Runs the handler on the history's args, racing it against the executor as
  * upstream's workflow mutation does, and returns what upstream's race returns.
  * Throws a `ReplayError` for args that don't pass the `args` validator, for a
- * handler that throws after migrations applied now (`ran`), unless the
- * history's last step failed, and the executor's `ReplayMismatch`. Call it
+ * handler that throws after migrations applied in this handler run (`ran`),
+ * unless the history's last step failed or was canceled, and the executor's
+ * `ReplayMismatch`. Call it
  * inside the replay's environment (`setupEnvironment`).
  */
 export async function replayHandler(

@@ -94,8 +94,8 @@ class ReplayOnly extends StepExecutor {
  * Replays the migrated history, and returns why it doesn't replay, if it
  * doesn't. It starts no step: replay stops where the history ends, or at a
  * running step. A handler that throws fails it, unless the history's last
- * step failed or was canceled, which the handler may be passing on: as
- * `migration` if migrations applied now, as at runtime, otherwise as `threw`.
+ * step failed or was canceled: as `migration` if migrations applied in this
+ * handler run, as at runtime, otherwise as `threw`.
  */
 async function replayHistory(replay: ReplayTarget, recorded: RecordedHistory, prepared: Prepared): Promise<string | undefined> {
   const workflowId = (recorded.workflowId ?? 'history') as WorkflowId;
