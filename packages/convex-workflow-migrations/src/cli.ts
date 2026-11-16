@@ -9,10 +9,9 @@ import { dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 
-import { FORMAT } from './component/schema.ts';
-import type { OverlayOp, RecordedHistory, RecordedStep, StepKind } from './history.ts';
+import { collectRuns, type Query, runHistory } from './histories.ts';
+import type { RecordedHistory } from './history.ts';
 import { type Redact, redactHistory } from './redact.ts';
-import type { RunResult } from './vendor/workflow/types.ts';
 
 const USAGE = `Usage: convex-workflow-migrations histories <workflow> [options] [-- <convex options>]
 
@@ -48,7 +47,9 @@ with --redact, before you commit it.
 
 Options after -- go to every \`convex\` command it runs, e.g. -- --prod. It
 runs two \`convex run\` commands per exported run, so it's slow for many runs.
-Exit codes: 0 exported, 1 more runs than --max-runs, 2 usage or deployment error.`;
+A record that a newer version of this package wrote stops the export.
+Exit codes: 0 exported, 1 more runs than --max-runs, 2 usage or deployment
+error, or a record from a newer version.`;
 
 const WARNING =
   "The export holds production data: every run's args, every step's args, result and error, and each record's overlay (stand-ins, rewritten args and results, migrated workflow args). Check it before you commit it, or scrub it with --redact.";
@@ -68,8 +69,6 @@ function convex(args: string[], convexArgs: string[]) {
   const result = spawnSync(process.execPath, [convexBin(), ...args, ...convexArgs], { encoding: 'utf8', maxBuffer: 256 << 20 });
   return { ok: result.status === 0, stdout: result.stdout, output: `${result.stdout}\n${result.stderr}`.trim() };
 }
-
-type Query = <T>(component: string, path: string, args: object) => T;
 
 function cliQuery(convexArgs: string[]): Query {
   return <T>(component: string, path: string, args: object) => {
@@ -91,11 +90,6 @@ function isDeployed(component: string, convexArgs: string[]): boolean {
   if (/Component path '[^']*' not found/.test(result.output)) return false;
   throw new Error(`convex data --component ${component} failed:\n${result.output}`);
 }
-
-type Page<T> = { page: T[]; isDone: boolean; continueCursor: string };
-type PublicWorkflow = { workflowId: string; name?: string; args: unknown; runResult?: RunResult };
-type WorkflowStep = { stepId: string; name: string; kind: StepKind; args: unknown; runResult?: RunResult; startedAt: number };
-type RunRecord = { applied: string[]; overlay: OverlayOp[]; format: number } | null;
 
 const count = (value: string, option: string) => {
   const n = Number(value);
@@ -135,37 +129,16 @@ async function histories(argv: string[]): Promise<number> {
   const recent = count(values.recent, 'recent');
   const maxRuns = count(values['max-runs'], 'max-runs');
   if (maxRuns < 1) throw new UsageError('--max-runs must be at least 1.');
-  const maxSteps = Math.max(1, count(values['max-steps'], 'max-steps'));
+  const maxSteps = count(values['max-steps'], 'max-steps');
+  if (maxSteps < 1) throw new UsageError('--max-steps must be at least 1.');
   const redact = values.redact === undefined ? undefined : await loadRedact(values.redact);
   const convexArgs = split < 0 ? [] : argv.slice(split + 1);
   const query = cliQuery(convexArgs);
   const workflowComponent = values['workflow-component'];
   const migrationsComponent = values['migrations-component'];
 
-  // Upstream has no index by status, so this pages through the runs newest first.
-  const runs: PublicWorkflow[] = [];
-  let finished = 0;
-  let scanned = 0;
-  let oldest: string | undefined;
-  let complete = false;
-  let cursor: string | null = null;
-  while (scanned < maxRuns) {
-    const numItems = Math.min(100, maxRuns - scanned);
-    const result: Page<PublicWorkflow> = query(workflowComponent, 'workflow:listByName', { name, order: 'desc', paginationOpts: { numItems, cursor } });
-    scanned += result.page.length;
-    oldest = result.page.at(-1)?.workflowId ?? oldest;
-    for (const run of result.page) {
-      if (run.runResult === undefined) runs.push(run);
-      else if (finished < recent) {
-        finished++;
-        runs.push(run);
-      }
-    }
-    complete = result.isDone;
-    if (complete) break;
-    cursor = result.continueCursor;
-  }
-  if (!complete) {
+  const { runs, scanned, more, oldest } = collectRuns(query, workflowComponent, name, { maxRuns, recent });
+  if (more) {
     // The runs it didn't look at are the oldest: running ones there are on the oldest shapes.
     const created =
       oldest && query<{ workflow: { _creationTime: number } }>(workflowComponent, 'workflow:getStatus', { workflowId: oldest }).workflow._creationTime;
@@ -179,37 +152,11 @@ async function histories(argv: string[]): Promise<number> {
     }
   }
 
-  const records = isDeployed(migrationsComponent, convexArgs);
+  const components = { workflow: workflowComponent, ...(isDeployed(migrationsComponent, convexArgs) ? { migrations: migrationsComponent } : {}) };
   const exported: RecordedHistory[] = [];
   for (const run of runs) {
     // Two `convex run`s per run: its steps, and its record.
-    const steps: Page<WorkflowStep> = query(workflowComponent, 'workflow:listSteps', {
-      workflowId: run.workflowId,
-      order: 'asc',
-      paginationOpts: { numItems: maxSteps, cursor: null },
-    });
-    const record: RunRecord = records ? query(migrationsComponent, 'runs:load', { workflowId: run.workflowId }) : null;
-    if (record && record.format > FORMAT) {
-      throw new Error(
-        `Run ${run.workflowId}'s record has format ${record.format}, from a newer version of @dev-marzahn/convex-workflow-migrations than this one, which reads format ${FORMAT}. Install the version the deployment runs.`,
-      );
-    }
-    const history: RecordedHistory = {
-      workflowId: run.workflowId,
-      workflow: name,
-      args: run.args,
-      steps: steps.page.map((step): RecordedStep => ({
-        id: step.stepId,
-        name: step.name,
-        kind: step.kind,
-        args: step.args,
-        ...(step.runResult ? { runResult: step.runResult } : {}),
-        startedAt: step.startedAt,
-      })),
-      ...(record ? { applied: record.applied, overlay: record.overlay } : {}),
-      ...(run.runResult ? { outcome: run.runResult.kind } : {}),
-      ...(steps.isDone ? {} : { truncated: true }),
-    };
+    const history = runHistory(query, components, name, run, maxSteps);
     exported.push(redact ? await redactHistory(history, redact) : history);
   }
   const json = `${JSON.stringify(exported, null, 2)}\n`;

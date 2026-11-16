@@ -93,7 +93,8 @@ async function replay(
   workpoolOptions?: WorkpoolOptions,
 ): Promise<ReplayOutcome> {
   const { history: recorded } = request;
-  const prepared = prepareHistory(recorded.steps, { applied: recorded.applied ?? [], overlay: recorded.overlay ?? [] }, migrations.list, recorded.args ?? {});
+  const stored = { applied: recorded.applied ?? [], overlay: recorded.overlay ?? [], ...(recorded.restart === undefined ? {} : { restart: recorded.restart }) };
+  const prepared = prepareHistory(recorded.steps, stored, migrations.list, recorded.args ?? {});
   const { history } = prepared;
   const failed = (pause: ReplayPause): ReplayOutcome => ({
     ok: false,
@@ -103,11 +104,11 @@ async function replay(
     history,
   });
   if (prepared.blocked) return failed(prepared.blocked);
-  if (!request.replay) return { ok: true, history };
   if (recorded.truncated) {
     const detail = `The history is truncated: the export stopped at ${recorded.steps.length} steps, so the rest of the run can't be checked. Export it with a larger --max-steps.`;
     return { ok: false, reason: 'truncated', detail, history };
   }
+  if (!request.replay) return { ok: true, history };
 
   const workflowId = (recorded.workflowId ?? 'history') as WorkflowId;
   const channel = new BaseChannel<StepRequest>(workpoolOptions?.maxParallelism ?? 10);

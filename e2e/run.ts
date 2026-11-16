@@ -182,6 +182,20 @@ const scenarios: Record<string, (backend: Backend) => Promise<void>> = {
     );
     const allowed = JSON.parse(cli('v3', backend, ['histories', 'pipeline:run', '--max-runs', '1', '--allow-partial']).stdout) as Exported[];
     expectEqual(allowed.length, 1, 'histories exported with --max-runs 1 --allow-partial');
+    // Exactly as many runs as --max-runs, and as many steps as --max-steps, aren't more. Newest first: the
+    // release 3 run has 6 steps; the release 0 run 5 (grab, the wait, import, transcode, publish; notify is a stand-in).
+    const exact = JSON.parse(cli('v3', backend, ['histories', 'pipeline:run', '--max-runs', '2', '--max-steps', '5']).stdout) as (Exported & {
+      truncated?: boolean;
+    })[];
+    expectEqual(
+      exact.map((h) => ({ workflowId: h.workflowId, steps: h.steps.length, truncated: h.truncated })),
+      [
+        { workflowId: fresh.workflowId, steps: 5, truncated: true },
+        { workflowId: old.workflowId, steps: 5, truncated: undefined },
+      ],
+      'histories exported with --max-runs 2 --max-steps 5',
+    );
+    expectEqual(cliRun('v3', backend, ['histories', 'pipeline:run', '--max-steps', '0']).status, 2, 'the exit code for --max-steps 0');
   },
 
   /**

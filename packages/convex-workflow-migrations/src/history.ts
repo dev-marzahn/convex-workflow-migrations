@@ -38,6 +38,8 @@ export type RecordedHistory = {
   steps: RecordedStep[];
   applied?: string[];
   overlay?: OverlayOp[];
+  /** The step a `restart` stored, if the restarted run hasn't replayed yet: its next handler run removes the history from there on. */
+  restart?: string;
   /** How the run ended, if it has. */
   outcome?: RunResult['kind'];
   /** The export stopped at its step limit: the run has more steps than these. */

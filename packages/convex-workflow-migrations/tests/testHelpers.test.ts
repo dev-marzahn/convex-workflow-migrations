@@ -253,9 +253,20 @@ test('a redacted export replays: the overlay is scrubbed with the steps and the 
   await expectReplays(t, ref('personal'), redacted);
 });
 
-test('expectReplays fails a truncated history', async () => {
+test('expectReplays fails a truncated history, and migrate throws for one', async () => {
   const message = await failure(expectReplays(setup(), ref('current'), [{ ...release0Done, truncated: true }]));
   expect(message).toContain('(truncated): The history is truncated: the export stopped at 3 steps');
+  await expect(migrate(setup(), ref('current'), { ...release0Done, truncated: true })).rejects.toThrow('The history is truncated');
+});
+
+test("an exported run's pending restart applies, as the deployment's next handler run will apply it", async () => {
+  const t = setup();
+  // Restarted from the wait: the run's next handler run hides it, and waits for the download again.
+  const restarted = { ...release0Done, outcome: undefined, restart: 'h1' };
+  expect((await migrate(t, ref('current'), restarted)).steps.map((s) => s.name)).toEqual(['flows:grab', 'flows:notify']);
+  // short returns after grab: against the whole history, that's an early return.
+  await expect(expectReplays(t, ref('short'), [release0Done])).rejects.toThrow('the code returned before it');
+  await expectReplays(t, ref('short'), [{ ...release0Done, restart: 'h1' }]);
 });
 
 test('a stand-in inserted as a function and called as a workflow says so', async () => {
