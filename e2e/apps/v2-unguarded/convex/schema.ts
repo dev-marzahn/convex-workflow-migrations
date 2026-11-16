@@ -9,4 +9,5 @@ export default defineSchema({
     log: v.array(v.string()),
     workflowId: v.optional(vWorkflowId),
   }),
+  alerts: defineTable({ workflowId: v.string(), reason: v.string() }).index('workflowId', ['workflowId']),
 });

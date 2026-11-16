@@ -22,7 +22,8 @@ const LEFT_OUT = {
   cleanup: "leaves the run's record behind; use workflow.cleanup",
 };
 /** What the main entry exports besides upstream's names, and what /replay exports, types included. */
-const ADDED = 'History HistoryStep InsertOptions Migration MigrationsComponent StepArgs StepRef StepResult StepSelector WorkflowManagerOptions migration';
+const ADDED =
+  'History HistoryStep InsertOptions Migration MigrationsComponent PauseInfo PauseReason PausedRun StepArgs StepRef StepResult StepSelector WorkflowManagerOptions migration';
 const REPLAY_NAMES = 'History HistoryOptions HistoryStep RecordedHistory RecordedStep StepSpec expectReplays history migrate';
 
 const UPSTREAM_TYPES = join(import.meta.dirname, '../node_modules/@convex-dev/workflow/dist/client/index.d.ts');
@@ -98,4 +99,13 @@ test('/replay imports nothing that needs Vitest configuration: no import.meta.gl
   const test_ = readFileSync(join(SRC, 'test.ts'), 'utf8');
   expect(test_).toMatch(/import\.meta\.glob\(/);
   expect(test_).toMatch(/from 'convex-test'/);
+});
+
+test('the bin is dist/cli.js, made executable by the build, and runs on plain Node: no convex-test, Vitest or import.meta.glob', () => {
+  const pkg = JSON.parse(readFileSync(join(import.meta.dirname, '../package.json'), 'utf8')) as { bin: unknown; scripts: { build: string } };
+  expect(pkg.bin).toEqual({ 'convex-workflow-migrations': './dist/cli.js' });
+  expect(pkg.scripts.build).toContain("fs.chmodSync('dist/cli.js', 0o755)");
+  const closure = [...importClosure(join(SRC, 'cli.ts'))];
+  expect(closure).toContain(join(SRC, 'histories.ts'));
+  for (const file of closure) expect(readFileSync(file, 'utf8'), file).not.toMatch(/import\.meta\.glob\(|from ['"](convex-test|vite-plus[^'"]*|vitest)['"]/);
 });

@@ -1,8 +1,12 @@
+/// <reference types="node" />
 // @vitest-environment node
 // Histories the older releases recorded, replayed against the current code
 // with the helpers from /replay: no Convex backend, no convex-test, and no
 // Vitest configuration needed.
-import { expectReplays, history, migrate } from '@dev-marzahn/convex-workflow-migrations/replay';
+import { readdirSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
+
+import { expectReplays, history, migrate, type RecordedHistory } from '@dev-marzahn/convex-workflow-migrations/replay';
 import { makeFunctionReference } from 'convex/server';
 import { expect, test } from 'vite-plus/test';
 
@@ -48,4 +52,15 @@ test('a run from release 0 gets a stand-in notify and imports without a time', (
   const migrated = migrate(run, release0.preparing);
   expect(migrated.steps.map((step) => step.name)).toEqual(['pipeline:grab', 'pipeline:notify', 'downloadDone', 'pipeline:importFiles', 'pipeline:transcode']);
   expect(migrated.steps[3]?.args).toEqual({ grabId, notifiedAt: null });
+});
+
+// The e2e tests (e2e/run.ts, skip) export runs from a real deployment with the
+// `histories` CLI into this directory, then run this test.
+const exportedDir = process.env.EXPORTED_HISTORIES;
+test.skipIf(exportedDir === undefined)('runs exported from a deployment replay on the current code', async () => {
+  const files = readdirSync(exportedDir!).filter((file) => file.endsWith('.json'));
+  await expectReplays(
+    run,
+    files.flatMap((file) => JSON.parse(readFileSync(join(exportedDir!, file), 'utf8')) as RecordedHistory[]),
+  );
 });

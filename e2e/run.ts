@@ -1,13 +1,15 @@
 // End-to-end tests on a real self-hosted backend: a fixture app starts a run
 // that waits on `awaitEvent`, a later release (another fixture, or
 // examples/basic) is deployed over it, and the run finishes on the new code,
-// or fails.
+// or pauses.
 //
 //   bun run e2e                 all scenarios
 //   bun run e2e skip            only these
 //
 // Needs Docker. Builds the package first.
 import { spawnSync, type SpawnSyncOptions } from 'node:child_process';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
@@ -47,6 +49,7 @@ function call<T>(app: string, backend: Backend, fn: string, args: Record<string,
 
 type Ids = { grabId: string; workflowId: string };
 type Grab = { log: string[]; status: string; error?: string };
+type Pauses = { paused: { reason: string; attempts: number } | null; alerts: string[] };
 
 async function until<T>(read: () => T, done: (value: T) => boolean, what: string, timeoutMs = 60_000): Promise<T> {
   const deadline = Date.now() + timeoutMs;
@@ -58,14 +61,62 @@ async function until<T>(read: () => T, done: (value: T) => boolean, what: string
   }
 }
 const grab = (app: string, backend: Backend, { grabId }: Ids) => call<Grab>(app, backend, 'pipeline:status', { grabId });
+/** Whether the run is paused, and the reasons `onPause` recorded for it. */
+const pauses = (app: string, backend: Backend, { workflowId }: Ids) => call<Pauses>(app, backend, 'pipeline:pauses', { workflowId });
+/** Waits for the run to pause, or to finish, and returns its pause and its grab. */
+const pausedRun = (app: string, backend: Backend, ids: Ids) =>
+  until(
+    () => ({ ...pauses(app, backend, ids), run: grab(app, backend, ids) }),
+    (p) => p.paused !== null || p.run.status !== 'inProgress',
+    'the run to pause',
+  );
 const record = (app: string, backend: Backend, { workflowId }: Ids) =>
   call<{ applied: string[]; overlay: unknown[] } | null>(app, backend, 'runs:load', { workflowId }, 'workflowMigrations');
-const finished = (app: string, backend: Backend, ids: Ids, what: string) =>
+const finished = (app: string, backend: Backend, ids: Ids, what: string, timeoutMs?: number) =>
   until(
     () => grab(app, backend, ids),
     (g) => g.status !== 'inProgress',
     what,
+    timeoutMs,
   );
+
+type Exported = { workflowId: string; args: unknown; steps: { name: string; runResult?: unknown }[]; applied?: string[]; overlay?: unknown };
+
+/**
+ * Runs the `histories` CLI from `app`'s directory, as a user would: the
+ * installed package's bin, or the build for a fixture without the package.
+ * The bin is resolved through the package's package.json rather than
+ * node_modules/.bin, which a fresh install doesn't link before the first
+ * build. With `out`, it writes the export there, and this reads it back.
+ */
+function histories(app: string, backend: Backend, args: string[], { status = 0, out }: { status?: number; out?: string } = {}) {
+  const pkg = app === release3 ? join(appDir(app), 'node_modules/@dev-marzahn/convex-workflow-migrations') : join(ROOT, 'packages/convex-workflow-migrations');
+  const bin = (JSON.parse(readFileSync(join(pkg, 'package.json'), 'utf8')) as { bin: Record<string, string> }).bin['convex-workflow-migrations']!;
+  const argv = [join(pkg, bin), 'histories', 'pipeline:run', ...args, ...(out ? ['--out', out] : [])];
+  const result = spawnSync(process.execPath, argv, { cwd: appDir(app), env: backend.env, encoding: 'utf8' });
+  if (result.error) throw result.error;
+  if (result.status !== status) throw new Error(`histories exited with ${result.status}, not ${status}:\n${result.stderr}`);
+  const json = out ? readFileSync(out, 'utf8') : result.stdout;
+  return { exported: json ? (JSON.parse(json) as Exported[]) : [], stderr: result.stderr };
+}
+
+/** Runs examples/basic's test of the exports in `tmp`/histories (pipeline.test.ts), and checks it ran rather than skipped. */
+function replayExports(tmp: string): void {
+  const report = join(tmp, 'report.json');
+  sh(join(appDir(release3), 'node_modules/.bin/vp'), ['test', 'run', 'convex/pipeline.test.ts', '--reporter=json', `--outputFile=${report}`], {
+    cwd: appDir(release3),
+    env: { ...process.env, EXPORTED_HISTORIES: join(tmp, 'histories') },
+  });
+  const { testResults } = JSON.parse(readFileSync(report, 'utf8')) as { testResults: { assertionResults: { title: string; status: string }[] }[] };
+  const test = testResults[0]?.assertionResults.find((a) => a.title === 'runs exported from a deployment replay on the current code');
+  if (test?.status !== 'passed') throw new Error(`The exports' replay test didn't pass: ${JSON.stringify(test)}`);
+}
+const shape = ({ workflowId, args, steps, applied }: Exported) => ({
+  workflowId,
+  args,
+  steps: steps.map((s) => `${s.name}${s.runResult ? '' : ' (running)'}`),
+  ...(applied ? { applied } : {}),
+});
 
 function expectEqual(actual: unknown, expected: unknown, what: string): void {
   if (!isDeepStrictEqual(actual, expected)) throw new Error(`${what}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
@@ -91,11 +142,26 @@ const scenarios: Record<string, (backend: Backend) => Promise<void>> = {
    * A run from release 0 (plain @convex-dev/workflow) waiting across a deploy
    * of release 3, which lists the migrations of releases 1 to 3: it replays
    * without releases 1 and 2 ever being deployed. A run started on release 3
-   * has every migration applied from the start.
+   * has every migration applied from the start. The `histories` CLI exports
+   * the release 0 run before the deploy, without the migrations component
+   * (only with --before-adoption), and both runs once they finished on
+   * release 3, with their records; release 3's pipeline.test.ts replays the
+   * exports.
    */
   async skip(backend) {
+    // The exports, in a directory that's left behind if the scenario fails.
+    const tmp = mkdtempSync(join(tmpdir(), `${PREFIX}-`));
     deploy('v1', backend);
     const old = await startWaitingRun('v1', backend, 1);
+    histories('v1', backend, [], { status: 2 });
+    const before = histories('v1', backend, ['--before-adoption'], { out: join(tmp, 'histories/before.json') });
+    const args = { grabId: old.grabId };
+    expectEqual(
+      before.exported.map(shape),
+      [{ workflowId: old.workflowId, args, steps: ['pipeline:grab', 'downloadDone (running)'] }],
+      'the export before the deploy',
+    );
+    if (!before.stderr.includes("The workflowMigrations component isn't deployed")) throw new Error(`No note about the component:\n${before.stderr}`);
     deploy(release3, backend);
     expectEqual(record(release3, backend, old), null, 'the release 0 run’s record before its next handler run');
     const fresh = await startWaitingRun(release3, backend, 2);
@@ -112,25 +178,84 @@ const scenarios: Record<string, (backend: Backend) => Promise<void>> = {
     const freshGrab = await finished(release3, backend, fresh, 'the release 3 run to finish');
     expectEqual(freshGrab, { log: ['grab', 'notify', 'import', 'transcode', 'publish'], status: 'completed' }, 'the release 3 run');
     expectEqual(record(release3, backend, fresh)?.overlay, [], 'the release 3 run’s overlay');
+
+    const after = histories(release3, backend, [], { out: join(tmp, 'histories/after.json') }).exported;
+    expectEqual(after.map((h) => h.workflowId).sort(), [old.workflowId, fresh.workflowId].sort(), 'the runs exported after');
+    const exported = after.find((h) => h.workflowId === old.workflowId);
+    const steps = ['pipeline:grab', 'downloadDone', 'pipeline:importFiles', 'pipeline:transcode', 'pipeline:publish'];
+    expectEqual(exported && shape(exported), { workflowId: old.workflowId, args, steps, applied: ALL }, 'the export after');
+    expectEqual(exported?.overlay, record(release3, backend, old)?.overlay, 'the exported overlay, which has notify’s stand-in');
+    replayExports(tmp);
+    // Two runs, and --max-scan 1: it stops, says where, and exports nothing.
+    const stopped = histories(release3, backend, ['--max-scan', '1'], { status: 1 });
+    if (!/read the newest 1, the oldest created \d{4}-/.test(stopped.stderr)) throw new Error(`The --max-scan stop doesn't say where:\n${stopped.stderr}`);
+    rmSync(tmp, { recursive: true, force: true });
   },
 
   /**
    * Release 2's change without its migrations: the run release 0 left
-   * waiting fails at its next handler run, with the mismatch, as it would
-   * without this package.
+   * waiting pauses at its next handler run instead of failing, and onPause
+   * records it once. Deploying the fix, release 3, resumes it at the
+   * scheduled retry, 48 to 72 s after the pause. That assumes the deploy is
+   * live by then: if the first retry came before it, the run paused again
+   * and its next retry is about 10 minutes out, so the scenario resumes it.
    */
-  async 'failed-mismatch'(backend) {
+  async unguarded(backend) {
     deploy('v1', backend);
     const old = await startWaitingRun('v1', backend, 1);
     deploy('v2-unguarded', backend);
     call('v2-unguarded', backend, 'pipeline:downloadDone', { workflowId: old.workflowId });
-    const failed = await finished('v2-unguarded', backend, old, 'the run to fail');
-    expectEqual({ log: failed.log, status: failed.status }, { log: ['grab'], status: 'failed' }, 'the release 0 run');
-    const mismatch =
-      'Journal entry mismatch at step 1 of the run\'s history, as its migrations leave it: the code calls {"args":{"grabId":"' +
-      `${old.grabId}"},"kind":"function","name":"pipeline:notify"}, the history has {"args":{},"kind":"event","name":"downloadDone"}`;
-    if (!failed.error?.includes(mismatch)) throw new Error(`Expected the mismatch "${mismatch}", got: ${failed.error}`);
-    expectEqual(record('v2-unguarded', backend, old), null, 'the failed run’s record');
+    expectEqual(
+      await pausedRun('v2-unguarded', backend, old),
+      { paused: { reason: 'mismatch', attempts: 1 }, alerts: ['mismatch'], run: { log: ['grab'], status: 'inProgress' } },
+      'the paused run',
+    );
+    expectEqual(record('v2-unguarded', backend, old), null, 'the paused run’s record: nothing of the handler run was saved');
+
+    deploy(release3, backend);
+    const afterDeploy = pauses(release3, backend, old).paused;
+    if (afterDeploy && afterDeploy.attempts > 1) {
+      log('  the first retry came before the deploy: resuming');
+      expectEqual(call(release3, backend, 'pipeline:resume', { workflowId: old.workflowId }), true, 'resume');
+    } else log('  waiting for the retry');
+    const done = await finished(release3, backend, old, 'the retry to resume the run', 120_000);
+    expectEqual(done, { log: ['grab', 'import', 'transcode', 'publish'], status: 'completed' }, 'the resumed run');
+    expectEqual(pauses(release3, backend, old), { paused: null, alerts: ['mismatch'] }, 'the pauses after the retry');
+    expectEqual(record(release3, backend, old)?.applied, ALL, 'the resumed run’s applied migrations');
+  },
+
+  /**
+   * A run started on release 3 pauses when release 2's code without its
+   * migrations is deployed over it, a rollback: its applied migrations aren't
+   * a prefix of that code's list. Rolling forward and calling resume
+   * finishes it. A second run, paused the same way, is deleted by upstream's
+   * forced cleanup: resume finds it gone, through the workflow mutation, and
+   * deletes its pause and record.
+   */
+  async rollback(backend) {
+    deploy(release3, backend);
+    const [ids, gone] = [await startWaitingRun(release3, backend, 2), await startWaitingRun(release3, backend, 2)];
+    deploy('v2-unguarded', backend);
+    for (const { workflowId } of [ids, gone]) call('v2-unguarded', backend, 'pipeline:downloadDone', { workflowId });
+    for (const run of [ids, gone]) {
+      expectEqual(
+        await pausedRun('v2-unguarded', backend, run),
+        { paused: { reason: 'migrations', attempts: 1 }, alerts: ['migrations'], run: { log: ['grab', 'notify'], status: 'inProgress' } },
+        'the paused run',
+      );
+    }
+
+    deploy(release3, backend);
+    expectEqual(call(release3, backend, 'pipeline:resume', { workflowId: ids.workflowId }), true, 'resume');
+    const done = await finished(release3, backend, ids, 'the run to finish');
+    expectEqual(done, { log: ['grab', 'notify', 'import', 'transcode', 'publish'], status: 'completed' }, 'the resumed run');
+    expectEqual(pauses(release3, backend, ids).paused, null, 'the pause after resume');
+
+    expectEqual(record(release3, backend, gone)?.applied, ALL, 'the paused run’s record');
+    expectEqual(call(release3, backend, 'workflow:cleanup', { workflowId: gone.workflowId, force: true }, 'workflow'), true, 'the forced cleanup');
+    expectEqual(call(release3, backend, 'pipeline:resume', { workflowId: gone.workflowId }), false, 'resume of the gone run');
+    expectEqual(pauses(release3, backend, gone).paused, null, 'the gone run’s pause');
+    expectEqual(record(release3, backend, gone), null, 'the gone run’s record');
   },
 };
 

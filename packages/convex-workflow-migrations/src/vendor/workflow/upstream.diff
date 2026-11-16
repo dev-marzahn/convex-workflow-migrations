@@ -29,13 +29,18 @@
  
  export type WorkerResult =
    | { type: "handlerDone"; runResult: RunResult }
-@@ -60,16 +69,21 @@
+@@ -60,16 +69,26 @@
  
  export class StepExecutor {
    private journalEntrySize: number;
 +  // PATCHES: replay matches calls against the run's history, the journal
 +  // with its migrations' edits, instead of the raw journal.
 +  private journalEntries: ReplayEntry[];
++  // PATCHES: whether this handler run started a step past the history.
++  private started = false;
++  // PATCHES: set by `replayHandler` when the handler run pauses: no step
++  // starts after that, though the handler may still make calls.
++  halted = false;
  
    constructor(
      private workflowId: string,
@@ -52,7 +57,7 @@
    ) {
      this.journalEntrySize = journalEntries.reduce(
        (size, entry) => size + getConvexSize(entry),
-@@ -80,6 +94,8 @@
+@@ -80,6 +99,8 @@
        // This should never happen, but we'll throw an error just in case.
        throw new Error(journalSizeError(this.journalEntrySize, this.workflowId));
      }
@@ -61,7 +66,7 @@
    }
    async run(): Promise<WorkerResult> {
      while (true) {
-@@ -87,6 +103,13 @@
+@@ -87,6 +108,13 @@
        // In the future we can correlate the calls to entries by handle, args,
        // etc. instead of just ordering. As is, the fn order can't change.
        const entry = this.journalEntries.shift();
@@ -75,12 +80,37 @@
        if (entry) {
          this.completeMessage(message, entry);
          continue;
-@@ -125,17 +148,21 @@
+@@ -97,6 +125,12 @@
+         const message = await this.receiver.get();
+         messages.push(message);
+       }
++      // PATCHES: a paused handler run starts no step. Nothing reads this
++      // result any more, and the calls stay unresolved.
++      if (this.halted) {
++        return { type: "executorBlocked" };
++      }
++      this.started = true;
+       const entries = await this.startSteps(messages);
+       if (entries.every((entry) => entry.step.runResult)) {
+         for (let i = 0; i < entries.length; i++) {
+@@ -125,17 +159,33 @@
      };
    }
  
 -  completeMessage(message: StepRequest, entry: JournalEntry) {
 -    if (entry.step.inProgress) {
++  // PATCHES: how far replay got, for a handler that threw or returned: the
++  // first history step it hasn't called (calls the executor hasn't taken yet
++  // count as called), and whether it started, or is about to start, a step
++  // past the history.
++  progress(): { next?: ReplayEntry; started: boolean } {
++    const queued = this.receiver.bufferSize;
++    return {
++      next: this.journalEntries[queued],
++      started: this.started || queued > this.journalEntries.length,
++    };
++  }
++
 +  // PATCHES: takes a step of the history. With checkOnly, for a running
 +  // step, it compares the call and resolves nothing.
 +  completeMessage(message: StepRequest, entry: ReplayStep, checkOnly = false) {
@@ -101,11 +131,11 @@
        ? { name: message.name, kind: message.target.kind }
        : {
            name: message.name,
-@@ -145,10 +172,15 @@
+@@ -145,10 +195,15 @@
      const stepJson = JSON.stringify(convexToJson(stepFields));
      const messageJson = JSON.stringify(convexToJson(messageFields));
      if (stepJson !== messageJson) {
-+      // PATCHES: a mismatch with the history says where in it.
++      // PATCHES: a mismatch with the history pauses the run.
 +      if (entry.position !== undefined) {
 +        throw new ReplayMismatch(entry.position, messageJson, stepJson);
 +      }
@@ -213,7 +243,7 @@
 +  recordStart,
 +  type WorkflowMigrations,
 +} from "../../migrations.js";
-+import { replayHandler } from "../../replay.js";
++import { ReplayError, replayHandler } from "../../replay.js";
  
  export type WorkflowArgs<V extends PropertyValidators, Context = unknown> = {
    /**
@@ -235,17 +265,32 @@
          if (args.startAsync) {
            return workflowId;
          }
-@@ -224,6 +237,9 @@
+@@ -205,7 +218,9 @@
+         );
+         return workflowId;
+       }
+-      if (workflow.runResult?.kind === "success") {
++      // PATCHES: any result, not only success, so a retry left over from a
++      // paused run that finished returns, and the pause ends.
++      if (workflow.runResult) {
+         console.log(`Workflow ${workflowId} completed, returning.`);
+         return workflowId;
+       }
+@@ -224,6 +239,13 @@
            `Assertion failed: not blocked but have in-progress journal entry`,
          );
        }
-+      // PATCHES: apply the run's pending migrations, in memory. Throws, so
-+      // the run fails, if they can't be applied.
++      // PATCHES: apply the run's pending migrations, in memory. A run they
++      // can't be applied to pauses, and returns so the workpool doesn't fail.
 +      const run = await loadRecord(ctx, migrations, workflow, journalEntries);
++      if (run.blocked) {
++        await run.pause(generationNumber, run.blocked, console);
++        return workflowId;
++      }
        const channel = new BaseChannel<StepRequest>(
          workpoolOptions.maxParallelism ?? 10,
        );
-@@ -237,55 +253,20 @@
+@@ -237,55 +259,28 @@
          channel,
          Date.now(),
          workpoolOptions,
@@ -256,6 +301,8 @@
          executor.getGenerationState.bind(executor),
          workflowId,
        );
++      // PATCHES:
++      let paused: ReplayError | undefined;
        try {
 -        const handlerWorker = async (): Promise<WorkerResult> => {
 -          let runResult: RunResult;
@@ -301,11 +348,28 @@
 -        };
 -        const result = await Promise.race([handlerWorker(), executorWorker()]);
 +        // PATCHES: upstream's handler and executor workers, in replayHandler
-+        // (src/replay.ts), with the args as the migrations left them.
++        // (src/replay.ts), with the args as the migrations left them. It
++        // returns a pause by the README's rules ("Pausing and recovery"),
++        // which commits nothing of the handler run.
 +        const options = { step, console, db: ctx.db };
 +        const result = await replayHandler(registered, run, executor, options);
++        if (result instanceof ReplayError) {
++          paused = result;
++          return workflowId;
++        }
 +        // PATCHES: save what this handler run applied, in its transaction.
 +        await run.save();
          switch (result.type) {
            case "handlerDone": {
              await ctx.runMutation(component.workflow.complete, {
+@@ -305,6 +300,10 @@
+         }
+       } finally {
+         restoreEnvironment();
++        // PATCHES: outside the replay's deterministic Date and console.
++        if (paused) {
++          await run.pause(generationNumber, paused, console);
++        }
+       }
+       return workflowId;
+     },

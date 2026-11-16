@@ -38,7 +38,7 @@ import {
   recordStart,
   type WorkflowMigrations,
 } from "../../migrations.js";
-import { replayHandler } from "../../replay.js";
+import { ReplayError, replayHandler } from "../../replay.js";
 
 export type WorkflowArgs<V extends PropertyValidators, Context = unknown> = {
   /**
@@ -218,7 +218,9 @@ export function workflowMutation<
         );
         return workflowId;
       }
-      if (workflow.runResult?.kind === "success") {
+      // PATCHES: any result, not only success, so a retry left over from a
+      // paused run that finished returns, and the pause ends.
+      if (workflow.runResult) {
         console.log(`Workflow ${workflowId} completed, returning.`);
         return workflowId;
       }
@@ -237,9 +239,13 @@ export function workflowMutation<
           `Assertion failed: not blocked but have in-progress journal entry`,
         );
       }
-      // PATCHES: apply the run's pending migrations, in memory. Throws, so
-      // the run fails, if they can't be applied.
+      // PATCHES: apply the run's pending migrations, in memory. A run they
+      // can't be applied to pauses, and returns so the workpool doesn't fail.
       const run = await loadRecord(ctx, migrations, workflow, journalEntries);
+      if (run.blocked) {
+        await run.pause(generationNumber, run.blocked, console);
+        return workflowId;
+      }
       const channel = new BaseChannel<StepRequest>(
         workpoolOptions.maxParallelism ?? 10,
       );
@@ -260,11 +266,19 @@ export function workflowMutation<
         executor.getGenerationState.bind(executor),
         workflowId,
       );
+      // PATCHES:
+      let paused: ReplayError | undefined;
       try {
         // PATCHES: upstream's handler and executor workers, in replayHandler
-        // (src/replay.ts), with the args as the migrations left them.
+        // (src/replay.ts), with the args as the migrations left them. It
+        // returns a pause by the README's rules ("Pausing and recovery"),
+        // which commits nothing of the handler run.
         const options = { step, console, db: ctx.db };
         const result = await replayHandler(registered, run, executor, options);
+        if (result instanceof ReplayError) {
+          paused = result;
+          return workflowId;
+        }
         // PATCHES: save what this handler run applied, in its transaction.
         await run.save();
         switch (result.type) {
@@ -286,6 +300,10 @@ export function workflowMutation<
         }
       } finally {
         restoreEnvironment();
+        // PATCHES: outside the replay's deterministic Date and console.
+        if (paused) {
+          await run.pause(generationNumber, paused, console);
+        }
       }
       return workflowId;
     },
