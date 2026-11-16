@@ -41,7 +41,8 @@ export const notify = internalMutation({
   },
 });
 export const importFiles = internalMutation({
-  args: { grabId: v.id('grabs'), notifiedAt: v.union(v.number(), v.null()) },
+  // Optional: an import that release 0 or 1 queued runs here without it.
+  args: { grabId: v.id('grabs'), notifiedAt: v.optional(v.union(v.number(), v.null())) },
   returns: v.null(),
   handler: (ctx, { grabId }) => log(ctx, grabId, 'import'),
 });

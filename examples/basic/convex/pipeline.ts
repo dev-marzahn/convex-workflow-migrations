@@ -15,6 +15,9 @@ import { workflow } from './workflow';
 //   1. notify after grab. Runs already past grab count as notified, at no time.
 //   2. import takes when the grab was notified. Runs that imported did so without it.
 //   3. prepare is renamed to transcode.
+// The step functions stay backward compatible, since a step an older release
+// queued runs on the current code: import's new argument is optional, and
+// prepare stays, as an alias of transcode.
 export const run = workflow.define({
   args: { grabId: v.id('grabs') },
   migrations: [
@@ -22,7 +25,7 @@ export const run = workflow.define({
     migration('import-gets-notified-at', (h) =>
       h.updateArgs(internal.pipeline.importFiles, (args) => ({ ...args, notifiedAt: h.result(internal.pipeline.notify)?.at ?? null })),
     ),
-    // prepare no longer exists, so it's named by its path.
+    // Named by its path, so the migration keeps compiling once the prepare alias is gone.
     migration('prepare-becomes-transcode', (h) => h.rename(makeFunctionReference<'mutation'>('pipeline:prepare'), internal.pipeline.transcode)),
   ],
   handler: async (step, { grabId }): Promise<void> => {
@@ -58,11 +61,14 @@ export const notify = internalMutation({
   },
 });
 export const importFiles = internalMutation({
-  args: { grabId: v.id('grabs'), notifiedAt: v.union(v.number(), v.null()) },
+  // Optional: an import that release 0 or 1 queued runs here without it.
+  args: { grabId: v.id('grabs'), notifiedAt: v.optional(v.union(v.number(), v.null())) },
   returns: v.null(),
   handler: (ctx, { grabId }) => log(ctx, grabId, 'import'),
 });
 export const transcode = step('transcode');
+// For a prepare that release 2 or older queued: it runs as transcode.
+export const prepare = transcode;
 export const publish = step('publish');
 
 export const startGrab = mutation({

@@ -18,18 +18,18 @@ const serial = new WorkflowManager(components.workflow, {
 });
 
 export const hold = internalAction({
-  args: {},
+  args: { ms: v.optional(v.number()) },
   returns: v.null(),
-  handler: async () => {
-    await new Promise((resolve) => setTimeout(resolve, HOLD_MS));
+  handler: async (_ctx, { ms = HOLD_MS }) => {
+    await new Promise((resolve) => setTimeout(resolve, ms));
     return null;
   },
 });
 
 export const block = serial.define({
-  args: {},
-  handler: async (step): Promise<void> => {
-    await step.runAction(internal.queued.hold, {});
+  args: { ms: v.optional(v.number()) },
+  handler: async (step, { ms }): Promise<void> => {
+    await step.runAction(internal.queued.hold, ms === undefined ? {} : { ms });
   },
 });
 

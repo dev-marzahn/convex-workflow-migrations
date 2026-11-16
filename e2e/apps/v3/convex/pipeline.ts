@@ -19,7 +19,7 @@ export const run = workflow.define({
     migration('import-gets-notified-at', (h) =>
       h.updateArgs(internal.pipeline.importFiles, (args) => ({ ...args, notifiedAt: h.result(internal.pipeline.notify)?.at ?? null })),
     ),
-    // Release 3: prepare was renamed to transcode. The old function is gone, so it's named by its path.
+    // Release 3: prepare was renamed to transcode. Named by its path, so the migration keeps compiling once the alias goes.
     migration('prepare-becomes-transcode', (h) => h.rename(makeFunctionReference<'mutation'>('pipeline:prepare'), internal.pipeline.transcode)),
   ],
   handler: async (step, { grabId }): Promise<void> => {
@@ -53,11 +53,14 @@ export const notify = internalMutation({
   },
 });
 export const importFiles = internalMutation({
-  args: { grabId: v.id('grabs'), notifiedAt: v.union(v.number(), v.null()) },
+  // Optional: an import that release 0 or 1 queued runs here without it.
+  args: { grabId: v.id('grabs'), notifiedAt: v.optional(v.union(v.number(), v.null())) },
   returns: v.null(),
   handler: (ctx, { grabId }) => log(ctx, grabId, 'import'),
 });
 export const transcode = step('transcode');
+// For a prepare that release 2 or older queued: it runs as transcode.
+export const prepare = transcode;
 export const publish = step('publish');
 
 // Everything below is the same in every fixture release from 1 on.

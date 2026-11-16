@@ -112,6 +112,8 @@ type Exported = {
 };
 
 const ALL = ['notify-after-grab', 'import-gets-notified-at', 'prepare-becomes-transcode'];
+/** Release 4's list. */
+const ALL4 = [...ALL, 'channel-arg', 'grab-gets-channel'];
 
 /** Starts a run on `app` and leaves it waiting for its download. */
 async function startWaitingRun(app: string, backend: Backend, steps: number): Promise<Ids> {
@@ -152,16 +154,24 @@ const scenarios: Record<string, (backend: Backend) => Promise<void>> = {
     const scrubbed = JSON.parse(redacted.stdout) as Exported[];
     expectEqual([scrubbed[0]!.args.grabId, ...scrubbed[0]!.steps.map((s) => s.args.grabId)], ['redacted', 'redacted', undefined], 'the redacted grab ids');
     expectEqual(redacted.stderr.includes('Scrubbed with'), true, 'the note about the scrubbed export');
-    // Two runs from before adoption, and --max-runs 1: it says how far it looked, and exports nothing unless --allow-partial.
+    // Two running runs from before adoption, and --max-runs 1, or --max-scan 1: it says how far it looked, and exports nothing unless --allow-partial.
     const partial = cliRun('v3', backend, ['histories', 'pipeline:run', '--max-runs', '1']);
     expectEqual(
       {
         status: partial.status,
         stdout: partial.stdout,
-        stderr: /from before the app adopted this package than --max-runs 1\. .* up to one created \d{4}-.*Nothing was exported/s.test(partial.stderr),
+        stderr: /running runs from before the app adopted this package than --max-runs 1\. .* up to one created \d{4}-.*Nothing was exported/s.test(
+          partial.stderr,
+        ),
       },
       { status: 1, stdout: '', stderr: true },
       'the export stopped at --max-runs',
+    );
+    const scan = cliRun('v3', backend, ['histories', 'pipeline:run', '--max-scan', '1']);
+    expectEqual(
+      { status: scan.status, stderr: /than --max-scan 1, finished ones included\..*Raise --max-scan/s.test(scan.stderr) },
+      { status: 1, stderr: true },
+      'the export stopped at --max-scan',
     );
     const allowed = JSON.parse(cli('v3', backend, ['histories', 'pipeline:run', '--max-runs', '1', '--allow-partial']).stdout) as Exported[];
     expectEqual(
@@ -212,10 +222,13 @@ const scenarios: Record<string, (backend: Backend) => Promise<void>> = {
     );
     for (const ids of [old, fresh]) expectEqual(redactedAfter.stdout.includes(ids.grabId), false, `grab id ${ids.grabId} in the redacted export`);
 
-    // Exactly as many runs from before adoption as --max-runs, and as many steps as --max-steps, aren't more: the scan
-    // stops at the first run this package started. Newest first: the release 3 run has 6 steps; the release 0 runs 5
-    // (grab, the wait, import, transcode, publish; notify is a stand-in).
-    const exact = JSON.parse(cli('v3', backend, ['histories', 'pipeline:run', '--max-runs', '2', '--max-steps', '5']).stdout) as (Exported & {
+    // Exactly as many runs from before adoption as --max-scan, and as many steps as --max-steps, aren't more: the scan
+    // stops at the first run this package started, and the finished ones from before adoption don't count toward
+    // --max-runs. Newest first: the release 3 run has 6 steps; the release 0 runs 5 (grab, the wait, import, transcode,
+    // publish; notify is a stand-in).
+    const exact = JSON.parse(
+      cli('v3', backend, ['histories', 'pipeline:run', '--max-runs', '1', '--max-scan', '2', '--max-steps', '5']).stdout,
+    ) as (Exported & {
       truncated?: boolean;
     })[];
     expectEqual(
@@ -225,7 +238,7 @@ const scenarios: Record<string, (backend: Backend) => Promise<void>> = {
         { workflowId: old2.workflowId, steps: 5, truncated: undefined },
         { workflowId: old.workflowId, steps: 5, truncated: undefined },
       ],
-      'histories exported with --max-runs 2 --max-steps 5',
+      'histories exported with --max-runs 1 --max-scan 2 --max-steps 5',
     );
     expectEqual(cliRun('v3', backend, ['histories', 'pipeline:run', '--max-steps', '0']).status, 2, 'the exit code for --max-steps 0');
 
@@ -441,8 +454,8 @@ const scenarios: Record<string, (backend: Backend) => Promise<void>> = {
         (g) => g.status !== 'inProgress',
         'the queued run to finish',
       );
-      expectEqual(done, { log: ['grab', 'notify', 'import', 'transcode', 'publish default'], status: 'completed' }, 'the queued run');
-      expectEqual(record('v4', backend, ids)?.applied, [...ALL, 'channel-arg'], 'the queued run’s applied migrations');
+      expectEqual(done, { log: ['grab default', 'notify', 'import', 'transcode', 'publish default'], status: 'completed' }, 'the queued run');
+      expectEqual(record('v4', backend, ids)?.applied, ALL4, 'the queued run’s applied migrations');
     }
     await until(
       () => runResult('v4', backend, parent),
@@ -459,6 +472,39 @@ const scenarios: Record<string, (backend: Backend) => Promise<void>> = {
       (r) => r === null,
       'the child’s record to be deleted',
     );
+  },
+
+  /**
+   * A step a run started on release 3, queued in upstream's workpool behind a
+   * long action across the deploy of release 4, which gives that step a new
+   * argument. It runs on release 4's code with release 3's args, which pass
+   * because the new argument is optional, as the README's rule for queued
+   * steps says; then the run replays on release 4 through its migrations,
+   * and goes on.
+   */
+  async 'queued-step'(backend) {
+    deploy('v3', backend);
+    const ids = call<Ids>('v3', backend, 'queued:startBehindHold', {});
+    expectEqual(record('v3', backend, ids)?.applied, ALL, 'the run’s applied migrations');
+    deploy('v4', backend);
+    if (grab('v4', backend, ids).log.length > 0) throw new Error('grab ran before the deploy finished: raise STEP_HOLD_MS in the v3 fixture’s queued.ts.');
+    const waiting = await until(
+      () => ({ ...grab('v4', backend, ids), paused: pauses('v4', backend, ids).paused }),
+      (g) => g.log.length === 2 || g.status !== 'inProgress' || g.paused !== null,
+      'the run to wait for its download',
+      60_000,
+    );
+    // grab ran on release 4 without a channel: the args release 3 called it with.
+    expectEqual(waiting, { log: ['grab', 'notify'], status: 'inProgress', paused: null }, 'the run after its queued grab');
+    call('v4', backend, 'pipeline:downloadDone', { workflowId: ids.workflowId });
+    const done = await until(
+      () => grab('v4', backend, ids),
+      (g) => g.status !== 'inProgress',
+      'the run to finish',
+    );
+    expectEqual(done, { log: ['grab', 'notify', 'import', 'transcode', 'publish default'], status: 'completed' }, 'the run');
+    expectEqual(record('v4', backend, ids)?.applied, ALL4, 'the run’s applied migrations');
+    expectEqual(pauses('v4', backend, ids), { paused: null, alerts: [] }, 'pauses');
   },
 
   /**
@@ -493,7 +539,7 @@ const scenarios: Record<string, (backend: Backend) => Promise<void>> = {
       20_000,
     );
     expectEqual(done, { log: ['grab', 'notify', 'import', 'transcode', 'publish default'], status: 'completed' }, 'the resumed run');
-    expectEqual(record('v4', backend, ids)?.applied, [...ALL, 'channel-arg'], 'the applied migrations');
+    expectEqual(record('v4', backend, ids)?.applied, ALL4, 'the applied migrations');
 
     // The overlay's migrated workflow args hold the grab id too: --redact scrubs it there.
     const redacted = cli('v4', backend, ['histories', 'pipeline:run', '--redact', REDACT]);

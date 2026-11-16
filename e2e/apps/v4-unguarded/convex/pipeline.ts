@@ -7,9 +7,9 @@ import type { Id } from './_generated/dataModel';
 import { internalMutation, type MutationCtx, mutation, query } from './_generated/server';
 import { workflow } from './workflow';
 
-// Release 4's code without its migration: the workflow takes a channel, and
+// Release 4's code without its migrations: the workflow takes a channel, and
 // runs started before it have none. They pause on their next replay, until
-// release 4 with its migration is deployed.
+// release 4 with its migrations is deployed.
 export const run = workflow.define({
   args: { grabId: v.id('grabs'), channel: v.string() },
   migrations: [
@@ -20,7 +20,7 @@ export const run = workflow.define({
     migration('prepare-becomes-transcode', (h) => h.rename(makeFunctionReference<'mutation'>('pipeline:prepare'), internal.pipeline.transcode)),
   ],
   handler: async (step, { grabId, channel }): Promise<void> => {
-    await step.runMutation(internal.pipeline.grab, { grabId });
+    await step.runMutation(internal.pipeline.grab, { grabId, channel });
     const { at } = await step.runMutation(internal.pipeline.notify, { grabId });
     await step.awaitEvent({ name: 'downloadDone' });
     await step.runMutation(internal.pipeline.importFiles, { grabId, notifiedAt: at });
@@ -39,7 +39,13 @@ async function log(ctx: MutationCtx, grabId: Id<'grabs'>, name: string): Promise
 }
 
 const step = (name: string) => internalMutation({ args: { grabId: v.id('grabs') }, returns: v.null(), handler: (ctx, { grabId }) => log(ctx, grabId, name) });
-export const grab = step('grab');
+const withChannel = (name: string) =>
+  internalMutation({
+    args: { grabId: v.id('grabs'), channel: v.optional(v.string()) },
+    returns: v.null(),
+    handler: (ctx, { grabId, channel }) => log(ctx, grabId, channel === undefined ? name : `${name} ${channel}`),
+  });
+export const grab = withChannel('grab');
 export const notify = internalMutation({
   args: { grabId: v.id('grabs') },
   returns: v.object({ at: v.union(v.number(), v.null()) }),
@@ -49,16 +55,13 @@ export const notify = internalMutation({
   },
 });
 export const importFiles = internalMutation({
-  args: { grabId: v.id('grabs'), notifiedAt: v.union(v.number(), v.null()) },
+  args: { grabId: v.id('grabs'), notifiedAt: v.optional(v.union(v.number(), v.null())) },
   returns: v.null(),
   handler: (ctx, { grabId }) => log(ctx, grabId, 'import'),
 });
 export const transcode = step('transcode');
-export const publish = internalMutation({
-  args: { grabId: v.id('grabs'), channel: v.string() },
-  returns: v.null(),
-  handler: (ctx, { grabId, channel }) => log(ctx, grabId, `publish ${channel}`),
-});
+export const prepare = transcode;
+export const publish = withChannel('publish');
 
 // Everything below is the same in every fixture release from 1 on, except
 // that startGrab passes a channel from release 4 on.

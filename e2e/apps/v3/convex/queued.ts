@@ -1,7 +1,7 @@
-// For the e2e `queued` scenario: runs that wait in upstream's workpool, not
-// yet started, across a deploy. `serial` makes the workflow component's
-// workpool run one job at a time, so `hold`, an action that sleeps, keeps every
-// job enqueued after it waiting.
+// For the e2e `queued` and `queued-step` scenarios: runs and steps that wait
+// in upstream's workpool, not yet started, across a deploy. `serial` makes the
+// workflow component's workpool run one job at a time, so `hold`, an action
+// that sleeps, keeps every job enqueued after it waiting.
 import { vWorkflowId, type WorkflowId, WorkflowManager } from '@dev-marzahn/convex-workflow-migrations';
 import { v } from 'convex/values';
 
@@ -10,7 +10,7 @@ import type { Id } from './_generated/dataModel';
 import { internalAction, mutation } from './_generated/server';
 import { workflow } from './workflow';
 
-/** How long `hold` keeps the workpool busy: long enough to export the queued runs and deploy the next release. */
+/** How long `hold` keeps the workpool busy by default: long enough to export the queued runs and deploy the next release. */
 const HOLD_MS = 30_000;
 
 const serial = new WorkflowManager(components.workflow, {
@@ -22,19 +22,19 @@ const serial = new WorkflowManager(components.workflow, {
 });
 
 export const hold = internalAction({
-  args: {},
+  args: { ms: v.optional(v.number()) },
   returns: v.null(),
-  handler: async () => {
-    await new Promise((resolve) => setTimeout(resolve, HOLD_MS));
+  handler: async (_ctx, { ms = HOLD_MS }) => {
+    await new Promise((resolve) => setTimeout(resolve, ms));
     return null;
   },
 });
 
-/** Takes the workpool's one slot for `HOLD_MS`. */
+/** Takes the workpool's one slot for `ms`, `HOLD_MS` by default. */
 export const block = serial.define({
-  args: {},
-  handler: async (step): Promise<void> => {
-    await step.runAction(internal.queued.hold, {});
+  args: { ms: v.optional(v.number()) },
+  handler: async (step, { ms }): Promise<void> => {
+    await step.runAction(internal.queued.hold, ms === undefined ? {} : { ms });
   },
 });
 
@@ -67,5 +67,25 @@ export const startQueued = mutation({
     const queued: WorkflowId = await workflow.start(ctx, internal.pipeline.run, { grabId }, { startAsync: true });
     await ctx.db.patch('grabs', grabId, { workflowId: queued });
     return { queued: { grabId, workflowId: queued }, child: { grabId: childGrab, workflowId: child }, parent };
+  },
+});
+
+/** How long `startBehindHold` holds the workpool: long enough to deploy the next release. */
+const STEP_HOLD_MS = 15_000;
+
+/**
+ * Starts `block`, then a pipeline run, both inline: the run's first handler
+ * run, on this release, starts grab, which waits behind hold with this
+ * release's args.
+ */
+export const startBehindHold = mutation({
+  args: {},
+  returns: vIds,
+  handler: async (ctx): Promise<Ids> => {
+    await serial.start(ctx, internal.queued.block, { ms: STEP_HOLD_MS });
+    const grabId = await ctx.db.insert('grabs', { title: 'grab queued behind hold', log: [] });
+    const workflowId: WorkflowId = await workflow.start(ctx, internal.pipeline.run, { grabId });
+    await ctx.db.patch('grabs', grabId, { workflowId });
+    return { grabId, workflowId };
   },
 });
