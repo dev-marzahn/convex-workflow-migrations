@@ -71,13 +71,26 @@ function expectEqual(actual: unknown, expected: unknown, what: string): void {
  * would. Resolved through package.json rather than node_modules/.bin, which a
  * fresh install doesn't link before the first build.
  */
-function cli(app: string, backend: Backend, args: string[]): { stdout: string; stderr: string } {
+function cliRun(app: string, backend: Backend, args: string[]): { status: number | null; stdout: string; stderr: string } {
   const pkg = join(appDir(app), 'node_modules/@dev-marzahn/convex-workflow-migrations');
   const bin = (JSON.parse(readFileSync(join(pkg, 'package.json'), 'utf8')) as { bin: Record<string, string> }).bin['convex-workflow-migrations']!;
-  return exec(process.execPath, [join(pkg, bin), ...args], { cwd: appDir(app), env: backend.env });
+  const result = spawnSync(process.execPath, [join(pkg, bin), ...args], { cwd: appDir(app), env: backend.env, encoding: 'utf8', maxBuffer: 64 << 20 });
+  return { status: result.status, stdout: result.stdout, stderr: result.stderr };
 }
+function cli(app: string, backend: Backend, args: string[]): { stdout: string; stderr: string } {
+  const result = cliRun(app, backend, args);
+  if (result.status !== 0) throw new Error(`convex-workflow-migrations ${args.join(' ')} failed:\n${`${result.stdout}\n${result.stderr}`.trim().slice(-3000)}`);
+  return result;
+}
+const REDACT = join(ROOT, 'e2e/redact.ts');
 
-type Exported = { workflowId: string; args: { grabId: string }; steps: { name: string; args: { grabId?: string }; runResult?: unknown }[]; applied?: string[] };
+type Exported = {
+  workflowId: string;
+  args: { grabId: string };
+  steps: { name: string; args: { grabId?: string }; runResult?: unknown }[];
+  applied?: string[];
+  overlay?: { op: string; args?: unknown; result?: unknown }[];
+};
 
 const ALL = ['notify-after-grab', 'import-gets-notified-at', 'prepare-becomes-transcode'];
 
@@ -115,7 +128,7 @@ const scenarios: Record<string, (backend: Backend) => Promise<void>> = {
     );
     expectEqual(plain.stderr.includes('The export holds production data'), true, 'the warning about production data');
     // Scrubbed: the run's args and every step's.
-    const redacted = cli('v3', backend, ['histories', 'pipeline:run', '--redact', join(ROOT, 'e2e/redact.ts')]);
+    const redacted = cli('v3', backend, ['histories', 'pipeline:run', '--redact', REDACT]);
     const scrubbed = JSON.parse(redacted.stdout) as Exported[];
     expectEqual([scrubbed[0]!.args.grabId, ...scrubbed[0]!.steps.map((s) => s.args.grabId)], ['redacted', 'redacted', undefined], 'the redacted grab ids');
     expectEqual(redacted.stderr.includes('Scrubbed with'), true, 'the note about the scrubbed export');
@@ -145,18 +158,66 @@ const scenarios: Record<string, (backend: Backend) => Promise<void>> = {
     const after = JSON.parse(cli('v3', backend, ['histories', 'pipeline:run', '--recent', '1']).stdout) as Exported[];
     expectEqual(after.length, 1, 'histories exported with --recent 1');
     expectEqual(after[0]!.applied, ALL, 'the exported applied migrations');
+
+    // Redacted with records: the overlay is scrubbed too. The release 0 run's stand-in got the notify time null, which the module turns into 0.
+    const redactedAfter = cli('v3', backend, ['histories', 'pipeline:run', '--redact', REDACT]);
+    const oldScrubbed = (JSON.parse(redactedAfter.stdout) as Exported[]).find((h) => h.workflowId === old.workflowId);
+    expectEqual(
+      oldScrubbed?.overlay?.map((op) => ({ op: op.op, result: op.result })),
+      [{ op: 'insert', result: { at: 0 } }],
+      'the redacted overlay of the release 0 run',
+    );
+    for (const ids of [old, fresh]) expectEqual(redactedAfter.stdout.includes(ids.grabId), false, `grab id ${ids.grabId} in the redacted export`);
+
+    // Two runs, and --max-runs 1: it says how far it looked, and exports nothing unless --allow-partial.
+    const partial = cliRun('v3', backend, ['histories', 'pipeline:run', '--max-runs', '1']);
+    expectEqual(
+      {
+        status: partial.status,
+        stdout: partial.stdout,
+        stderr: /more runs than --max-runs 1\. .* back to one created \d{4}-.*Nothing was exported/s.test(partial.stderr),
+      },
+      { status: 1, stdout: '', stderr: true },
+      'the export stopped at --max-runs',
+    );
+    const allowed = JSON.parse(cli('v3', backend, ['histories', 'pipeline:run', '--max-runs', '1', '--allow-partial']).stdout) as Exported[];
+    expectEqual(allowed.length, 1, 'histories exported with --max-runs 1 --allow-partial');
+  },
+
+  /**
+   * A run from release 0 waiting across a deploy of release 3, whose
+   * download then fails: the handler passes the failure on, and the run
+   * fails, as before, though the deploy's migrations edited its history in
+   * that handler run.
+   */
+  async failed(backend) {
+    deploy('v1', backend);
+    const ids = await startWaitingRun('v1', backend, 1);
+    deploy('v3', backend);
+    call('v3', backend, 'pipeline:downloadDone', { workflowId: ids.workflowId, error: 'the download failed' });
+    const done = await until(
+      () => grab('v3', backend, ids),
+      (g) => g.status !== 'inProgress' || pauses('v3', backend, ids).paused !== null,
+      'the run to fail',
+    );
+    expectEqual({ ...done, error: done.error?.includes('the download failed') }, { log: ['grab'], status: 'failed', error: true }, 'the failed run');
+    expectEqual(pauses('v3', backend, ids), { paused: null, alerts: [] }, 'pauses');
+    expectEqual(record('v3', backend, ids)?.applied, ALL, 'the applied migrations');
   },
 
   /**
    * The same change as release 2 without its migrations pauses the waiting
-   * run instead of failing it; deploying release 2 with them resumes it at
-   * the next retry, a minute later.
+   * runs instead of failing them; deploying release 2 with them resumes them
+   * at the next retry, about a minute later. A paused run whose workflow is
+   * deleted meanwhile, as upstream deletes a child with its parent, loses
+   * its record at that retry.
    */
   async unguarded(backend) {
     deploy('v1', backend);
     const old = await startWaitingRun('v1', backend, 1);
+    const gone = await startWaitingRun('v1', backend, 1);
     deploy('v2-unguarded', backend);
-    call('v2-unguarded', backend, 'pipeline:downloadDone', { workflowId: old.workflowId });
+    for (const ids of [old, gone]) call('v2-unguarded', backend, 'pipeline:downloadDone', { workflowId: ids.workflowId });
     // Not failed: it stays in progress, with the pause recorded and reported once.
     const paused = await until(
       () => ({ ...pauses('v2-unguarded', backend, old), run: grab('v2-unguarded', backend, old) }),
@@ -164,9 +225,15 @@ const scenarios: Record<string, (backend: Backend) => Promise<void>> = {
       'the run to pause',
     );
     expectEqual(paused, { paused: { reason: 'mismatch', attempts: 1 }, alerts: ['mismatch'], run: { log: ['grab'], status: 'inProgress' } }, 'the paused run');
+    await until(
+      () => pauses('v2-unguarded', backend, gone).paused,
+      (p) => p !== null,
+      'the second run to pause',
+    );
+    call('v2-unguarded', backend, 'workflow:cleanup', { workflowId: gone.workflowId, force: true }, 'workflow');
 
     deploy('v2', backend);
-    log('  waiting for the retry');
+    log('  waiting for the retries');
     const done = await until(
       () => grab('v2', backend, old),
       (g) => g.status !== 'inProgress',
@@ -175,6 +242,12 @@ const scenarios: Record<string, (backend: Backend) => Promise<void>> = {
     );
     expectEqual(done, { log: ['grab', 'import', 'prepare', 'publish'], status: 'completed' }, 'the resumed run');
     expectEqual(pauses('v2', backend, old), { paused: null, alerts: ['mismatch'] }, 'pauses after the retry');
+    await until(
+      () => record('v2', backend, gone),
+      (r) => r === null,
+      'the deleted run’s record to be deleted',
+      120_000,
+    );
   },
 
   /**
@@ -241,6 +314,12 @@ const scenarios: Record<string, (backend: Backend) => Promise<void>> = {
     );
     expectEqual(done, { log: ['grab', 'notify', 'import', 'transcode', 'publish default'], status: 'completed' }, 'the resumed run');
     expectEqual(record('v4', backend, ids)?.applied, [...ALL, 'channel-arg'], 'the applied migrations');
+
+    // The overlay's migrated workflow args hold the grab id too: --redact scrubs it there.
+    const redacted = cli('v4', backend, ['histories', 'pipeline:run', '--redact', REDACT]);
+    const [scrubbed] = JSON.parse(redacted.stdout) as Exported[];
+    expectEqual(scrubbed?.overlay?.find((op) => op.op === 'workflowArgs')?.args, { grabId: 'redacted', channel: 'default' }, 'the redacted workflow args');
+    expectEqual(redacted.stdout.includes(ids.grabId), false, 'the grab id in the redacted export');
   },
 };
 

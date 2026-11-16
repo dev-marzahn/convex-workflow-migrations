@@ -80,11 +80,12 @@ export const startGrab = mutation({
   },
 });
 
+/** The download finished, or failed with `error`. */
 export const downloadDone = mutation({
-  args: { workflowId: vWorkflowId },
+  args: { workflowId: vWorkflowId, error: v.optional(v.string()) },
   returns: v.null(),
-  handler: async (ctx, { workflowId }) => {
-    await workflow.sendEvent(ctx, { workflowId, name: 'downloadDone' });
+  handler: async (ctx, { workflowId, error }) => {
+    await workflow.sendEvent(ctx, error === undefined ? { workflowId, name: 'downloadDone' } : { workflowId, name: 'downloadDone', error });
     return null;
   },
 });
