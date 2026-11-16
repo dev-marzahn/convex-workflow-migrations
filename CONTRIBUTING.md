@@ -34,6 +34,7 @@ The e2e fixture apps are the README's pipeline at its releases: release 0 is `v1
 - `v2`: releases 1 and 2: adopts the package, and adds notify (`notify-after-grab`) and import's `notifiedAt` (`import-gets-notified-at`).
 - `v3`: release 3: renames prepare to transcode (`prepare-becomes-transcode`), and lists all three migrations.
 - `v4`: release 4: a new required workflow arg, `channel` (`channel-arg`, with `updateWorkflowArgs`).
+- `v3` and `v4` also have `queued.ts`, for the `queued` scenario: a parent workflow that runs the pipeline as a child, which passes the channel from v4 on (`child-gets-channel`).
 - `v2-unguarded` and `v4-unguarded`: v2's and v4's code without their new migrations.
 
 ## Codegen
@@ -44,32 +45,33 @@ The `_generated/` folders are committed. After changing the component's function
 bun run codegen
 ```
 
-Component codegen pulls deployment state, so the script starts a throwaway backend in Docker (`e2e/backend.ts`), runs `convex codegen` for the component and every app, and removes the container. Nothing is deployed. The apps import the built package, so run `bun run build` first. If the component's generated types are stale, the build fails its type check but still writes `dist/`, which is enough for codegen.
+Component codegen pulls deployment state, so the script starts a throwaway backend in Docker (`e2e/backend.ts`), runs `convex codegen` for the component and every app, and removes the container. Nothing is deployed. The apps import the built package, so run `bun run build` first. If the component's generated types are stale, as they are after you change its functions, the build fails its type check and exits non-zero: it still writes `dist/`, which is enough for codegen, but skips its last step, which copies the vendored LICENSE into `dist/` and makes the CLI executable. So run `bun run build`, then `bun run codegen`, then `bun run build` again.
 
 ## End-to-end tests
 
 ```sh
 bun run e2e             # all scenarios, a few minutes
-bun run e2e skip        # only the named scenarios: skip, failed, unguarded, rollback, restart, args
+bun run e2e skip        # only the named scenarios: skip, failed, unguarded, rollback, restart, queued, args
 ```
 
-The script builds the package first. Each scenario starts a fresh backend and leaves a run waiting on `awaitEvent`:
+The script builds the package first. Each scenario starts a fresh backend and leaves runs waiting on `awaitEvent`, or, in `queued`, in upstream's workpool:
 
-- `skip` starts the run on v1, exports its history with `convex-workflow-migrations histories` from v3, plain and with `--redact`, deploys v3, sends the event, and checks that the run replays through all three migrations and that a run started on v3 has every id applied. Then it exports with `--redact` again, now that the run has a record, and checks its overlay is scrubbed; that `--max-runs 1` refuses to export without `--allow-partial`; that exactly `--max-runs` runs and exactly `--max-steps` steps export whole; and that `--max-steps 0` exits with 2.
+- `skip` starts two runs on v1 and exports their histories with `convex-workflow-migrations histories` from v3, plain and with `--redact`, and checks that `--max-runs 1` refuses to export these two runs from before adoption without `--allow-partial`, and exports the oldest with it. Then it deploys v3, sends the events, and checks that the runs replay through all three migrations and that a run started on v3 has every id applied. It exports with `--redact` again, now that the runs have records, and checks the overlay is scrubbed; that exactly `--max-runs` runs from before adoption and exactly `--max-steps` steps export whole; and that `--max-steps 0` exits with 2. Last, it cleans up a run from before adoption, which reads its journal through a function handle to upstream's `journal.load`.
 - `failed` starts the run on v1, deploys v3, and fails the download: the run fails instead of pausing, though the deploy's migrations edited its history.
-- `unguarded` starts two runs on v1, deploys v2-unguarded, sends the events, and checks that the runs pause (reported once to `onPause`) instead of failing. It deletes the second run's workflow, as a parent's cleanup would; then deploys v2 and waits for the scheduled retries, about a minute later, to finish the first run and delete the second's record.
+- `unguarded` starts three runs on v1, deploys v2-unguarded, sends the events, and checks that the runs pause (reported once to `onPause`) instead of failing. It deletes the second run's workflow, as a parent's cleanup would, and fails the third with `fail`; then deploys v2 and waits for the scheduled retries, about a minute later, to finish the first run and delete the second's record.
 - `rollback` starts the run on v3, deploys v2, sends the event, and checks that the run pauses with `migrations`; then deploys v3 again and resumes it with `resume`.
-- `restart` pauses a run the same way, and checks that `restartFrom` on v2, where any position would pause it again, throws and changes nothing; then deploys v3, restarts it from the wait with `restartFrom`, lets it finish, and restarts the finished run from transcode, by name, with `restart`.
+- `restart` pauses a run the same way, and checks that `restartFrom` on v2, where any position would pause it again, throws and changes nothing; then deploys v3, restarts it from the wait with `restartFrom`, lets it finish, restarts the finished run from transcode, by name, with `restart`, and checks that upstream's journal didn't keep the entries `restart` ran again.
+- `queued` starts, on v3, a workflow whose action holds upstream's workpool, which `e2e/apps/v3/convex/queued.ts` limits to one job at a time; then a parent whose child waits behind it, and a pipeline run with `startAsync`. It checks both records and that the export lists both runs, with no steps yet; then deploys v4, whose pipeline takes a channel, and checks that both run on v4 with the channel `updateWorkflowArgs` gives them, that the parent resumes through its own migration, and that the parent's cleanup deletes the child's record.
 - `args` starts the run on v3, deploys v4-unguarded, sends the event, and checks that the run pauses with `args`; then deploys v4 and resumes it with `resumeAll`, before its scheduled retry, and checks that `--redact` scrubs the migrated workflow args.
 
 ## The component across versions
 
-A deployment's `runs` rows, its scheduled `runs:retry`, `runs:resumeAll` and `runs:cleanupMany` calls, and what `runs:load` returns outlive the version of this package that wrote them: the next release reads the rows and runs the scheduled calls, and the `histories` CLI of whatever version a developer has installed reads `runs:load`. So from one version to the next:
+A deployment's `runs` and `pauses` rows, its scheduled `runs:retry`, `runs:attempt`, `runs:resumeAll` and `runs:forget` calls, and what the CLI's queries return outlive the version of this package that wrote them: the next release reads the rows and runs the scheduled calls, and the `histories` CLI of whatever version a developer has installed calls `runs:load`, `runs:live` and `runs:origins`. So from one version to the next:
 
-- keep every field of `runs` and of its overlay operations readable, adding only optional fields (Convex refuses a schema that existing rows don't match, so the push fails otherwise);
-- keep `runs:retry` callable with `{ workflowId, due? }` (a pause and `fail`'s claim schedule it with `{ workflowId }`, `resumeAll` with `due: true`), `runs:resumeAll` with `{ workflow?, cursor, numItems?, until }` and `runs:cleanupMany` with `{ workflowIds }`, and `runs:load`'s result shape a superset of the last one;
-- keep the stored `paused.handle` called with `{ workflowId, generationNumber }`, upstream's workflow mutation arguments;
-- when a row's meaning changes in a way an older version would misread, raise `FORMAT` in `src/component/schema.ts`. The workflow mutation of a version that finds a row with a higher `format` pauses the run instead of reading it, and the CLI refuses to export it, so a rollback can't corrupt it. That holds only while the newer row still matches the older version's schema; if it doesn't, the older version's push fails instead.
+- keep every field of `runs`, of `pauses` and of the overlay operations readable, adding only optional fields (Convex refuses a schema that existing rows don't match, so the push fails otherwise);
+- keep `runs:retry` callable with `{ workflowId, due? }` (a first pause and every retry schedule it with `{ workflowId }`, `resumeAll` with `due: true`), `runs:attempt` with `{ workflowId, attempts }`, `runs:resumeAll` with `{ workflow?, cursor, until }` and `runs:forget` with `{ workflowIds, from?, journal? }`, and the results of `runs:load`, `runs:live` and `runs:origins` supersets of the last ones;
+- keep the stored `pauses.handle` called with `{ workflowId, generationNumber }`, upstream's workflow mutation arguments, and a scheduled `forget`'s `journal` handle called as upstream's `journal.load`, with `{ workflowId }`;
+- when a record's meaning changes in a way an older version would misread, raise `FORMAT` in `src/component/schema.ts`. The workflow mutation of a version that finds a record with a higher `format` pauses the run instead of reading it, and the CLI and `restart` refuse it, so a rollback can't corrupt it. That holds only while the newer row still matches the older version's schema; if it doesn't, the older version's push fails instead. A `pauses` row has no format: it lasts until the run's next replay that matches, and only the component's own functions write it, so keep each field's meaning, and put new data in new optional fields an older version can ignore.
 
 ## Updating @convex-dev/workflow
 
