@@ -60,8 +60,9 @@ const sameRecord = (a: RunRecord, b: RunRecord) => JSON.stringify(a && [a.applie
 /**
  * A run's history: its first `maxSteps` journal entries, read raw with
  * upstream's `journal.load`, marked `truncated` if there are more, and its
- * record's `applied` and `overlay` if it has one. The record is read before and after the journal, up to `READS` times
- * until the two reads agree; if they never do, the history is `unstable`.
+ * record's `applied` and `overlay` if it has one. The record is read before
+ * and after the journal, up to `READS` times until the two reads agree; if
+ * they never do, the history is `unstable`.
  * `gone` if the run is gone, and `tooBig` if its journal is too big to load
  * (over 8 MiB), which upstream fails at the run's next handler run.
  */
@@ -92,36 +93,44 @@ function runHistory(query: Query, components: Components, workflowId: string, ma
 
 const USAGE = `Usage: convex-workflow-migrations histories <workflow> [options] [-- <convex options>]
 
-Exports the histories of a workflow's running runs, and of its newest
-succeeded ones, as JSON RecordedHistory[]: the input for expectReplays() from
-@dev-marzahn/convex-workflow-migrations/replay. <workflow> is the workflow's
-function name, like pipeline:run. Run it from your app's directory: it runs
-the app's \`convex run\`, so options after -- (like --prod) and the usual
-environment (CONVEX_DEPLOY_KEY, CONVEX_SELF_HOSTED_*) pick the deployment.
+Exports the histories of a workflow's running runs, paused ones included, and
+of its newest succeeded ones, as JSON RecordedHistory[]: the input for
+expectReplays() from @dev-marzahn/convex-workflow-migrations/replay.
+<workflow> is the workflow's function path, like pipeline:run (not
+internal.pipeline.run). Run it from your app's directory: it runs the app's
+\`convex\` CLI, so the usual environment (.env.local, CONVEX_DEPLOY_KEY,
+CONVEX_SELF_HOSTED_*) picks the deployment. Options after -- go to every
+\`convex\` command it runs: pass only ones that select the deployment
+(--prod, --deployment-name, --env-file, --url with --admin-key).
 
-  --recent <n>        Succeeded runs to export too, the newest. Failed and
-                      canceled runs never replay, so it leaves them out.
-                      Default: 10
+  --recent <n>        Succeeded runs to export too, the newest by creation
+                      time. Failed and canceled runs never replay, so it
+                      leaves them out. Default: 10
   --max-scan <n>      Runs to read, newest first, finished ones included, at
                       least 1. If there are more, running runs older than
                       those may be missing: it exports nothing and exits
                       with 1. Default: 10000
-  --allow-partial     Export anyway when --max-scan stopped the scan.
+  --allow-partial     Export anyway when --max-scan stopped the scan. The
+                      file doesn't say the export is partial.
   --max-steps <n>     Steps to export per run, at least 1. A longer run is cut
                       there and marked "truncated". Default: 1000
   --out <file>        Write the JSON to <file> instead of stdout, creating
-                      its directory.
+                      its directory, which is checked before the scan.
   --workflow-component <name>    Default: workflow
   --migrations-component <name>  Default: workflowMigrations. If it isn't
                       deployed, it exits with 2, unless --before-adoption.
   --before-adoption   The app hasn't adopted this package yet, so there's no
                       migrations component: every run is exported without
-                      "applied", as a run from before adoption.
+                      "applied", as a run from before adoption. If the
+                      component is deployed, it exits with 2.
 
-It runs three \`convex run\` commands per exported run, so it's slow for many.
+It runs a few \`convex run\` commands per exported run, so it's slow for many.
 A run whose journal is too big to load (over 8 MiB) is left out, with a note.
-Exit codes: 0 exported, 1 stopped by --max-scan, 2 usage or deployment
-error, or no runs of that name.`;
+
+Exit codes:
+  0  exported, also a partial export with --allow-partial
+  1  stopped by --max-scan, without --allow-partial
+  2  a usage, deployment or file-write error, or no runs of that name`;
 
 const WARNING =
   "The export holds production data: every run's args, and every step's args, result and error, and each record's overlay. Check it before you commit it.";

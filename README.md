@@ -210,38 +210,50 @@ test('runs from every older release replay on the current code', async () => {
 - **`history(steps, { args, applied, workflowId })`** builds a history: `{ step: ref, args, result }` (or `error`, or `canceled: true`), `{ workflow: ref, ... }`, `{ event: name, result }` and `{ sleep: name }`, each with `status: 'running'` if the run is waiting there ([what migrations do to it](#the-history-h)), `startedAt` for its start time (default: its position), and `name` for a custom name. An `awaitEvent({ id })` step records `{ eventId }` as its args, so give it `args: { eventId }`; without a `name`, it's named by its id. A step without an outcome succeeded with `null`.
 - **`applied`**: for a run started on a release that already used this package, pass the ids that release listed, whether or not the run has steps yet. Leave it out only for a run from before adoption and for a child workflow, which have no record: with steps, every migration applies; with none, the args decide: if they pass the current validator, no migration applies; otherwise all do.
 - **`await expectReplays(workflow, histories)`** replays each history, with the migrations, against the current handler, and throws for each one that doesn't replay, with the reason the run would pause, as at runtime, or `(fails)` for a handler that throws and would fail the run; for a throw, the report names the throw rule. A handler passing on a failure (rule 4) replays. A return value that fails the `returns` validator, which fails the run, is reported as `(returns)`, even after a failure. An `updateResult` or `updateWorkflowArgs` that changes its own output fails too. Replay stops where the history ends or at a running step, and checks ids only as strings.
-- **`migrate(workflow, history)`** returns the history `h` after the migrations, to check what they did. It throws if they can't be applied.
+- **`migrate(workflow, history)`** returns the history `h` after the migrations, to check what they did. It throws if they can't be applied, or the history is `truncated` or `unstable` ([exported](#exporting-histories)).
 
 To run the current code from scratch with convex-test, `@dev-marzahn/convex-workflow-migrations/test` has `register(t)`, which registers both components; the helpers above come from `/replay`. It uses `import.meta.glob`, so configure Vitest as for upstream's test helpers: the `edge-runtime` environment, and `convex-test`, `@convex-dev/workflow`, `@convex-dev/workpool` and this package in `server.deps.inline`.
 
 ## Exporting histories
 
-The package's CLI exports a workflow's runs from a deployment as JSON `RecordedHistory[]`, for `expectReplays`: every running run, and the newest finished ones. Run it from your app's directory. It runs your app's `convex run`, so it picks the deployment as that does (`.env.local`, `CONVEX_DEPLOY_KEY`, `CONVEX_SELF_HOSTED_*`), and passes the options after `--` to it:
+The package's `histories` CLI exports a workflow's runs from a deployment as JSON `RecordedHistory[]`, for `expectReplays`: every running run, paused ones included, and the newest that succeeded. Run it from your app's directory: it runs your app's `convex` CLI, which picks the deployment as usual (`.env.local`, `CONVEX_DEPLOY_KEY`, `CONVEX_SELF_HOSTED_*`). Options after `--` go to every `convex` command it runs, so pass only ones that select the deployment: `--prod`, `--deployment-name`, `--env-file`, or `--url` with `--admin-key`.
 
 ```sh
 npx convex-workflow-migrations histories pipeline:run --out convex/histories/pipeline.json -- --prod
 ```
 
-- `--recent <n>`: the newest finished runs to export too (default 10).
-- `--max-scan <n>`: how many runs to read, newest first, finished ones included (default 10,000). Upstream has no index by status, so this is how it finds the running ones. If the workflow has more, older running runs may be missing: it says how many it read and when the oldest was created, exports nothing and exits with 1, unless you pass `--allow-partial`.
-- `--max-steps <n>`: the steps to export per run (default 1,000). A longer run is cut there and marked `truncated`.
-- `--out <file>` writes the JSON there instead of stdout. `--workflow-component` and `--migrations-component` name the components if you mounted them under other names.
+The workflow is named by its function path, `pipeline:run`; upstream lists runs by the name it stored, so `internal.pipeline.run` finds none.
 
-Each history has the run's `workflowId`, `workflow` (its function name), `args` and `steps`, read from upstream's journal; `applied` and `overlay`, if the run has a record; `outcome` (`success`, `failed` or `canceled`) once it finished; `truncated`; and `unstable` if its record changed each of the 3 times the CLI read it around the journal, so the two may not match. Without the migrations component on the deployment, every run is exported without `applied`, as a run from before adoption, and the CLI says so. It exits with 0 when it exported, 1 when `--max-scan` stopped it, and 2 on a usage or deployment error.
+- `--recent <n>`: the newest runs that succeeded to export too, by creation time (default 10). Failed and canceled runs never replay, so they're left out.
+- `--max-scan <n>`: how many runs to read, newest first, finished ones included (default 10,000). Upstream has no index by status, so this is how it finds the running ones. If the workflow has more, older running runs may be missing: it says how many it read, exports nothing and exits with 1, unless you pass `--allow-partial`. A partial export isn't marked in the file.
+- `--max-steps <n>`: the steps to export per run (default 1,000). A longer run is cut there and marked `truncated`. A run whose journal is over 8 MiB, too big to load, is left out, with a note naming it.
+- `--out <file>`: write the JSON there, creating its directory, which is checked before the scan. Without it, the JSON goes to stdout, so in CI it can end up in logs.
+- `--before-adoption`: the app has no migrations component yet, so every run is exported without `applied`, as a run from before adoption. The CLI exits with 2 when the component is missing without this option, or deployed with it. `--workflow-component` and `--migrations-component` name the components if you mounted them under other names.
 
-`expectReplays` fails a `truncated` or `unstable` history, and `outcome` changes which handler failures count: after `success`, every one does; after `failed` or `canceled`, only a throw before the last recorded step, since the run ended after it. Load the file with `resolveJsonModule`, or read it:
+Each history has the run's `workflowId`, `args` and `steps`, from upstream's journal; `applied` and `overlay`, from its record; `encoding: 'json'`, so that `/replay` decodes the int64s, bytes and special floats `convex run` printed; `truncated`; and `unstable` if its record changed each of the 3 times the CLI read the journal, so the two may not match. `expectReplays` and `migrate` fail a `truncated` or `unstable` history, and `expectReplays` throws on an empty list. The CLI exits with:
+
+- 0 when it exported, also a partial export with `--allow-partial`;
+- 1 when `--max-scan` stopped it, without `--allow-partial`;
+- 2 on a usage, deployment or file-write error, or when there are no runs of that name.
+
+A paused run is exported with the migrations applied before it paused, so `expectReplays` on it confirms a fix before you deploy it. A succeeded run covers the full path, so migrations that edit later steps get exercised: if one fails on it, a running run that reaches that point would hit the same problem. Export before each release, and keep the older exports: their `applied` stays the start of the growing list, so they stay valid as histories of older releases.
+
+To import the file, enable `resolveJsonModule` in `convex/tsconfig.json`:
 
 ```ts
+// convex/pipeline.test.ts
 import { expectReplays, type RecordedHistory } from '@dev-marzahn/convex-workflow-migrations/replay';
+import { test } from 'vitest';
 
-import raw from './histories/pipeline.json' with { type: 'json' };
+import exported from './histories/pipeline.json';
+import { run } from './pipeline';
 
-const histories = raw as RecordedHistory[];
-// Or: JSON.parse(readFileSync(new URL('./histories/pipeline.json', import.meta.url), 'utf8')) as RecordedHistory[]
-await expectReplays(run, histories);
+test('exported runs replay on the current code', async () => {
+  await expectReplays(run, exported as RecordedHistory[]);
+});
 ```
 
-**The export holds production data:** every run's args, every step's args, result and error, and the overlay's values. The CLI warns about it on stderr. Check the file, and take out what shouldn't be in your repository, before you commit it.
+**The export holds production data:** every run's args, every step's args, result and error, and the overlay's values. Check it before you commit it. Removing a whole history is safe. Editing a value changes what's replayed: a step's args must stay what the handler computes from the run's args and earlier results, and a result must stay a value the function could return. Or export from a staging deployment.
 
 ## Limits
 
@@ -255,7 +267,7 @@ await expectReplays(run, histories);
 - **Child workflows' records.** When upstream deletes a run's child workflows, in `cleanup` or `restart({ from })`, their records stay behind in the migrations component. They're only storage.
 - **The record is one document.** The overlay stores every stand-in result and every migrated result or args value, so together they must fit Convex's document size limit. A save over it fails the run in a handler run the workpool started; in a scheduled retry, the run stays paused with the error in `lastError`, and `resume` throws it. Keep them small.
 - **Matching is by position, name, kind and args**, as upstream's. Workflow function renames aren't supported.
-- **The export reads by the workflow's name.** Upstream names a child workflow after its `runWorkflow` step, so a child started with a custom `name` is listed under that name, not under its function name. The CLI runs three `convex run` commands per run it exports, so many runs take a while.
+- **The export lists runs by name.** Each page of upstream's listing holds 100 full workflow documents, with their args and results, so very large ones can hit Convex's read limits, and the CLI exits with 2. Upstream names a child workflow after its `runWorkflow` step, so a child started with a custom `name` isn't listed under its function name.
 
 ## What's next
 
