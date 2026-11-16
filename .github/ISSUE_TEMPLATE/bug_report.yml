@@ -13,12 +13,12 @@ body:
     id: repro
     attributes:
       label: Steps to reproduce
-      description: The smallest workflow, before and after the change, that shows it. A convex-test case with `simulateDeploy` is ideal.
+      description: The smallest workflow, before and after the change, with its migrations, that shows it. A failing `expectReplays` test with the history (from `history()` or the `histories` CLI) is ideal.
   - type: textarea
     id: logs
     attributes:
       label: Output
-      description: The workflow's error (e.g. `Journal entry mismatch`) and its steps from `workflow.listSteps`, if you have them.
+      description: For a paused run, its entry from `workflow.paused()` (reason, detail, step). Otherwise the workflow's error and its steps from `workflow.listSteps`. Remove production data first.
       render: text
   - type: input
     id: version
