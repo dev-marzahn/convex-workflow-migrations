@@ -38,9 +38,6 @@ export function checkMigrations(migrations: readonly Migration[] = []): readonly
 /** What the vendored workflow mutation gets from the manager: the migrations component, the workflow's migrations, and its `args` validator. */
 export type WorkflowMigrations = { component: MigrationsComponent; list: readonly Migration[]; args?: unknown };
 
-/** The largest overlay a run may store, in bytes: half of Convex's 1 MiB document limit. */
-export const OVERLAY_LIMIT = 512 * 1024;
-
 /** A history with the run's pending migrations applied: the ids applied now, and how many edits each migration made. */
 export type Prepared = { history: HistoryView; applied: string[]; ran: { id: string; edits: number }[] };
 
@@ -50,8 +47,8 @@ const message = (error: unknown) => (error instanceof Error ? error.message : St
 /**
  * Builds the history from the journal and the stored overlay, and applies
  * the migrations the run hasn't had, in memory. Throws a `ReplayError` if the
- * applied ids aren't a prefix of the list, a migration throws, or the overlay
- * grows past `OVERLAY_LIMIT`.
+ * overlay edits a step the journal doesn't have, the applied ids aren't a
+ * prefix of the list, or a migration throws.
  */
 export function prepareHistory(
   journal: readonly RecordedStep[],
@@ -81,15 +78,6 @@ export function prepareHistory(
       throw new ReplayError('migration', `Migration "${m.id}" threw: ${message(error)}`);
     }
     applied.push(m.id);
-  }
-  // The stored overlay fit; only what this handler run added can make it too big to save.
-  const bytes = ran.length > 0 ? history.size() : 0;
-  if (bytes > OVERLAY_LIMIT) {
-    const added = quoted(ran.filter((m) => m.edits > 0).map((m) => m.id));
-    throw new ReplayError(
-      'overlay',
-      `The run's overlay would be ${Math.ceil(bytes / 1024)} KiB, over the ${OVERLAY_LIMIT / 1024} KiB limit. Added to it now: ${added}.`,
-    );
   }
   return { history, applied, ran };
 }
@@ -135,20 +123,21 @@ type MutationCtx = GenericMutationCtx<GenericDataModel>;
 /**
  * For the vendored workflow mutation, once per handler run, before replay:
  * loads the run's record and applies its pending migrations, or throws a
- * `ReplayError`. Returns the history, the args as the migrations left them,
- * and `save`, which stores what changed, after a replay that matched.
+ * `ReplayError`. Returns the history, the migrations applied now, and `save`,
+ * which stores what changed, after a replay that matched. Convex's document
+ * size limit makes `save` throw for an overlay too big to store.
  */
 export async function loadRecord(ctx: MutationCtx, migrations: WorkflowMigrations, run: { _id: string; args: unknown }, journal: readonly JournalEntry[]) {
   const workflowId = run._id as WorkflowId;
   const workflow = (await ctx.meta.getFunctionMetadata()).name;
   const row = await ctx.runQuery(migrations.component.runs.load, { workflowId });
   const valid = (args: unknown) => argsValid({ args: migrations.args }, args, ctx.db);
-  const { history, applied } = prepareRun(journal.map(recordedStep), { applied: row?.applied, overlay: row?.overlay ?? [] }, migrations.list, run.args, valid);
+  const prepared = prepareRun(journal.map(recordedStep), { applied: row?.applied, overlay: row?.overlay ?? [] }, migrations.list, run.args, valid);
   const save = async () => {
-    const record = { workflow, applied, overlay: history.overlay() };
+    const record = { workflow, applied: prepared.applied, overlay: prepared.history.overlay() };
     if (!row || json(row) !== json(record)) await ctx.runMutation(migrations.component.runs.save, { workflowId, ...record });
   };
-  return { history, args: history.workflowArgs as unknown, save };
+  return { ...prepared, save };
 }
 
 /** For the vendored workflow mutation, in the transaction that creates a run: its record, with every migration applied. */

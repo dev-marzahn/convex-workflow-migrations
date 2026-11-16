@@ -5,7 +5,7 @@
 import { BaseChannel } from 'async-channel';
 import type { FunctionReference, GenericDataModel, GenericMutationCtx, RegisteredMutation } from 'convex/server';
 
-import type { History, HistoryStep, HistoryView, RecordedHistory, RecordedStep, StepKind } from './history.ts';
+import type { History, HistoryStep, RecordedHistory, RecordedStep, StepKind } from './history.ts';
 import { type Prepared, prepareRun } from './migrations.ts';
 import { argsValid, REPLAY, ReplayError, replayHandler, type ReplayTarget } from './replay.ts';
 import { setupEnvironment } from './vendor/workflow/environment.ts';
@@ -89,20 +89,21 @@ class ReplayOnly extends StepExecutor {
  * Replays the migrated history, and returns why it doesn't replay, if it
  * doesn't. It starts no step: replay stops where the history ends, or at a
  * running step. A handler that throws fails it, unless the history's last
- * step failed or was canceled, which the handler may be passing on.
+ * step failed or was canceled, which the handler may be passing on: as
+ * `migration` if migrations applied now, as at runtime, otherwise as `threw`.
  */
-async function replayHistory(replay: ReplayTarget, recorded: RecordedHistory, history: HistoryView): Promise<string | undefined> {
+async function replayHistory(replay: ReplayTarget, recorded: RecordedHistory, prepared: Prepared): Promise<string | undefined> {
   const workflowId = (recorded.workflowId ?? 'history') as WorkflowId;
   const channel = new BaseChannel<StepRequest>(replay.workpoolOptions?.maxParallelism ?? 10);
   const now = Math.max(0, ...recorded.steps.map((s) => s.startedAt));
   // Never used: starting a step stops the replay.
   const [ctx, component] = [undefined as unknown as GenericMutationCtx<GenericDataModel>, undefined as unknown as WorkflowComponent];
-  const executor = new ReplayOnly(workflowId, 0, ctx, component, [], channel, now, replay.workpoolOptions, history);
+  const executor = new ReplayOnly(workflowId, 0, ctx, component, [], channel, now, replay.workpoolOptions, prepared.history);
   const restoreEnvironment = setupEnvironment(executor.getGenerationState.bind(executor), workflowId);
   try {
     const options = { step: createWorkflowCtx(workflowId, channel), console: { error: () => {} } };
-    const result = await replayHandler(replay.definition, history.workflowArgs, executor, options);
-    if (result.type === 'handlerDone' && result.runResult.kind === 'failed' && history.steps.at(-1)?.error === undefined) {
+    const result = await replayHandler(replay.definition, prepared, executor, options);
+    if (result.type === 'handlerDone' && result.runResult.kind === 'failed' && prepared.history.steps.at(-1)?.error === undefined) {
       return `(threw): The handler threw replaying the history: ${result.runResult.error.split('\n')[0]}`;
     }
   } catch (error) {
@@ -134,7 +135,7 @@ export async function expectReplays(workflow: Workflow, histories: readonly Reco
       failures.push(`${label} (${error.reason}): ${error.message}`);
       continue;
     }
-    const problem = await replayHistory(replay, recorded, prepared.history);
+    const problem = await replayHistory(replay, recorded, prepared);
     if (problem) failures.push(`${label} ${problem}\n  migrated history: ${summary(prepared.history.steps)}`);
   }
   if (failures.length > 0) throw new Error(`${failures.length} of ${histories.length} histories don't replay on the current handler:\n${failures.join('\n')}`);
@@ -164,7 +165,7 @@ export async function expectEdits(history: History | Promise<History>, ids?: rea
   const problems = (ids ?? [...edits.keys()]).flatMap((id) => {
     const count = edits.get(id);
     if (count === undefined) return [`"${id}" didn't run: it isn't in the workflow's list, or the history has it applied already`];
-    return count === 0 ? [`"${id}" changed nothing: the steps it names aren't in the history by those names`] : [];
+    return count === 0 ? [`"${id}" changed nothing: the steps it names aren't in the history by those names, or already are as it leaves them`] : [];
   });
   if (ids === undefined && edits.size === 0) problems.push('no migration ran: the history has them all applied');
   if (problems.length > 0) throw new Error(`Migrations didn't edit the history: ${problems.join('; ')}.\n  migrated history: ${summary(resolved.steps)}`);

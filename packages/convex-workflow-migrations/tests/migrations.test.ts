@@ -80,7 +80,8 @@ const releases = {
       throw new Error('oops');
     }),
   ]),
-  huge: release({ notify: true }, [migration('huge', (h) => h.insertAfter(flows.grab, flows.notify, { result: { at: null, padding: 'x'.repeat(600_000) } }))]),
+  // Release 2 with a stand-in whose result the handler can't read `at` of.
+  badStandIn: release({ notify: true, notifiedAt: true }, [migration(m1.id, (h) => h.insertAfter(flows.grab, flows.notify, { result: null })), m2]),
   channel: withChannel([channelArg]),
   channelUnguarded: withChannel([]),
   optionalChannel: withChannel([channelArg], true),
@@ -224,7 +225,12 @@ test.each([
     ALL,
     'The run has migrations "notify-after-grab", "import-gets-notified-at", "prepare-becomes-transcode" applied, but this code lists "notify-after-grab".',
   ],
-  ['an overlay over the size limit', 'huge', [], 'The run\'s overlay would be 587 KiB, over the 512 KiB limit. Added to it now: "huge".'],
+  [
+    'a handler that throws on the history its migrations leave',
+    'badStandIn',
+    [],
+    `The handler threw replaying the history as migrations "notify-after-grab", "import-gets-notified-at" leave it: TypeError: Cannot read properties of null (reading 'at')`,
+  ],
 ] as const)('a run that cannot replay fails, as upstream does: %s', async (_, to, applied, error) => {
   const t = setup();
   if (applied.length > 0) deploy('r3');
@@ -252,6 +258,20 @@ test('a run that failed to replay recovers with restart, once the code has its m
   await settle(t);
   expect(await status(t, id)).toEqual(completed);
   expect(ran).toEqual(['grab', 'import', 'prepare', 'publish']);
+});
+
+test('a run whose handler threw on its migrated history recovers with restart, once the migration is fixed', async () => {
+  const t = setup();
+  const id = await start(t);
+  deploy('badStandIn');
+  await downloadDone(t, id);
+  expect((await status(t, id)).type).toBe('failed');
+  deploy('r2'); // the same ids, with the stand-in fixed
+  await t.run((ctx) => manager.restart(ctx, id));
+  await settle(t);
+  expect(await status(t, id)).toEqual(completed);
+  expect(ran).toEqual(['grab', 'import {"notifiedAt":null}', 'prepare', 'publish']);
+  expect(await record(t, id)).toMatchObject({ applied: ['notify-after-grab', 'import-gets-notified-at'], overlay: [{ op: 'insert', result: { at: null } }] });
 });
 
 test('restart replays the whole history with its migrations; restart from a step refuses a history its migrations edited', async () => {

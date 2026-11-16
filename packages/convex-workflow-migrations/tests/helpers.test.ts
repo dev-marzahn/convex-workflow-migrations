@@ -120,16 +120,20 @@ test('expectReplays reports the history, the position, both calls and the migrat
 
 test("expectReplays reports a handler that throws while replaying, but not one passing on the last step's failure", async () => {
   const message = await failure(expectReplays(workflows.badStandIn, [release0Waiting]));
-  expect(message).toContain("(threw): The handler threw replaying the history: TypeError: Cannot read properties of null (reading 'at')");
+  // As at runtime, where the run fails without saving the migrations as applied.
+  expect(message).toContain(
+    `(migration): The handler threw replaying the history as migrations "notify-after-grab" leave it: TypeError: Cannot read properties of null (reading 'at')`,
+  );
+  // No migration applies now: at runtime the run just fails, but the history doesn't replay.
+  const recorded = history([{ step: flows.grab }, { step: flows.notify }, { event: 'downloadDone', status: 'running' }], { applied: ['notify-after-grab'] });
+  expect(await failure(expectReplays(workflows.badStandIn, [recorded]))).toContain('(threw): The handler threw replaying the history: TypeError');
   // The download failed: the handler passes that on, and the run fails, as it did.
   await expectReplays(workflows.current, [history([{ step: flows.grab }, { event: 'downloadDone', error: 'the download failed' }])]);
 });
 
-test('expectReplays reports a migration that edits a running step', async () => {
+test('a migration may edit a running step, which at runtime it never sees', async () => {
   const preparing = history([{ step: flows.grab }, { event: 'downloadDone' }, { step: flows.prepare, status: 'running' }]);
-  await expect(expectReplays(workflows.current, [preparing])).rejects.toThrow(
-    '(migration): Migration "prepare-becomes-transcode" threw: rename(flows:prepare): the step is still running',
-  );
+  await expectReplays(workflows.current, [preparing]);
 });
 
 test('expectReplays checks the workflow args as the migrations leave them; an empty history without applied ids lets its args pick', async () => {
@@ -166,6 +170,8 @@ test('expectReplays and migrate fail an updateResult that changes its own output
   await expect(migrate(workflows.wraps, finishedOnNewCode)).rejects.toThrow('run again on its own output, the update changed it');
   await expectReplays(workflows.normalizes, [oldShape, finishedOnNewCode]);
   expect((await migrate(workflows.normalizes, finishedOnNewCode)).result(flows.grab)).toEqual({ value: 'file' });
+  // A result already in the new shape stays as it is: the edit stores nothing.
+  await expect(expectEdits(migrate(workflows.normalizes, finishedOnNewCode))).rejects.toThrow('"grab-wraps" changed nothing');
 });
 
 test('migrate returns the history after the migrations', async () => {

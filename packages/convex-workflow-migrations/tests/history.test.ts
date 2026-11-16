@@ -4,7 +4,8 @@ import { anyApi } from 'convex/server';
 import { expect, test } from 'vite-plus/test';
 
 import { HistoryView, type RecordedStep } from '../src/history.ts';
-import { migration, OVERLAY_LIMIT, prepareHistory, prepareRun, recordedStep } from '../src/migrations.ts';
+import { migration, prepareHistory, prepareRun, recordedStep } from '../src/migrations.ts';
+import { ReplayError } from '../src/replay.ts';
 import type { JournalEntry } from '../src/vendor/workflow/types.ts';
 
 const fn = anyApi.flows!;
@@ -78,6 +79,39 @@ test('remove, rename and updateArgs; updateArgs gets a copy of the recorded args
   expect(h.replay(0)[1]!.step).toMatchObject({ name: 'flows:ingest', args: { grabId: 'g', notifiedAt: null } });
 });
 
+test('a migration reads copies: changing them changes neither the history nor its replay', () => {
+  const h = new HistoryView([done('j0', 'grab', { files: ['a'] }, { ids: [1] })]);
+  (h.result(fn.grab) as { files: string[] }).files.push('b');
+  (h.steps[0]!.args as { ids: number[] }).ids.push(2);
+  (h.steps[0]!.result as { files: string[] }).files.push('c');
+  expect(h.steps[0]).toMatchObject({ args: { ids: [1] }, result: { files: ['a'] } });
+  expect(h.replay(0)[0]!.step).toMatchObject({ args: { ids: [1] }, runResult: { kind: 'success', returnValue: { files: ['a'] } } });
+  expect(h.overlay()).toEqual([]);
+});
+
+test('an edit that leaves a value as it is stores nothing; a later edit of the same field replaces the earlier one', () => {
+  const h = new HistoryView(journal(), [], { grabId: 'g' });
+  h.updateResult(fn.grab, (r: unknown) => r);
+  h.updateArgs(fn.importFiles, (args) => args);
+  h.updateWorkflowArgs((args) => args);
+  expect(h.overlay()).toEqual([]);
+  h.updateArgs(fn.importFiles, () => ({ x: 1 }));
+  h.rename(fn.importFiles, fn.ingest);
+  h.updateArgs(fn.ingest, () => ({ x: 2 }));
+  h.updateResult(fn.grab, () => 'one');
+  h.updateResult(fn.grab, () => 'two');
+  expect(h.overlay()).toEqual([
+    { op: 'rewrite', target: 'j2', name: 'flows:ingest' },
+    { op: 'rewrite', target: 'j2', args: { x: 2 } },
+    { op: 'rewrite', target: 'j0', result: 'two' },
+  ]);
+  expect(new HistoryView(journal(), h.overlay()).replay(0).map((e) => e.step)).toEqual(h.replay(0).map((e) => e.step));
+  // A stand-in inserted without args gets them even when they equal its default {}.
+  h.insertAfter(fn.grab, fn.notify, { result: null });
+  h.updateArgs(fn.notify, () => ({}));
+  expect(h.overlay().at(-1)).toEqual({ op: 'rewrite', target: '+1', args: {} });
+});
+
 test('an edit whose step is not in the history does nothing', () => {
   const h = new HistoryView(journal());
   h.insertAfter(fn.notify, fn.other, { result: null });
@@ -101,15 +135,17 @@ test('a reference matches at most one step; pass one of h.steps for repeated ste
   expect(() => h.remove(gone)).toThrow("that step isn't in the history any more");
 });
 
-test('a running step can be inserted around, but not removed, renamed or given other args or another result', () => {
-  const h = new HistoryView([done('j0', 'grab'), event('j1', 'downloadDone', true)]);
+test('a running step, which only a test history has, takes every edit but updateResult, which leaves it as it is', () => {
+  const h = new HistoryView([done('j0', 'grab'), event('j1', 'downloadDone', true), done('j2', 'prepare'), event('j3', 'later', true)]);
   expect(h.steps[1]!.status).toBe('running');
-  expect(() => h.remove({ event: 'downloadDone' })).toThrow('the step is still running');
-  expect(() => h.rename({ event: 'downloadDone' }, { event: 'done' })).toThrow('still running');
-  expect(() => h.updateArgs(h.steps[1]!, () => ({}))).toThrow('still running');
-  expect(() => h.updateResult(h.steps[1]!, () => ({}))).toThrow('still running');
-  h.insertBefore({ event: 'downloadDone' }, fn.notify, { result: null });
-  expect(names(h)).toEqual(['grab', 'notify', 'downloadDone (running)']);
+  h.updateResult(h.steps[1]!, () => ({}));
+  expect(h.overlay()).toEqual([]);
+  h.rename({ event: 'downloadDone' }, { event: 'done' });
+  h.updateArgs(h.steps[1]!, () => ({ x: 1 }));
+  h.insertBefore({ event: 'done' }, fn.notify, { result: null });
+  h.remove({ event: 'later' });
+  expect(names(h)).toEqual(['grab', 'notify', 'done (running)', 'prepare']);
+  expect(h.steps[2]!.args).toEqual({ x: 1 });
 });
 
 test('an insert where no journal entry or stand-in follows does nothing, so the run makes the call; atEnd inserts it anyway', () => {
@@ -139,7 +175,7 @@ test('rename keeps the kind of step, and takes a custom name', () => {
   expect(h.steps[0]).toMatchObject({ name: 'fetch the files', kind: 'function' });
 });
 
-test('the overlay reloads: later edits see earlier ones, ids stay unique, and edits of steps gone from the journal are dropped', () => {
+test('the overlay reloads: later edits see earlier ones, ids stay unique, and an edit of a step gone from the journal throws', () => {
   const h = new HistoryView(journal());
   h.insertAfter(fn.grab, fn.notify, { result: { at: null } });
   h.updateArgs(fn.notify, () => ({ to: 'me' }));
@@ -152,8 +188,11 @@ test('the overlay reloads: later edits see earlier ones, ids stay unique, and ed
   reloaded.insertAfter(fn.log, fn.more, { result: null });
   const ids = reloaded.overlay().flatMap((op) => (op.op === 'insert' ? [op.id] : []));
   expect(ids).toEqual(['+1', '+2', '+3']);
-  // Upstream's restart({ from: 1 }) deleted the wait and import.
-  expect(new HistoryView(journal().slice(0, 1), h.overlay()).overlay().map((op) => op.op)).toEqual(['insert', 'rewrite', 'insert', 'rewrite']);
+  // Upstream's restart({ from: 1 }), called around the manager, deleted the wait and import.
+  const gone = () => new HistoryView(journal().slice(0, 1), h.overlay());
+  expect(gone).toThrow(ReplayError);
+  expect(gone).toThrow("The run's record edits journal entry j2, which was deleted outside the WorkflowManager.");
+  expect(() => prepareHistory(journal().slice(0, 1), { applied: [], overlay: h.overlay() }, [], {})).toThrow(expect.objectContaining({ reason: 'record' }));
 });
 
 test('updateResult changes what replay gives a call, for a recorded step or a stand-in', () => {
@@ -181,13 +220,23 @@ test('strict, as the /replay helpers run it, an updateResult must leave its own 
   const runtime = new HistoryView(journal());
   runtime.updateResult(fn.grab, (r: unknown) => (calls++, { value: r }));
   expect([calls, runtime.result(fn.grab)]).toEqual([1, { value: 'grabbed' }]);
+  // So must an updateWorkflowArgs.
+  expect(() => new HistoryView(journal(), [], { n: 1 }, { strict: true }).updateWorkflowArgs((a: { n: number }) => ({ n: a.n + 1 }))).toThrow(
+    'updateWorkflowArgs: run again on its own output, the update changed it ({"n":2} became {"n":3}).',
+  );
+  const args = new HistoryView(journal(), [], { n: 1 }, { strict: true });
+  args.updateWorkflowArgs((a: object) => ({ channel: 'default', ...a }));
+  expect(args.workflowArgs).toEqual({ n: 1, channel: 'default' });
+  new HistoryView(journal(), [], { n: 1 }).updateWorkflowArgs((a: { n: number }) => (calls++, { n: a.n + 1 }));
+  expect(calls).toBe(2);
 });
 
-test('updateWorkflowArgs gives replay new workflow args; the latest wins', () => {
+test('updateWorkflowArgs gives replay new workflow args; the latest wins, and replaces the earlier one', () => {
   const h = new HistoryView(journal(), [], { grabId: 'g' });
   h.updateWorkflowArgs((args) => ({ ...args, quality: 'sd' }));
   h.updateWorkflowArgs((args) => ({ ...args, quality: 'hd' }));
   expect(h.workflowArgs).toEqual({ grabId: 'g', quality: 'hd' });
+  expect(h.overlay()).toEqual([{ op: 'workflowArgs', args: { grabId: 'g', quality: 'hd' } }]);
   expect(new HistoryView(journal(), h.overlay(), { grabId: 'g' }).workflowArgs).toEqual({ grabId: 'g', quality: 'hd' });
   expect(() => h.updateWorkflowArgs(() => undefined)).toThrow('updateWorkflowArgs: the update must return the new args.');
 });
@@ -220,10 +269,6 @@ test('prepareHistory applies the pending migrations, counting their edits, and r
   });
   expect(() => prepareHistory(journal(), { applied: [], overlay: [] }, [broken], {})).toThrow(
     'Migration "broken" threw: remove(flows:grab (j0)): that step isn\'t in the history any more.',
-  );
-  const huge = migration('huge', (h) => h.insertAfter(fn.grab, fn.big, { result: 'x'.repeat(OVERLAY_LIMIT) }));
-  expect(() => prepareHistory(journal(), { applied: [], overlay: [] }, [notify, none, huge], {})).toThrow(
-    /^The run's overlay would be \d+ KiB, over the 512 KiB limit\. Added to it now: "notify", "huge"\.$/,
   );
 });
 

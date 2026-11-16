@@ -9,14 +9,14 @@ import type { GenericDatabaseReader } from 'convex/server';
 import { asObjectValidator, type PropertyValidators, type Validator } from 'convex/values';
 
 import type { StepKind } from './history.ts';
-import type { Migration } from './migrations.ts';
+import type { Migration, Prepared } from './migrations.ts';
 import { formatErrorWithStack } from './vendor/workflow/shared.ts';
 import type { StepExecutor, WorkerResult } from './vendor/workflow/step.ts';
 import type { RunResult } from './vendor/workflow/types.ts';
 import type { WorkflowCtx } from './vendor/workflow/workflowContext.ts';
 
 /** Why a run can't replay on the current code. */
-export type ReplayReason = 'mismatch' | 'args' | 'migration' | 'migrations' | 'overlay';
+export type ReplayReason = 'mismatch' | 'args' | 'migration' | 'migrations' | 'record';
 
 /** The run can't replay on the current code: the workflow mutation throws it, and upstream fails the run with its message. */
 export class ReplayError extends Error {
@@ -73,19 +73,21 @@ export function argsValid(definition: { args?: unknown }, args: unknown, db?: Ge
 }
 
 /**
- * Runs the handler against the executor's history, racing it against the
- * executor as upstream's workflow mutation does, and returns what upstream's
- * race returns. Throws a `ReplayError` for args that don't pass the `args`
- * validator, and the executor's `ReplayMismatch`. Call it inside the replay's
- * environment (`setupEnvironment`).
+ * Runs the handler on the history's args, racing it against the executor as
+ * upstream's workflow mutation does, and returns what upstream's race returns.
+ * Throws a `ReplayError` for args that don't pass the `args` validator, for a
+ * handler that throws after migrations applied now (`ran`), unless the
+ * history's last step failed, and the executor's `ReplayMismatch`. Call it
+ * inside the replay's environment (`setupEnvironment`).
  */
 export async function replayHandler(
   registered: ReplayDefinition,
-  args: unknown,
+  { history, ran }: Pick<Prepared, 'history' | 'ran'>,
   executor: StepExecutor,
   options: { step: WorkflowCtx; console: { error: (...args: unknown[]) => void }; db?: GenericDatabaseReader<any> },
 ): Promise<WorkerResult> {
   const { console } = options;
+  const args = history.workflowArgs as unknown;
   const handlerWorker = async (): Promise<WorkerResult> => {
     if (registered.args) {
       try {
@@ -110,6 +112,11 @@ export async function replayHandler(
     } catch (error) {
       const message = formatErrorWithStack(error);
       console.error(message);
+      // Likely a wrong migration: the run fails without saving it as applied, so restart applies the fixed one.
+      if (ran.length > 0 && history.steps.at(-1)?.error === undefined) {
+        const ids = ran.map((m) => `"${m.id}"`).join(', ');
+        throw new ReplayError('migration', `The handler threw replaying the history as migrations ${ids} leave it: ${message.split('\n')[0]}`);
+      }
       runResult = { kind: 'failed', error: message };
     }
     return { type: 'handlerDone', runResult };

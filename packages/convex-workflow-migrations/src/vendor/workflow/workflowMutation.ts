@@ -264,7 +264,7 @@ export function workflowMutation<
         // PATCHES: upstream's handler and executor workers, in replayHandler
         // (src/replay.ts), with the args as the migrations left them.
         const options = { step, console, db: ctx.db };
-        const result = await replayHandler(registered, run.args, executor, options);
+        const result = await replayHandler(registered, run, executor, options);
         // PATCHES: save what this handler run applied, in its transaction.
         await run.save();
         switch (result.type) {

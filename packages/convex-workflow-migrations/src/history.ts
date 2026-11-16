@@ -2,10 +2,10 @@
 // run's overlay applied. Migrations edit it through `History`; the vendored
 // executor replays the handler against `HistoryView.replay()`.
 import type { FunctionArgs, FunctionReference, FunctionReturnType } from 'convex/server';
-import { convexToJson, getConvexSize, type Infer, jsonToConvex, type Value } from 'convex/values';
+import { convexToJson, type Infer, jsonToConvex, type Value } from 'convex/values';
 
 import type { vOverlayOp, vStepKind } from './component/schema.ts';
-import type { ReplayEntry } from './replay.ts';
+import { type ReplayEntry, ReplayError } from './replay.ts';
 import { safeFunctionName } from './vendor/workflow/safeFunctionName.ts';
 import type { RunResult, WorkflowReturnType } from './vendor/workflow/types.ts';
 
@@ -91,7 +91,7 @@ export interface History {
   rename(step: StepSelector, to: StepRef, options?: { name?: string }): void;
   /** The args the current code passes. For matching only: the step ran with its old args. */
   updateArgs<R extends StepRef>(step: R | HistoryStep, update: (args: any) => StepArgs<R>): void;
-  /** The result replay gives the call, for a step whose return value changed shape. The step must have succeeded. */
+  /** The result replay gives the call, for a step whose return value changed shape. The step must have succeeded; a running one is left as it is. */
   updateResult<R extends StepRef>(step: R | HistoryStep, update: (result: any) => StepResult<R>): void;
   /** The workflow's arguments as the current `args` validator expects them. Replay passes these; the run keeps its own. */
   updateWorkflowArgs(update: (args: any) => unknown): void;
@@ -109,6 +109,7 @@ type Node = {
   result?: { value: unknown };
 };
 
+const REWRITTEN = ['name', 'args', 'result'] as const;
 const clone = <T>(value: T): T => (value === undefined ? value : (jsonToConvex(convexToJson(value as Value)) as T));
 export const json = (value: unknown) => JSON.stringify(convexToJson(value as Value));
 
@@ -130,7 +131,7 @@ function describe(step: StepSelector): string {
 
 export class HistoryView implements History {
   private nodes: Node[];
-  private readonly ops: OverlayOp[] = [];
+  private ops: OverlayOp[] = [];
   private args: unknown;
   private nextId = 1;
   /** How many edits migrations have made to this view. */
@@ -138,10 +139,10 @@ export class HistoryView implements History {
 
   /**
    * The journal with `overlay` applied in order, and `args` as the run
-   * recorded them. An operation whose step isn't in the journal is dropped.
-   * With `strict`, for the /replay helpers, each `updateResult` runs again on
-   * its own output and throws if that changes it: a step can finish on the
-   * new code, so its result may already be in the new shape.
+   * recorded them. Throws a `ReplayError` if an operation's step isn't in the
+   * journal. With `strict`, for the /replay helpers, each `updateResult` and
+   * `updateWorkflowArgs` runs again on its own output and throws if that
+   * changes it.
    */
   public constructor(
     journal: readonly RecordedStep[],
@@ -183,12 +184,12 @@ export class HistoryView implements History {
   }
 
   public remove(step: StepSelector): void {
-    const node = this.editable(step, 'remove');
+    const node = this.find(step, 'remove');
     if (node) this.push({ op: 'remove', target: node.id });
   }
 
   public rename(step: StepSelector, to: StepRef, options: { name?: string } = {}): void {
-    const node = this.editable(step, 'rename');
+    const node = this.find(step, 'rename');
     if (!node) return;
     const { name, kind } = target(to);
     const same = kind === 'function or workflow' ? node.kind === 'function' || node.kind === 'workflow' : node.kind === kind;
@@ -197,35 +198,42 @@ export class HistoryView implements History {
   }
 
   public updateArgs<R extends StepRef>(step: R | HistoryStep, update: (args: any) => StepArgs<R>): void {
-    const node = this.editable(step, 'updateArgs');
+    const node = this.find(step, 'updateArgs');
     if (!node) return;
     const args = update(clone(node.args ?? {}));
     if (args === undefined || (args as unknown) instanceof Promise) throw new Error(`updateArgs(${describe(step)}): the update must return the new args.`);
-    this.push({ op: 'rewrite', target: node.id, args: clone(args) });
+    if (!node.argsKnown || json(args) !== json(node.args)) this.push({ op: 'rewrite', target: node.id, args: clone(args) });
   }
 
   public updateResult<R extends StepRef>(step: R | HistoryStep, update: (result: any) => StepResult<R>): void {
-    const node = this.editable(step, 'updateResult');
+    const node = this.find(step, 'updateResult');
     if (!node) return;
     const current = this.toStep(node);
+    // A running step's result is still to come, from the code that runs then. At runtime, migrations see finished steps only.
+    if (current.status === 'running') return;
     if (current.error !== undefined) throw new Error(`updateResult(${describe(step)}): the step didn't succeed, so it has no result to change.`);
-    const result = update(clone(current.result));
+    const result = update(current.result);
     if (result === undefined || (result as unknown) instanceof Promise)
       throw new Error(`updateResult(${describe(step)}): the update must return the new result.`);
-    const again = this.options.strict && json(update(clone(result)));
-    if (again && again !== json(result)) {
-      throw new Error(
-        `updateResult(${describe(step)}): run again on its own output, the update changed it (${json(result)} became ${again}). ` +
-          "A step can finish on the new code, so its result may already be in the new shape: leave such a result as it is, for example r => ('size' in r ? r : { ...r, size: null }).",
-      );
-    }
-    this.push({ op: 'rewrite', target: node.id, result: clone(result) });
+    this.rerun(`updateResult(${describe(step)})`, update, result);
+    if (json(result) !== json(current.result)) this.push({ op: 'rewrite', target: node.id, result: clone(result) });
   }
 
   public updateWorkflowArgs(update: (args: any) => unknown): void {
     const args = update(this.workflowArgs);
     if (args === undefined || args instanceof Promise) throw new Error('updateWorkflowArgs: the update must return the new args.');
-    this.push({ op: 'workflowArgs', args: clone(args) });
+    this.rerun('updateWorkflowArgs', update, args);
+    if (json(args) !== json(this.args)) this.push({ op: 'workflowArgs', args: clone(args) });
+  }
+
+  /** With `strict`, throws if `update`, run again on its own `output`, changes it. */
+  private rerun(action: string, update: (value: any) => unknown, output: unknown): void {
+    const again = this.options.strict && json(update(clone(output)));
+    if (!again || again === json(output)) return;
+    throw new Error(
+      `${action}: run again on its own output, the update changed it (${json(output)} became ${again}). ` +
+        "It may be in the new shape already, as a step can finish on the new code: leave such a value as it is, for example r => ('size' in r ? r : { ...r, size: null }).",
+    );
   }
 
   /** Runs a migration's `migrate` on this view. Returns how many edits it made. */
@@ -235,14 +243,9 @@ export class HistoryView implements History {
     return this.edits - before;
   }
 
-  /** The operations to store: the overlay as loaded, minus dropped ones, plus this handler run's. */
+  /** The operations to store: the overlay as loaded, plus this handler run's, without the ones later ones superseded. */
   public overlay(): OverlayOp[] {
     return this.ops.map(clone);
-  }
-
-  /** The stored size of the overlay, in bytes. */
-  public size(): number {
-    return this.ops.reduce((bytes, op) => bytes + getConvexSize(op as Value), 0);
   }
 
   /**
@@ -293,15 +296,6 @@ export class HistoryView implements History {
     return matches[0];
   }
 
-  /** Like `find`, for edits a running step can't take: a result will still arrive into it. */
-  private editable(selector: StepSelector, action: string): Node | undefined {
-    const node = this.find(selector, action);
-    if (node?.recorded && !node.recorded.runResult) {
-      throw new Error(`${action}(${describe(selector)}): the step is still running, so it can't be removed, renamed or given other args or another result.`);
-    }
-    return node;
-  }
-
   private matches(node: Node, ref: StepRef): boolean {
     const { name, kind } = target(ref);
     if (node.name !== name) return false;
@@ -310,17 +304,19 @@ export class HistoryView implements History {
 
   /** Applies and keeps a migration's edit. */
   private push(op: OverlayOp): void {
-    if (!this.apply(op)) throw new Error(`Assertion failed: ${op.op} of a step that isn't in the history`);
+    this.apply(op);
     this.edits++;
   }
 
-  /** Applies one operation and keeps it; false, and not kept, if its step isn't in the history. */
-  private apply(op: OverlayOp): boolean {
+  /** Applies one operation and keeps it, in place of the earlier ones it supersedes. Only a stored one can name a step the history lacks. */
+  private apply(op: OverlayOp): void {
     if (op.op === 'workflowArgs') {
       this.args = op.args;
+      this.ops = this.ops.filter((kept) => kept.op !== 'workflowArgs');
     } else {
-      const index = this.nodes.findIndex((node) => node.id === (op.op === 'insert' ? op.anchor : op.target));
-      if (index < 0) return false;
+      const id = op.op === 'insert' ? op.anchor : op.target;
+      const index = this.nodes.findIndex((node) => node.id === id);
+      if (index < 0) throw new ReplayError('record', `The run's record edits journal entry ${id}, which was deleted outside the WorkflowManager.`);
       const node = this.nodes[index]!;
       if (op.op === 'insert') {
         const standIn = { id: op.id, name: op.name, kind: op.kind, args: op.args ?? {}, argsKnown: op.args !== undefined, result: { value: op.result } };
@@ -330,19 +326,23 @@ export class HistoryView implements History {
       } else {
         if (op.name !== undefined) node.name = op.name;
         if (op.args !== undefined) [node.args, node.argsKnown] = [op.args, true];
-        if ('result' in op) node.result = { value: op.result };
+        if (op.result !== undefined) node.result = { value: op.result };
+        // An earlier rewrite of the same field of the step is superseded.
+        const fields = REWRITTEN.filter((field) => op[field] !== undefined);
+        for (const kept of this.ops) if (kept.op === 'rewrite' && kept.target === op.target) for (const field of fields) delete kept[field];
+        this.ops = this.ops.filter((kept) => kept.op !== 'rewrite' || REWRITTEN.some((field) => kept[field] !== undefined));
       }
     }
     this.ops.push(op);
-    return true;
   }
 
+  /** A copy of the step, so that changing what a migration reads doesn't change the history. */
   private toStep(node: Node): HistoryStep {
-    const base = { id: node.id, name: node.name, kind: node.kind, args: node.args };
-    if (node.result) return { ...base, status: 'done', result: node.result.value };
+    const base = { id: node.id, name: node.name, kind: node.kind, args: clone(node.args) };
+    if (node.result) return { ...base, status: 'done', result: clone(node.result.value) };
     const runResult = node.recorded!.runResult;
     if (!runResult) return { ...base, status: 'running' };
-    if (runResult.kind === 'success') return { ...base, status: 'done', result: runResult.returnValue };
+    if (runResult.kind === 'success') return { ...base, status: 'done', result: clone(runResult.returnValue) };
     return { ...base, status: 'done', error: runResult.kind === 'failed' ? runResult.error : 'canceled' };
   }
 }
