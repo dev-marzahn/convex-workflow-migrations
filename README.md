@@ -51,7 +51,7 @@ Say a run started on release 0 is waiting for its download when release 3 ships.
 - **Skip releases.** Every release lists every migration, and each run records which ones it has had. A run applies the ones it's missing, in order, the next time it replays. Nothing has to be deployed first, and nothing has to drain.
 - **Same API otherwise.** `WorkflowManager` is upstream's, with `migrations` in `define()`. Your workflows, journals and events stay in upstream's component; this package adds a small one with a record per run: the migrations applied to it and their edits (the **overlay**).
 - **Pause, don't fail.** A run that can't replay on the current code, because a migration is missing or wrong, pauses and is retried, so deploying the fix resumes it ([Pausing and recovery](#pausing-and-recovery)).
-- **Tests against old histories.** `expectReplays` replays histories of older releases, with the migrations, against the current handler, without a Convex backend.
+- **Tests against old histories.** `expectReplays` replays histories of older releases, built by hand or [exported from a deployment](#exporting-histories), with the migrations, against the current handler, without a Convex backend.
 
 ## Quick start
 
@@ -214,6 +214,35 @@ test('runs from every older release replay on the current code', async () => {
 
 To run the current code from scratch with convex-test, `@dev-marzahn/convex-workflow-migrations/test` has `register(t)`, which registers both components; the helpers above come from `/replay`. It uses `import.meta.glob`, so configure Vitest as for upstream's test helpers: the `edge-runtime` environment, and `convex-test`, `@convex-dev/workflow`, `@convex-dev/workpool` and this package in `server.deps.inline`.
 
+## Exporting histories
+
+The package's CLI exports a workflow's runs from a deployment as JSON `RecordedHistory[]`, for `expectReplays`: every running run, and the newest finished ones. Run it from your app's directory. It runs your app's `convex run`, so it picks the deployment as that does (`.env.local`, `CONVEX_DEPLOY_KEY`, `CONVEX_SELF_HOSTED_*`), and passes the options after `--` to it:
+
+```sh
+npx convex-workflow-migrations histories pipeline:run --out convex/histories/pipeline.json -- --prod
+```
+
+- `--recent <n>`: the newest finished runs to export too (default 10).
+- `--max-scan <n>`: how many runs to read, newest first, finished ones included (default 10,000). Upstream has no index by status, so this is how it finds the running ones. If the workflow has more, older running runs may be missing: it says how many it read and when the oldest was created, exports nothing and exits with 1, unless you pass `--allow-partial`.
+- `--max-steps <n>`: the steps to export per run (default 1,000). A longer run is cut there and marked `truncated`.
+- `--out <file>` writes the JSON there instead of stdout. `--workflow-component` and `--migrations-component` name the components if you mounted them under other names.
+
+Each history has the run's `workflowId`, `workflow` (its function name), `args` and `steps`, read from upstream's journal; `applied` and `overlay`, if the run has a record; `outcome` (`success`, `failed` or `canceled`) once it finished; `truncated`; and `unstable` if its record changed each of the 3 times the CLI read it around the journal, so the two may not match. Without the migrations component on the deployment, every run is exported without `applied`, as a run from before adoption, and the CLI says so. It exits with 0 when it exported, 1 when `--max-scan` stopped it, and 2 on a usage or deployment error.
+
+`expectReplays` fails a `truncated` or `unstable` history, and `outcome` changes which handler failures count: after `success`, every one does; after `failed` or `canceled`, only a throw before the last recorded step, since the run ended after it. Load the file with `resolveJsonModule`, or read it:
+
+```ts
+import { expectReplays, type RecordedHistory } from '@dev-marzahn/convex-workflow-migrations/replay';
+
+import raw from './histories/pipeline.json' with { type: 'json' };
+
+const histories = raw as RecordedHistory[];
+// Or: JSON.parse(readFileSync(new URL('./histories/pipeline.json', import.meta.url), 'utf8')) as RecordedHistory[]
+await expectReplays(run, histories);
+```
+
+**The export holds production data:** every run's args, every step's args, result and error, and the overlay's values. The CLI warns about it on stderr. Check the file, and take out what shouldn't be in your repository, before you commit it.
+
 ## Limits
 
 - **Migrations are checked by tests, not by the deploy.** A release with a missing or wrong migration pauses the runs it can't replay, until a fix is deployed. `expectReplays` is what catches it before the deploy.
@@ -226,10 +255,11 @@ To run the current code from scratch with convex-test, `@dev-marzahn/convex-work
 - **Child workflows' records.** When upstream deletes a run's child workflows, in `cleanup` or `restart({ from })`, their records stay behind in the migrations component. They're only storage.
 - **The record is one document.** The overlay stores every stand-in result and every migrated result or args value, so together they must fit Convex's document size limit. A save over it fails the run in a handler run the workpool started; in a scheduled retry, the run stays paused with the error in `lastError`, and `resume` throws it. Keep them small.
 - **Matching is by position, name, kind and args**, as upstream's. Workflow function renames aren't supported.
+- **The export reads by the workflow's name.** Upstream names a child workflow after its `runWorkflow` step, so a child started with a custom `name` is listed under that name, not under its function name. The CLI runs three `convex run` commands per run it exports, so many runs take a while.
 
 ## What's next
 
-- **Exporting histories:** a CLI that exports running runs' histories from a deployment, for `expectReplays`.
+- **Scrubbing exports:** a `--redact` option for the `histories` CLI, to scrub production data before it's committed.
 - **More recovery methods:** `resumeAll` after a deploy, `restartFrom` a position of a paused run's history, `restart({ from })` on migrated histories, and cleanup of child workflows' records.
 
 ## @convex-dev/workflow versions
