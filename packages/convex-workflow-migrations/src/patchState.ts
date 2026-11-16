@@ -1,7 +1,7 @@
 import type { ComponentApi } from './component/_generated/component.js';
 import { isUnreleased } from './testing.ts';
 
-/** The installed patches component, `components.workflowPatches`. */
+/** The installed patches component, `components.workflowMigrations`. */
 export type PatchesComponent = ComponentApi;
 
 /** The patch ids each workflow declares, keyed by its function name (`dir/file:export`). See `convex/patches.ts`. */

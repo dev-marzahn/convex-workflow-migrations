@@ -1,5 +1,5 @@
 name: Feature request
-description: Something convex-workflow-patches should do that it doesn't.
+description: Something convex-workflow-migrations should do that it doesn't.
 labels: [enhancement]
 body:
   - type: textarea

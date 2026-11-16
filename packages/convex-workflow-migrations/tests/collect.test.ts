@@ -9,7 +9,7 @@ import { collect, convexDirOf, DEFAULT_COMPONENT_PATHS } from '../src/predeploy.
 
 const dirs: string[] = [];
 function project(files: Record<string, string>): string {
-  const root = mkdtempSync(join(tmpdir(), 'convex-workflow-patches-collect-'));
+  const root = mkdtempSync(join(tmpdir(), 'convex-workflow-migrations-collect-'));
   dirs.push(root);
   for (const [path, content] of Object.entries(files)) {
     mkdirSync(join(root, path, '..'), { recursive: true });

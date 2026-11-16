@@ -1,5 +1,5 @@
 {
-  "name": "@dev-marzahn/convex-workflow-patches",
+  "name": "@dev-marzahn/convex-workflow-migrations",
   "version": "100.0.0",
   "description": "Temporal-style patched() for @convex-dev/workflow: change a released workflow without failing the runs already in flight.",
   "keywords": [
@@ -19,10 +19,7 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/dev-marzahn/convex-workflow-patches.git",
-    "directory": "packages/convex-workflow-patches"
-  },
-  "bin": {
-    "convex-workflow-patches": "./dist/cli.js"
+    "directory": "packages/convex-workflow-migrations"
   },
   "files": [
     "dist"

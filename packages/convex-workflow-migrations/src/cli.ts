@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// convex-workflow-patches check: refuses a release that removes code a running
+// convex-workflow-migrations check: refuses a release that removes code a running
 // workflow still needs. Run it from the app's directory before deploying. Apps
 // deployed with convex-release don't need it: convex-release runs the same
 // check (src/predeploy.ts) on every deploy.
@@ -10,7 +10,7 @@ import { parseArgs } from 'node:util';
 
 import { blockedMessage, collect, COMPONENT_NOT_DEPLOYED, convexDirOf, describeBlocker, describeRemovals, inspect, type Query } from './predeploy.ts';
 
-const USAGE = `Usage: convex-workflow-patches check [--workflow-component <path>] [--patches-component <path>] [--page-size <n>] [-- <convex run options>]
+const USAGE = `Usage: convex-workflow-migrations check [--workflow-component <path>] [--patches-component <path>] [--page-size <n>] [-- <convex run options>]
 
 Compares the patches this checkout declares (convex/patches.ts) with the ones
 the deployed release declares, and lists the running workflows that still need
@@ -18,7 +18,7 @@ code the checkout removes. Exits 1 if there are any. Run it from your app's
 directory, against the deployment you're about to deploy to.
 
   --workflow-component  Where @convex-dev/workflow is mounted. Default: componentPaths.workflow in patches.ts, or workflow
-  --patches-component   Where this package's component is mounted. Default: componentPaths.patches in patches.ts, or workflowPatches
+  --patches-component   Where this package's component is mounted. Default: componentPaths.patches in patches.ts, or workflowMigrations
   --page-size           Workflows read per \`convex run\`. Default: 100
 
 Options after -- go to \`convex run\`, e.g. -- --prod.

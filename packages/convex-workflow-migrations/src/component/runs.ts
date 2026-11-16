@@ -81,7 +81,7 @@ export const save = mutation({
   },
 });
 
-/** The records of the given runs, for `convex-workflow-patches check`. One page of runs at a time. */
+/** The records of the given runs, for `convex-workflow-migrations check`. One page of runs at a time. */
 export const lookup = query({
   args: { workflowIds: v.array(v.string()) },
   returns: v.array(v.object({ workflowId: v.string(), run: v.union(vRun, v.null()), skips: v.array(v.string()) })),

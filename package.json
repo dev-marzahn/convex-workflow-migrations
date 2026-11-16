@@ -1,5 +1,5 @@
 {
-  "name": "convex-workflow-patches-monorepo",
+  "name": "convex-workflow-migrations-monorepo",
   "private": true,
   "license": "MPL-2.0",
   "workspaces": [

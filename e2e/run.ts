@@ -17,7 +17,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { type Backend, startBackend } from './backend.ts';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
-const PREFIX = 'convex-workflow-patches-e2e';
+const PREFIX = 'convex-workflow-migrations-e2e';
 
 function sh(cmd: string, args: string[], options: SpawnSyncOptions = {}): string {
   const result = spawnSync(cmd, args, { encoding: 'utf8', ...options });
@@ -68,8 +68,8 @@ function expectEqual(actual: unknown, expected: unknown, what: string): void {
  * non-zero exit.
  */
 function runCheck(app: string, backend: Backend): { status: number | null; output: string } {
-  const pkg = join(appDir(app), 'node_modules/@dev-marzahn/convex-workflow-patches');
-  const bin = (JSON.parse(readFileSync(join(pkg, 'package.json'), 'utf8')) as { bin: Record<string, string> }).bin['convex-workflow-patches']!;
+  const pkg = join(appDir(app), 'node_modules/@dev-marzahn/convex-workflow-migrations');
+  const bin = (JSON.parse(readFileSync(join(pkg, 'package.json'), 'utf8')) as { bin: Record<string, string> }).bin['convex-workflow-migrations']!;
   const result = spawnSync(process.execPath, [join(pkg, bin), 'check'], { cwd: appDir(app), env: backend.env, encoding: 'utf8' });
   return { status: result.status, output: `${result.stdout}\n${result.stderr}` };
 }
@@ -88,7 +88,7 @@ const expectCheck = (app: string, backend: Backend, status: number, what: string
 
 // --------------------------------------------------------- convex-release ---
 
-const PACKAGE = '@dev-marzahn/convex-workflow-patches';
+const PACKAGE = '@dev-marzahn/convex-workflow-migrations';
 const REFUSED = 'A predeploy check refused this release; nothing was pushed.';
 
 /** `convex-release deploy` from an app's checkout. Doesn't throw on a non-zero exit. */
@@ -164,7 +164,7 @@ const scenarios: Record<string, (backend: Backend) => Promise<void>> = {
   },
 
   /**
-   * `convex-workflow-patches check` before each deploy: adopting the package
+   * `convex-workflow-migrations check` before each deploy: adopting the package
    * and adding patches passes; removing a patch's old branch is refused while a
    * run from before the patch is running, and passes once it has finished.
    */
@@ -205,7 +205,7 @@ const scenarios: Record<string, (backend: Backend) => Promise<void>> = {
   async release(backend) {
     const old = await startWaitingRun(backend);
     expectRun('convex-release deploy v2, adopting the package', releaseDeploy('v2', backend), 0, {
-      lists: ['The deployment has no workflowPatches component yet'],
+      lists: ['The deployment has no workflowMigrations component yet'],
     });
     const fresh = call<Ids>('v2', backend, 'pipeline:startGrab', { title: 'started on release 2' });
     await until('v2', backend, fresh.grabId, (g) => g.log.length === 2);

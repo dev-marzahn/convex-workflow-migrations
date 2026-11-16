@@ -1,5 +1,5 @@
 /// <reference types="vite/client" />
-import patchesTest, { simulateDeploy } from '@dev-marzahn/convex-workflow-patches/test';
+import patchesTest, { simulateDeploy } from '@dev-marzahn/convex-workflow-migrations/test';
 import { convexTest } from 'convex-test';
 import { afterEach, beforeEach, expect, test, vi } from 'vite-plus/test';
 

@@ -21,7 +21,7 @@ jobs:
         with:
           node-version: 24
       - run: |
-          pinned=$(node -p "require('./packages/convex-workflow-patches/package.json').peerDependencies['@convex-dev/workflow']")
+          pinned=$(node -p "require('./packages/convex-workflow-migrations/package.json').peerDependencies['@convex-dev/workflow']")
           latest=$(npm view @convex-dev/workflow version)
           if [ "$pinned" != "$latest" ]; then
             echo "::error::@convex-dev/workflow $latest is out; this package copies $pinned. See CONTRIBUTING.md, Updating @convex-dev/workflow."

@@ -4,7 +4,7 @@
 // Kept on a global symbol rather than in module state: a test runner can load
 // two copies of this package (e.g. its build for the test helper and its
 // sources for the app), and both must see the same switch.
-const key = Symbol.for('@dev-marzahn/convex-workflow-patches/unreleased');
+const key = Symbol.for('@dev-marzahn/convex-workflow-migrations/unreleased');
 const unreleased = ((globalThis as { [key]?: Set<string> })[key] ??= new Set<string>());
 
 /**

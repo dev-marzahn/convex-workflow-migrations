@@ -1,4 +1,4 @@
-import { vWorkflowId, type WorkflowId } from '@dev-marzahn/convex-workflow-patches';
+import { vWorkflowId, type WorkflowId } from '@dev-marzahn/convex-workflow-migrations';
 import { v } from 'convex/values';
 
 import { internal } from './_generated/api';

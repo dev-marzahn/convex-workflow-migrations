@@ -21,7 +21,7 @@ export const COMPONENT_NOT_DEPLOYED = 'COMPONENT_NOT_DEPLOYED';
 /** Where the two components are mounted. */
 export type ComponentPaths = { workflow: string; patches: string };
 
-export const DEFAULT_COMPONENT_PATHS: ComponentPaths = { workflow: 'workflow', patches: 'workflowPatches' };
+export const DEFAULT_COMPONENT_PATHS: ComponentPaths = { workflow: 'workflow', patches: 'workflowMigrations' };
 
 /** What the release about to be deployed declares: read from its source by `collect`. */
 export type Facts = { declared: DeclaredPatches; componentPaths: ComponentPaths };

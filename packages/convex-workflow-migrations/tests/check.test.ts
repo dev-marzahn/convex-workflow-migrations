@@ -6,8 +6,8 @@ import { type DeclaredPatches, type PatchesComponent, type WorkflowComponent, ty
 import { check as predeployCheck, COMPONENT_NOT_DEPLOYED, DEFAULT_COMPONENT_PATHS, type Facts, inspect, type Query } from '../src/predeploy.ts';
 import patchesTest, { simulateDeploy } from '../src/test.ts';
 
-const components = componentsGeneric() as unknown as { workflow: WorkflowComponent; workflowPatches: PatchesComponent };
-const manager = new WorkflowManager(components.workflow, { patches: components.workflowPatches, declared: { 'checked:pipeline': ['notify'] } });
+const components = componentsGeneric() as unknown as { workflow: WorkflowComponent; workflowMigrations: PatchesComponent };
+const manager = new WorkflowManager(components.workflow, { migrationsComponent: components.workflowMigrations, declared: { 'checked:pipeline': ['notify'] } });
 type Ref = FunctionReference<'mutation', 'internal', { args: Record<string, never> }, WorkflowId>;
 const pipelineRef = anyApi.checked!.pipeline as Ref;
 const step = (name: string) => anyApi.checked![name]!;
@@ -58,7 +58,7 @@ async function send(t: T, workflowId: WorkflowId, name: 'first' | 'second') {
  * the CLI give it, here calling the components in convex-test.
  */
 const queryOf =
-  (t: T, deployedComponents = ['workflow', 'workflowPatches']): Query =>
+  (t: T, deployedComponents = ['workflow', 'workflowMigrations']): Query =>
   async <R>({ componentPath, path }: { componentPath?: string; path: string }, args: object = {}) => {
     if (!componentPath || !deployedComponents.includes(componentPath)) {
       throw Object.assign(new Error(`${componentPath} isn't deployed`), { code: COMPONENT_NOT_DEPLOYED });
@@ -157,5 +157,5 @@ test('passes on the release that adopts the package, before its component is dep
   const logs: string[] = [];
   const result = await predeployCheck({ facts: facts(removingNotify), query: queryOf(t, ['workflow']), log: (line) => logs.push(line) });
   expect(result).toEqual({ ok: true });
-  expect(logs).toEqual(['The deployment has no workflowPatches component yet, so no running workflow can need a removed patch.']);
+  expect(logs).toEqual(['The deployment has no workflowMigrations component yet, so no running workflow can need a removed patch.']);
 });

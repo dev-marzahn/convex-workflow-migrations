@@ -63,18 +63,21 @@ type WorkflowMutation<ArgsValidator extends PropertyValidators, ReturnsValidator
  * import declared from './patches';
  *
  * export const workflow = new WorkflowManager(components.workflow, {
- *   patches: components.workflowPatches,
+ *   migrationsComponent: components.workflowMigrations,
  *   declared,
  * });
  * ```
  */
 export class WorkflowManager extends UpstreamWorkflowManager {
-  public readonly patches: PatchesComponent;
+  public readonly migrationsComponent: PatchesComponent;
   public readonly declared: DeclaredPatches;
 
-  public constructor(component: WorkflowComponent, options: { patches: PatchesComponent; declared: DeclaredPatches; workpoolOptions?: WorkpoolOptions }) {
+  public constructor(
+    component: WorkflowComponent,
+    options: { migrationsComponent: PatchesComponent; declared: DeclaredPatches; workpoolOptions?: WorkpoolOptions },
+  ) {
     super(component, options.workpoolOptions ? { workpoolOptions: options.workpoolOptions } : undefined);
-    this.patches = options.patches;
+    this.migrationsComponent = options.migrationsComponent;
     this.declared = options.declared;
   }
 
@@ -91,7 +94,7 @@ export class WorkflowManager extends UpstreamWorkflowManager {
   public override define<ArgsValidator extends PropertyValidators, ReturnsValidator extends Validator<unknown, 'required', string> | void>(
     workflow: WorkflowDefinition<ArgsValidator, ReturnsValidator> & { handler?: WorkflowHandler<ArgsValidator, ReturnsValidator> },
   ): unknown {
-    const patches = { component: this.patches, declared: this.declared };
+    const patches = { component: this.migrationsComponent, declared: this.declared };
     const build = (handler: WorkflowHandler<ArgsValidator, ReturnsValidator>) =>
       workflowMutation(this.component, patches, { ...workflow, handler }, this.options?.workpoolOptions);
     return workflow.handler ? build(workflow.handler) : { handler: build };
@@ -100,7 +103,7 @@ export class WorkflowManager extends UpstreamWorkflowManager {
   /** Deletes a finished workflow, its journal and its patch records. */
   public override async cleanup(ctx: MutationCtx | ActionCtx, workflowId: WorkflowId): Promise<boolean> {
     const removed = await super.cleanup(ctx, workflowId);
-    if (removed) await ctx.runMutation(this.patches.runs.cleanup, { workflowId });
+    if (removed) await ctx.runMutation(this.migrationsComponent.runs.cleanup, { workflowId });
     return removed;
   }
 }

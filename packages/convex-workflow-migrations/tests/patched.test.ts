@@ -6,7 +6,7 @@ import { afterEach, beforeEach, expect, test, vi } from 'vite-plus/test';
 import { type PatchesComponent, type WorkflowComponent, type WorkflowCtx, type WorkflowId, WorkflowManager } from '../src/index.ts';
 import patchesTest, { simulateDeploy } from '../src/test.ts';
 
-const components = componentsGeneric() as unknown as { workflow: WorkflowComponent; workflowPatches: PatchesComponent };
+const components = componentsGeneric() as unknown as { workflow: WorkflowComponent; workflowMigrations: PatchesComponent };
 // Mutable, so a test can drop a patch's declaration as a release would.
 const declared: Record<string, string[]> = {};
 const DECLARED = {
@@ -19,7 +19,7 @@ const DECLARED = {
   'flows:twoWaits': ['notify'],
   'flows:typo': [],
 };
-const manager = new WorkflowManager(components.workflow, { patches: components.workflowPatches, declared });
+const manager = new WorkflowManager(components.workflow, { migrationsComponent: components.workflowMigrations, declared });
 type Ref = FunctionReference<'mutation', 'internal', { args: Record<string, never> }, WorkflowId>;
 const ref = (name: string) => anyApi.flows![name] as Ref;
 const step = (name: string) => anyApi.flows![name]!;
@@ -178,7 +178,7 @@ async function downloadDone(t: T, workflowId: WorkflowId) {
 const result = (t: T, workflowId: WorkflowId) =>
   t.run(async (ctx) => (await ctx.runQuery(components.workflow.workflow.getStatus, { workflowId })).workflow.runResult);
 const records = (t: T, workflowId: WorkflowId, workflow = 'flows:pipeline') =>
-  t.run((ctx) => ctx.runQuery(components.workflowPatches.runs.load, { workflowId, workflow }));
+  t.run((ctx) => ctx.runQuery(components.workflowMigrations.runs.load, { workflowId, workflow }));
 const markers = async (t: T, workflowId: WorkflowId, workflow?: string) => (await records(t, workflowId, workflow)).markers.map((m) => m.patchId).sort();
 const success = (returnValue: string[]) => ({ kind: 'success', returnValue });
 const failure = async (t: T, workflowId: WorkflowId) => {
