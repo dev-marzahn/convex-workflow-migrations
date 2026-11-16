@@ -5,6 +5,7 @@ import { anyApi, componentsGeneric, defineSchema, type FunctionReference, intern
 import { v } from 'convex/values';
 import { afterEach, beforeEach, expect, test, vi } from 'vite-plus/test';
 
+import { JITTER, PAGE_SIZE, UNFINISHED } from '../src/component/runs.ts';
 import { DETAIL_LIMIT } from '../src/component/schema.ts';
 import {
   type Migration,
@@ -236,11 +237,65 @@ test('a new run starts with every migration applied and never migrates', async (
     workflow: 'flows:pipeline',
     applied: ['notify-after-grab', 'import-gets-notified-at', 'prepare-becomes-transcode'],
     overlay: [],
+    live: true,
+    origin: 'start',
     format: 1,
   });
   await downloadDone(t, id);
   expect(ran).toEqual(['grab', 'notify', 'import {"notifiedAt":1234}', 'transcode', 'publish']);
-  expect((await record(t, id))?.overlay).toEqual([]);
+  expect(await record(t, id)).toMatchObject({ overlay: [], live: false });
+});
+
+test('a queued run gets its record when it starts, so a release that changes its args before its first handler run migrates it', async () => {
+  const t = setup();
+  // Through the manager, and through the workflow mutation itself, as upstream's standalone start calls it.
+  const ids = await t.run(async (ctx) => [
+    await manager.start(ctx, pipeline, {}, { startAsync: true }),
+    (await ctx.runMutation(pipeline, { args: {}, startAsync: true } as never)) as WorkflowId,
+  ]);
+  for (const id of ids) expect(await record(t, id)).toMatchObject({ applied: [], live: true, origin: 'start' });
+  expect(ran).toEqual([]);
+  // Release 4 lands before they first run: their args gain a channel through its migration.
+  deploy('channel');
+  await settle(t);
+  for (const id of ids) {
+    expect(await paused(t, id)).toBeUndefined();
+    await downloadDone(t, id);
+    expect(await status(t, id)).toEqual(completed);
+    expect(await record(t, id)).toMatchObject({ applied: ['channel-arg'], live: false });
+  }
+  expect(ran.filter((step) => step.startsWith('publish'))).toEqual(['publish {"channel":"default"}', 'publish {"channel":"default"}']);
+});
+
+test('a queued run whose args no release can fix pauses with args instead of failing', async () => {
+  const t = setup();
+  const id = await t.run((ctx) => manager.start(ctx, pipeline, {}, { startAsync: true }));
+  deploy('channelUnguarded');
+  await settle(t);
+  expect(await paused(t, id)).toMatchObject({ reason: 'args' });
+  expect(await status(t, id)).toMatchObject({ type: 'inProgress' });
+  deploy('channel');
+  expect(await t.run((ctx) => manager.resume(ctx, id))).toBe(true);
+  await downloadDone(t, id);
+  expect(await status(t, id)).toEqual(completed);
+});
+
+test('restarting a run that has no record, from before adoption, from 0 gives it one with nothing applied', async () => {
+  const t = setup();
+  const id = await start(t);
+  await downloadDone(t, id);
+  // As if it had run before the app adopted this package.
+  await t.run((ctx) => ctx.runMutation(components.workflowMigrations.runs.forget, { workflowIds: [id] }));
+  expect(await record(t, id)).toBeNull();
+  deploy('channel');
+  ran.length = 0;
+  await t.run((ctx) => manager.restart(ctx, id, { from: 0, startAsync: true }));
+  expect(await record(t, id)).toMatchObject({ applied: [], live: true, origin: 'adopted' });
+  await settle(t);
+  await downloadDone(t, id);
+  expect(await status(t, id)).toEqual(completed);
+  expect(ran).toEqual(['grab', 'import', 'prepare', 'publish {"channel":"default"}']);
+  expect(await record(t, id)).toMatchObject({ applied: ['channel-arg'], live: false });
 });
 
 test('a run whose anchor step was running across the deploy makes the inserted call for real; atEnd gives it the stand-in', async () => {
@@ -307,7 +362,7 @@ test('a replay that does not match pauses the run instead of failing it, and ale
   expect(completions).toEqual([{ workflowId: id, result: { kind: 'success', returnValue: null } }]);
 });
 
-test("changed workflow args pause a run with history; updateWorkflowArgs resumes it; a new run's bad args still fail it", async () => {
+test("changed workflow args pause a run with history; updateWorkflowArgs resumes it; a new run's bad args are refused", async () => {
   const t = setup();
   const id = await start(t);
   deploy('channelUnguarded');
@@ -326,9 +381,10 @@ test("changed workflow args pause a run with history; updateWorkflowArgs resumes
   expect((await record(t, id))?.overlay).toEqual([{ op: 'workflowArgs', args: { channel: 'default' } }]);
   expect(await t.run(async (ctx) => (await ctx.runQuery(components.workflow.workflow.getStatus, { workflowId: id })).workflow.args)).toEqual({});
 
-  // A new run without the arg is refused when it starts, as upstream's is.
+  // A new run without the arg is refused when it starts, as upstream's is, and with startAsync too.
   deploy('channelUnguarded');
   await expect(start(t)).rejects.toThrow('Missing required field `channel`');
+  await expect(t.run((ctx) => manager.start(ctx, pipeline, {}, { startAsync: true }))).rejects.toThrow('Missing required field `channel`');
 });
 
 test('a stand-in result the handler throws on pauses the run; updateResult in a later migration resumes it', async () => {
@@ -401,7 +457,7 @@ test("a pause's detail is cut, so a huge argument can't make the pause too big t
 });
 
 test('a retry left over from a paused run that was completed ends its pause', async () => {
-  // What `fail` from an action leaves behind if it dies after completing the run.
+  // A paused run that upstream's component completed, past the manager.
   const t = setup();
   const id = await start(t);
   deploy('unguarded');
@@ -450,10 +506,10 @@ test('a retry whose workflow mutation throws counts as another failed attempt', 
   expect(run!.nextAttemptAt - run!.at).toBeGreaterThan(400_000); // the next backoff step
   expect(warn.mock.calls.some(([message]) => String(message).startsWith(`Retrying paused workflow ${id} threw`))).toBe(true);
   warn.mockRestore();
-  // The same pause again: no second onPause, and no previousReason it never saw.
+  // The same pause again: no second onPause, and no previousReason it never saw. resume doesn't count an attempt.
   deploy('unguarded');
   expect(await t.run((ctx) => manager.resume(ctx, id))).toBe(false);
-  expect(await paused(t, id)).toMatchObject({ reason: 'mismatch', step: 1, attempts: 3 });
+  expect(await paused(t, id)).toMatchObject({ reason: 'mismatch', step: 1, attempts: 2, nextAttemptAt: run!.nextAttemptAt });
   expect((await paused(t, id))?.lastError).toBeUndefined();
   expect(pauses.map((p) => [p.reason, p.attempts, p.previousReason])).toEqual([['mismatch', 1, undefined]]);
   deploy('r1');
@@ -461,6 +517,37 @@ test('a retry whose workflow mutation throws counts as another failed attempt', 
   await settle(t);
   expect(await status(t, id)).toEqual(completed);
   expect(pauses).toHaveLength(1);
+});
+
+test('a retry is write-ahead: when its attempt dies, even past a catch, the next retry still arrives', async () => {
+  const t = setup();
+  const id = await start(t);
+  deploy('unguarded');
+  await downloadDone(t, id);
+  const first = await paused(t, id);
+  // The attempt's transaction dies: here its workflow mutation throws, and so does the warning it logs, so nothing of it commits.
+  functions.pipeline = internalMutationGeneric({
+    handler: async () => {
+      throw new Error('boom');
+    },
+  });
+  const warn = vi.spyOn(console, 'warn').mockImplementation((message: unknown) => {
+    if (String(message).startsWith('Retrying paused workflow')) throw new Error('the attempt ran out of time');
+  });
+  await settle(t, 73_000);
+  const died = await paused(t, id);
+  // The retry counted it and scheduled the next one before the attempt started.
+  expect(died).toMatchObject({ attempts: 2, at: first!.at, lastError: UNFINISHED });
+  expect(died!.nextAttemptAt - first!.nextAttemptAt).toBeGreaterThanOrEqual(480_000);
+  await settle(t, 721_000);
+  expect(await paused(t, id)).toMatchObject({ attempts: 3, lastError: UNFINISHED });
+  warn.mockRestore();
+  // A release with the migration: the retry after that, an hour later, resumes the run.
+  deploy('r1');
+  vi.advanceTimersByTime(3_600_000 * (1 + JITTER));
+  await settle(t);
+  expect(await paused(t, id)).toBeUndefined();
+  expect(await status(t, id)).toEqual(completed);
 });
 
 test('an onPause that throws is logged, and the run stays paused', async () => {
@@ -480,8 +567,10 @@ test('resume retries now, says whether the run got past its pause, and throws fo
   await expect(t.run((ctx) => manager.resume(ctx, id))).rejects.toThrow(`resume: workflow ${id} isn't paused.`);
   deploy('unguarded');
   await downloadDone(t, id);
+  const before = await paused(t, id);
   expect(await t.run((ctx) => manager.resume(ctx, id))).toBe(false);
-  expect(await paused(t, id)).toMatchObject({ attempts: 2 });
+  // Paused again: its attempts and its scheduled retry stay.
+  expect(await paused(t, id)).toEqual(before);
   deploy('r1');
   expect(await t.run((ctx) => manager.resume(ctx, id))).toBe(true);
   await settle(t);
@@ -515,44 +604,81 @@ test('resumeAll retries every paused run of a workflow now; paused() pages and f
   expect((await t.run((ctx) => manager.paused(ctx))).page).toEqual([]);
 });
 
-test('resumeAll retries each paused run once, spaced out, though each retry pauses it again', async () => {
+test('resumeAll retries each run paused when it was called once, a page at a time, though each retry pauses it again; new pauses do not keep it going', async () => {
   const t = setup();
-  const ids = [await start(t), await start(t), await start(t)];
+  // More than a page, all waiting for the download.
+  const ids = await t.run(async (ctx) => {
+    const started: WorkflowId[] = [];
+    for (let i = 0; i <= PAGE_SIZE; i++) started.push(await manager.start(ctx, pipeline, {}));
+    return started;
+  });
+  const late = await start(t);
   deploy('unguarded');
-  for (const workflowId of ids) await t.run((ctx) => manager.sendEvent(ctx, { workflowId, name: 'downloadDone' }));
+  await t.run(async (ctx) => {
+    for (const workflowId of ids) await manager.sendEvent(ctx, { workflowId, name: 'downloadDone' });
+  });
   await settle(t, 10_000);
-  const before = (await t.run((ctx) => manager.paused(ctx))).page;
-  expect(before.map((run) => run.attempts)).toEqual([1, 1, 1]);
+  const before = (await t.run((ctx) => manager.paused(ctx, { numItems: 200 }))).page;
+  expect(before.map((run) => run.attempts)).toEqual(ids.map(() => 1));
   // Jitter: runs that paused together don't retry together.
   expect(new Set(before.map((run) => run.nextAttemptAt - run.at)).size).toBeGreaterThan(1);
-
-  // A page of one run per transaction, still on code that doesn't match.
-  await t.run((ctx) => ctx.runMutation(components.workflowMigrations.runs.resumeAll, { numItems: 1 }));
-  await settle(t, 5_000); // well before the scheduled retries
-  const after = (await t.run((ctx) => manager.paused(ctx))).page;
-  expect(after.map((run) => run.attempts)).toEqual([2, 2, 2]);
-});
-
-test('resumeAll retries only the runs paused when it was called, so new pauses do not keep it going', async () => {
-  const t = setup();
-  const [a, b, late] = [await start(t), await start(t), await start(t)];
-  deploy('unguarded');
-  for (const workflowId of [a, b]) await t.run((ctx) => manager.sendEvent(ctx, { workflowId, name: 'downloadDone' }));
-  await settle(t, 1_000);
   const calledAt = Date.now();
   // A run that pauses after the first call: here before it, with `until` set as the first call sets it to its own time.
   vi.advanceTimersByTime(5_000);
   await t.run((ctx) => manager.sendEvent(ctx, { workflowId: late, name: 'downloadDone' }));
   await settle(t, 1_000);
-  expect(await paused(t, late)).toMatchObject({ attempts: 1 });
-  // A page of one run per transaction: the later pages must carry the first call's bound.
-  await t.run((ctx) => ctx.runMutation(components.workflowMigrations.runs.resumeAll, { numItems: 1, until: calledAt }));
-  await settle(t, 5_000); // well before the scheduled retries
-  expect((await t.run((ctx) => manager.paused(ctx))).page.map((run) => [run.workflowId, run.attempts])).toEqual([
-    [a, 2],
-    [b, 2],
-    [late, 1],
-  ]);
+  expect((await record(t, late))?.paused).toMatchObject({ attempts: 1 });
+
+  // Still on code that doesn't match. The second page must carry the first call's bound.
+  await t.run((ctx) => ctx.runMutation(components.workflowMigrations.runs.resumeAll, { until: calledAt }));
+  await settle(t, 12_000); // the retries are 100 ms apart, and well before the scheduled ones
+  const after = (await t.run((ctx) => manager.paused(ctx, { numItems: 200 }))).page;
+  expect(after.at(-1)).toMatchObject({ workflowId: late, attempts: 1 });
+  expect(
+    after
+      .slice(0, -1)
+      .map((run) => run.workflowId)
+      .sort(),
+  ).toEqual([...ids].sort());
+  expect(after.slice(0, -1).every((run) => run.attempts === 2 && run.lastError === undefined)).toBe(true);
+  // A retry starts the next backoff step: 10 minutes.
+  expect(after[0]!.nextAttemptAt - calledAt).toBeGreaterThan(400_000);
+});
+
+test("resumeAll and paused read only the runs' pauses, not their records, however big their overlays", async () => {
+  // Convex's per-transaction limits, enforced: 16 MiB read.
+  const t = convexTest({
+    schema: defineSchema({}),
+    modules: { './_generated/api.ts': async () => ({}), './flows.ts': async () => functions },
+    transactionLimits: true,
+  });
+  migrationsTest.register(t);
+  const { runs } = components.workflowMigrations;
+  const overlay = [
+    { op: 'insert' as const, id: '+1', where: 'after' as const, anchor: 'j0', name: 'flows:notify', kind: 'function' as const, result: 'x'.repeat(450_000) },
+  ];
+  const pause = {
+    workflow: 'flows:pipeline',
+    reason: 'mismatch' as const,
+    detail: 'x',
+    appliedCount: 0,
+    handle: 'function://;flows:pipeline',
+    generationNumber: 0,
+  };
+  // 40 records of 450 KiB: 18 MiB together, each written in its own transaction.
+  for (let i = 0; i < 40; i++) {
+    await t.run(async (ctx) => {
+      await ctx.runMutation(runs.save, { workflowId: `w${i}`, workflow: 'flows:pipeline', applied: [], overlay, done: false });
+      await ctx.runMutation(runs.pause, { workflowId: `w${i}`, ...pause });
+    });
+  }
+  expect((await t.run((ctx) => manager.paused(ctx))).page).toHaveLength(40);
+  await t.run((ctx) => manager.resumeAll(ctx));
+  // Each retry reads its pause, and starts the attempt, whose workflow mutation finds no such run.
+  const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  await settle(t, 6_000);
+  warn.mockRestore();
+  expect((await t.run((ctx) => manager.paused(ctx))).page.every((run) => run.attempts === 2)).toBe(true);
 });
 
 test('the record of a paused run whose workflow is gone is deleted at its next retry', async () => {
@@ -582,7 +708,7 @@ test('onPause is called again when the reason or step changes, with the attempts
   await t.run((ctx) => manager.resume(ctx, id));
   expect(pauses.map((p) => [p.reason, p.attempts, p.previousReason])).toEqual([
     ['mismatch', 1, undefined],
-    ['threw', 3, 'mismatch'],
+    ['threw', 1, 'mismatch'],
   ]);
 });
 
@@ -630,7 +756,7 @@ test('restartFrom drops the history from a step on, in one operation, and those 
   // Past the end of the history (grab, the wait): nothing to restart from.
   await expect(t.run((ctx) => manager.restartFrom(ctx, id, 2))).rejects.toThrow('restartFrom: the history has 2 steps, so step must be below 2, got 2.');
   expect(await paused(t, id)).toMatchObject({ attempts: 1 });
-  expect((await record(t, id))?.restartFrom).toBeUndefined();
+  expect((await record(t, id))?.paused?.restartFrom).toBeUndefined();
 
   await t.run((ctx) => manager.restartFrom(ctx, id, 1));
   await settle(t);
@@ -669,7 +795,7 @@ test('restartFrom refuses a position read before the history changed: a release 
   const stale = 'restartFrom: the history changed since the run paused';
   await expect(t.run((ctx) => manager.restartFrom(ctx, id, 1))).rejects.toThrow(stale);
   expect(await paused(t, id)).toMatchObject({ reason: 'mismatch', step: 1, attempts: 1 });
-  expect((await record(t, id))?.restartFrom).toBeUndefined();
+  expect((await record(t, id))?.paused?.restartFrom).toBeUndefined();
 
   // The same count of migrations, but one whose body was fixed: the wait moved from step 1 to 2.
   const t2 = setup();
@@ -723,35 +849,28 @@ test('fail completes a paused run as failed, and onComplete runs', async () => {
   expect(completions).toHaveLength(1);
 });
 
-test("fail's claim holds the run: no retry resumes it while fail completes it, and an abandoned claim runs out", async () => {
+test("fail fails the run and ends its pause in the caller's transaction, so it takes a mutation's ctx", async () => {
   const t = setup();
-  const [failed, abandoned] = [await start(t), await start(t)];
+  const id = await start(t);
   deploy('unguarded');
-  for (const workflowId of [failed, abandoned]) await t.run((ctx) => manager.sendEvent(ctx, { workflowId, name: 'downloadDone' }));
-  await settle(t, 1_000);
-  deploy('r1'); // a retry now would resume them
-  ran.length = 0;
-  // fail's first transaction, as from an action.
-  const claimed = await t.run((ctx) => ctx.runMutation(components.workflowMigrations.runs.claim, { workflowId: failed }));
-  expect(claimed).toMatchObject({ generationNumber: 0, reason: 'mismatch' });
-  await t.run((ctx) => ctx.runMutation(components.workflowMigrations.runs.claim, { workflowId: abandoned }));
-  await expect(t.run((ctx) => manager.resume(ctx, failed))).rejects.toThrow(`resume: workflow ${failed} is being failed.`);
-  await expect(t.run((ctx) => manager.restartFrom(ctx, failed, 1))).rejects.toThrow('is being failed');
-  await t.run((ctx) => manager.resumeAll(ctx));
-  await settle(t, 10_000);
-  expect(ran).toEqual([]);
-  // fail's other transactions.
-  await t.run(async (ctx) => {
-    const runResult = { kind: 'failed' as const, error: 'gave up' };
-    await ctx.runMutation(components.workflow.workflow.complete, { workflowId: failed, generationNumber: claimed.generationNumber, runResult });
-    await ctx.runMutation(components.workflowMigrations.runs.unpause, { workflowId: failed });
-  });
-  // The claim runs out a minute after it was made: the abandoned one is retried, and resumes.
-  await settle(t, 55_000);
-  expect(await status(t, failed)).toEqual({ type: 'failed', error: 'gave up' });
-  expect(await status(t, abandoned)).toEqual(completed);
-  expect(await paused(t, abandoned)).toBeUndefined();
-  expect(ran).toEqual(['import', 'prepare', 'publish']);
+  await downloadDone(t, id);
+  // Something after it in the same mutation throws: neither the failure nor the end of the pause commits.
+  await expect(
+    t.run(async (ctx) => {
+      await manager.fail(ctx, id);
+      throw new Error('later in the same mutation');
+    }),
+  ).rejects.toThrow('later in the same mutation');
+  expect(await paused(t, id)).toMatchObject({ reason: 'mismatch' });
+  expect(await status(t, id)).toMatchObject({ type: 'inProgress' });
+  // An action's ctx has no db: from there the steps would be transactions apart.
+  await expect(t.action(async (ctx) => manager.fail(ctx as never, id))).rejects.toThrow("fail takes a mutation's ctx");
+  await t.run((ctx) => manager.fail(ctx, id));
+  expect(await status(t, id)).toMatchObject({ type: 'failed' });
+  expect(await record(t, id)).toMatchObject({ live: false });
+  expect(await paused(t, id)).toBeUndefined();
+  // resume and restartFrom check and retry in one component mutation, so they stay callable from an action.
+  await expect(t.action((ctx) => manager.resume(ctx, id))).rejects.toThrow("isn't paused");
 });
 
 test('cancel ends a paused run and its pause', async () => {
@@ -762,6 +881,7 @@ test('cancel ends a paused run and its pause', async () => {
   await t.run((ctx) => manager.cancel(ctx, id));
   expect(await status(t, id)).toEqual({ type: 'canceled' });
   expect(await paused(t, id)).toBeUndefined();
+  expect(await record(t, id)).toMatchObject({ live: false });
   expect(completions.map((c) => c.result.kind)).toEqual(['canceled']);
 });
 
@@ -785,11 +905,13 @@ test('restart takes a position in the migrated history, and steps from there run
   await t.run((ctx) => manager.restart(ctx, id, { from: 1 })); // the stand-in: notify runs for real now
   await settle(t);
   expect(ran).toEqual(['notify']);
-  // The restarts hide the old steps, which stay in upstream's journal; the stand-in is removed.
-  expect((await record(t, id))?.overlay.map((op) => op.op)).toEqual(['insert', 'truncate', 'truncate', 'remove']);
+  // Upstream deleted the journal from the wait on, each time; the stand-in, which isn't in the journal, is removed.
+  expect((await record(t, id))?.overlay.map((op) => op.op)).toEqual(['insert', 'remove']);
   await downloadDone(t, id);
   expect(ran).toEqual(['notify', 'import {"notifiedAt":1234}', 'transcode', 'publish']);
   expect((await record(t, id))?.applied).toHaveLength(3);
+  const journal = ['grab', 'notify', 'downloadDone', 'importFiles', 'transcode', 'publish'];
+  expect(await steps(t, id)).toEqual(journal);
 
   ran.length = 0;
   await t.run((ctx) => manager.restart(ctx, id, { from: flows.transcode })); // its last call, by reference
@@ -800,6 +922,10 @@ test('restart takes a position in the migrated history, and steps from there run
   await settle(t);
   expect(ran).toEqual([]);
   expect((await record(t, id))?.restart).toBeUndefined();
+  await downloadDone(t, id);
+  // Repeated restarts don't grow the journal: each deletes what it runs again.
+  expect(await steps(t, id)).toEqual(journal);
+  expect((await record(t, id))?.overlay.map((op) => op.op)).toEqual(['insert', 'remove']);
 });
 
 test('restart stores the step on the record, and a pending migration that inserts before it leaves it on that step', async () => {
@@ -846,6 +972,12 @@ test('cleanup deletes the run with its record', async () => {
   expect(await record(t, id)).not.toBeNull();
   expect(await t.run((ctx) => manager.cleanup(ctx, id))).toBe(true);
   expect(await record(t, id)).toBeNull();
+});
+
+test('the manager needs onPause, or onPause: null to opt out explicitly', () => {
+  const options = { migrationsComponent: components.workflowMigrations };
+  expect(() => new WorkflowManager(components.workflow, options as never)).toThrow('pass onPause');
+  expect(() => new WorkflowManager(components.workflow, { ...options, onPause: null })).not.toThrow();
 });
 
 test('migration ids are checked when the workflow is defined', () => {

@@ -1,14 +1,16 @@
 // Child workflows, and restarting canceled runs, on convex-test. As in
 // migrations.test.ts, `deploy(name)` swaps the registered functions.
 import { convexTest } from 'convex-test';
-import { anyApi, componentsGeneric, defineSchema, type FunctionReference, internalMutationGeneric } from 'convex/server';
+import { anyApi, componentsGeneric, createFunctionHandle, defineSchema, type FunctionReference, internalMutationGeneric, queryGeneric } from 'convex/server';
+import { v } from 'convex/values';
 import { afterEach, beforeEach, expect, test, vi } from 'vite-plus/test';
 
+import { FORGET_BATCH } from '../src/component/schema.ts';
 import { migration, type MigrationsComponent, type WorkflowComponent, type WorkflowCtx, type WorkflowId, WorkflowManager } from '../src/index.ts';
 import migrationsTest from '../src/test.ts';
 
 const components = componentsGeneric() as unknown as { workflow: WorkflowComponent; workflowMigrations: MigrationsComponent };
-const manager = new WorkflowManager(components.workflow, { migrationsComponent: components.workflowMigrations });
+const manager = new WorkflowManager(components.workflow, { migrationsComponent: components.workflowMigrations, onPause: null });
 
 type Ref = FunctionReference<'mutation', 'internal', { args: Record<string, unknown> }, WorkflowId>;
 const flows = anyApi.flows!;
@@ -16,13 +18,16 @@ const flows = anyApi.flows!;
 const ran: string[] = [];
 const stepFn = (name: string) =>
   internalMutationGeneric({
-    handler: async () => {
-      ran.push(name);
+    handler: async (_ctx, args: Record<string, unknown>) => {
+      ran.push(Object.keys(args).length > 0 ? `${name} ${JSON.stringify(args)}` : name);
       return null;
     },
   });
-// Gives every run a record: a run with nothing applied has none.
+// A migration that changes nothing, so the applied ids show which list a record has.
 const marker = migration('marker', () => {});
+const channelArg = migration('channel-arg', (h) => h.updateWorkflowArgs((args) => ({ ...args, channel: 'default' })));
+/** What upstream's `journal.load` returns for runs a test makes up: entries without a kind, as older upstream versions wrote them, and child workflows. */
+const journals: Record<string, { step: { name: string; args: object; inProgress: boolean; kind?: string; workflowId?: string } }[]> = {};
 
 const releases = {
   // The parent runs a child, which runs a grandchild; each waits for an event.
@@ -80,6 +85,40 @@ const releases = {
       await step.runMutation(flows.publish, {});
     },
   }),
+  // Runs a child that publishes to a channel, from its release 4 on.
+  batch: manager.define({
+    args: {},
+    handler: async (step: WorkflowCtx): Promise<void> => {
+      await step.runWorkflow(flows.kid, {});
+    },
+  }),
+  kid: manager.define({
+    args: {},
+    handler: async (step: WorkflowCtx): Promise<void> => {
+      await step.runMutation(flows.publish, {});
+    },
+  }),
+  kidWithChannel: manager.define({
+    args: { channel: v.string() },
+    migrations: [channelArg],
+    handler: async (step: WorkflowCtx, { channel }): Promise<void> => {
+      await step.runMutation(flows.publish, { channel });
+    },
+  }),
+  kidUnguarded: manager.define({
+    args: { channel: v.string() },
+    handler: async (step: WorkflowCtx, { channel }): Promise<void> => {
+      await step.runMutation(flows.publish, { channel });
+    },
+  }),
+  // Runs many children at once, which finish at once.
+  fanOut: manager.define({
+    args: { children: v.number() },
+    handler: async (step: WorkflowCtx, { children }): Promise<void> => {
+      await Promise.all(Array.from({ length: children }, () => step.runWorkflow(flows.twig, {})));
+    },
+  }),
+  twig: manager.define({ args: {}, handler: async (): Promise<void> => {} }),
   waitsWithChild: manager.define({
     args: {},
     migrations: [migration('child-after-grab', (h) => h.insertAfter(flows.grab, { workflow: flows.child as Ref }, { result: null as never }))],
@@ -103,11 +142,25 @@ const functions: Record<string, unknown> = {
   grandchild: releases.grandchild,
   childThenWait: releases.childThenWait,
   waits: releases.waits,
+  batch: releases.batch,
+  kid: releases.kid,
+  fanOut: releases.fanOut,
+  twig: releases.twig,
+  journal: queryGeneric({
+    args: { workflowId: v.string() },
+    handler: async (_ctx, { workflowId }) => {
+      const journalEntries = journals[workflowId];
+      if (!journalEntries) throw new Error(`Workflow not found: ${workflowId}`);
+      return { journalEntries };
+    },
+  }),
 };
-const deploy = (name: 'child' | 'waits', release: keyof typeof releases) => void (functions[name] = releases[release]);
+const deploy = (name: 'child' | 'waits' | 'kid', release: keyof typeof releases) => void (functions[name] = releases[release]);
 
-function setup() {
-  const t = convexTest(defineSchema({}), { './_generated/api.ts': async () => ({}), './flows.ts': async () => functions });
+/** With `transactionLimits`, convex-test enforces Convex's per-transaction limits, with these lowered. */
+function setup(transactionLimits?: { documentsRead: number }) {
+  const modules = { './_generated/api.ts': async () => ({}), './flows.ts': async () => functions };
+  const t = convexTest({ schema: defineSchema({}), modules, ...(transactionLimits ? { transactionLimits } : {}) });
   migrationsTest.register(t);
   return t;
 }
@@ -135,7 +188,9 @@ beforeEach(() => {
   vi.useFakeTimers();
   deploy('child', 'child');
   deploy('waits', 'waits');
+  deploy('kid', 'kid');
   ran.length = 0;
+  for (const id of Object.keys(journals)) delete journals[id];
 });
 afterEach(() => vi.useRealTimers());
 
@@ -181,11 +236,116 @@ test("cleaning up a parent deletes its children's and grandchildren's records wi
   expect(await status(t, parent)).toEqual({ type: 'completed', result: null });
   const grandchild = (await childOf(t, child))!;
   for (const id of [parent, child, grandchild]) expect((await record(t, id))?.applied).toEqual(['marker']);
+  // Each child's record is linked to the run whose runWorkflow step started it.
+  expect(await record(t, child)).toMatchObject({ origin: 'child', parent });
+  expect(await record(t, grandchild)).toMatchObject({ origin: 'child', parent: child });
   expect(await t.run((ctx) => manager.cleanup(ctx, parent))).toBe(true);
-  for (const id of [parent, child, grandchild]) expect(await record(t, id)).toBeNull();
-  // Upstream deletes the children too, through its workpool.
+  expect(await record(t, parent)).toBeNull();
+  // The descendants' records go in scheduled batches; upstream deletes the children too, through its workpool.
   await settle(t);
+  for (const id of [child, grandchild]) expect(await record(t, id)).toBeNull();
   await expect(status(t, grandchild)).rejects.toThrow('Workflow not found');
+});
+
+test('a queued child gets a record linked to its parent, and its args pick its migrations at its first handler run', async () => {
+  const t = setup();
+  // Started inline: the parent's handler run creates the child, which waits in upstream's workpool.
+  const parent = await t.run((ctx) => manager.start(ctx, flows.batch as Ref, {}));
+  const child = (await childOf(t, parent))!;
+  const created = await record(t, child);
+  expect(created).toMatchObject({ workflow: 'flows:kid', origin: 'child', parent, live: true });
+  // Its parent's code doesn't know the child's migrations.
+  expect(created?.applied).toBeUndefined();
+  // The child's release 4 lands before it first runs: its args, from release 0, lack the channel.
+  deploy('kid', 'kidWithChannel');
+  await settle(t);
+  expect(await status(t, child)).toEqual({ type: 'completed', result: null });
+  expect(await status(t, parent)).toEqual({ type: 'completed', result: null });
+  expect(ran).toEqual(['publish {"channel":"default"}']);
+  expect(await record(t, child)).toMatchObject({ applied: ['channel-arg'], live: false, parent });
+});
+
+test('a queued child whose args no migration fixes pauses with args instead of failing; one whose args pass keeps them', async () => {
+  const t = setup();
+  const parent = await t.run((ctx) => manager.start(ctx, flows.batch as Ref, {}));
+  const child = (await childOf(t, parent))!;
+  deploy('kid', 'kidUnguarded');
+  await settle(t);
+  expect(await paused(t, child)).toMatchObject({ reason: 'args' });
+  expect(await status(t, parent)).toMatchObject({ type: 'inProgress' });
+  // With the migration, it resumes; a child started on this release, whose args pass, starts with every id applied.
+  deploy('kid', 'kidWithChannel');
+  expect(await t.run((ctx) => manager.resume(ctx, child))).toBe(true);
+  await settle(t);
+  expect(await status(t, parent)).toEqual({ type: 'completed', result: null });
+  const fresh = await t.run((ctx) => manager.start(ctx, flows.kid as Ref, { channel: 'main' }));
+  await settle(t);
+  expect(await record(t, fresh)).toMatchObject({ applied: ['channel-arg'], overlay: [] });
+  expect(ran).toEqual(['publish {"channel":"default"}', 'publish {"channel":"main"}']);
+});
+
+test('cleanup of a fan-out parent deletes its children’s records in batches, within the transaction limits', async () => {
+  const t = setup();
+  const parent = await t.run((ctx) => manager.start(ctx, flows.fanOut as Ref, { children: 30 }));
+  await settle(t);
+  expect(await status(t, parent)).toEqual({ type: 'completed', result: null });
+  const children = (await t.run((ctx) => manager.listSteps(ctx, parent, { paginationOpts: { numItems: 100, cursor: null } }))).page.map(
+    (step) => (step as { nestedWorkflowId: string }).nestedWorkflowId,
+  );
+  expect(children).toHaveLength(30);
+  for (const id of children) expect(await record(t, id)).toMatchObject({ parent });
+  expect(await t.run((ctx) => manager.cleanup(ctx, parent))).toBe(true);
+  await settle(t);
+  for (const id of [parent, ...children]) expect(await record(t, id)).toBeNull();
+
+  // Far more children than a transaction can read, linked as runWorkflow steps link them, with a grandchild each.
+  const limited = setup({ documentsRead: 1_000 });
+  const ids = Array.from({ length: 1_200 }, (_, i) => `c${i}`);
+  for (let i = 0; i < ids.length; i += FORGET_BATCH) {
+    const batch = ids.slice(i, i + FORGET_BATCH);
+    await limited.run(async (ctx) => {
+      await ctx.runMutation(components.workflowMigrations.runs.children, {
+        parent: 'p',
+        children: batch.map((workflowId) => ({ workflowId, workflow: 'flows:twig' })),
+      });
+      for (const id of batch)
+        await ctx.runMutation(components.workflowMigrations.runs.children, { parent: id, children: [{ workflowId: `${id}g`, workflow: 'flows:twig' }] });
+    });
+  }
+  await limited.run((ctx) => ctx.runMutation(components.workflowMigrations.runs.forget, { workflowIds: ['p'] }));
+  await settle(limited, 5_000);
+  for (const id of ['c0', 'c1199', 'c0g', 'c1199g', 'c600g']) expect(await record(limited, id)).toBeNull();
+});
+
+test('a run from before adoption has no links: its children come from its journal, read raw, entries without a kind included', async () => {
+  const t = setup();
+  // A root without a record, whose child has a record (its first handler run was after adoption), and a grandchild under that.
+  journals.root = [
+    { step: { name: 'flows:old', args: {}, inProgress: false } },
+    { step: { name: 'flows:child', args: {}, inProgress: false, kind: 'workflow', workflowId: 'c' } },
+  ];
+  journals.c = [{ step: { name: 'flows:grandchild', args: {}, inProgress: false, kind: 'workflow', workflowId: 'g' } }];
+  const pause = { workflow: 'flows:child', reason: 'mismatch' as const, detail: 'x', appliedCount: 0, handle: 'h', generationNumber: 0 };
+  await t.run(async (ctx) => {
+    await ctx.runMutation(components.workflowMigrations.runs.pause, { workflowId: 'c', ...pause });
+    await ctx.runMutation(components.workflowMigrations.runs.save, { workflowId: 'g', workflow: 'flows:grandchild', applied: [], overlay: [], done: true });
+    // A child the journal names that's gone: nothing to read.
+    journals.root!.push({ step: { name: 'flows:child', args: {}, inProgress: false, kind: 'workflow', workflowId: 'gone' } });
+  });
+  expect(await record(t, 'c')).toMatchObject({ origin: 'adopted' });
+  const journal = await t.run(() => createFunctionHandle(flows.journal));
+  await t.run((ctx) => ctx.runMutation(components.workflowMigrations.runs.forget, { workflowIds: ['root'], journal }));
+  await settle(t, 1_000);
+  for (const id of ['c', 'g']) expect(await record(t, id)).toBeNull();
+  expect(await paused(t, 'c')).toBeUndefined();
+});
+
+test('forget takes at most a batch of runs per call', async () => {
+  const t = setup();
+  const workflowIds = Array.from({ length: FORGET_BATCH + 1 }, (_, i) => `w${i}`);
+  await expect(t.run((ctx) => ctx.runMutation(components.workflowMigrations.runs.forget, { workflowIds }))).rejects.toThrow(
+    `at most ${FORGET_BATCH} runs per call`,
+  );
 });
 
 test("cleanup of a workflow that's already gone deletes its record; of an unfinished one, nothing", async () => {

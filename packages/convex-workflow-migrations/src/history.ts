@@ -23,11 +23,13 @@ export type RecordedStep = {
 };
 
 /**
- * A run's recorded history: its journal and, if the run has a record in the
- * migrations component, the migrations applied to it and their edits. The
- * CLI's `histories` command exports these as JSON, and `history([...])` in
- * `/test` builds one. Without `applied`, every migration applies: a history
- * from code before the first migration.
+ * A run's recorded history: its journal and, if the run's record in the
+ * migrations component says, the migrations applied to it and their edits.
+ * The CLI's `histories` command exports these as JSON, and `history([...])`
+ * in `/test` builds one. Without `applied`, it's treated as a run without a
+ * record is: a history with steps is from before the first migration, so
+ * every migration applies; an empty one keeps its args if they pass the
+ * `args` validator, and otherwise gets every migration.
  */
 export type RecordedHistory = {
   workflowId?: string;
@@ -44,6 +46,8 @@ export type RecordedHistory = {
   outcome?: RunResult['kind'];
   /** The export stopped at its step limit: the run has more steps than these. */
   truncated?: boolean;
+  /** The run's record changed every time the export read its journal, so the two may not match. */
+  unstable?: boolean;
 };
 
 /** A step of a history, as a migration reads it. */
@@ -97,9 +101,10 @@ export type StepArgs<R> = R extends { workflow: infer W extends WorkflowFunction
 /**
  * How to insert a finished stand-in: replay resolves the call with `result`
  * and runs nothing. `args`, if given, must match the call's. `name` matches a
- * call made with a custom `name` option. Without `atEnd`, an insert where no
- * journal entry follows does nothing, so the run makes the call for real;
- * with `atEnd: true`, the stand-in goes in there too.
+ * call made with a custom `name` option. Without `atEnd`, an insert where
+ * neither a journal entry nor another stand-in follows does nothing, so the
+ * run makes the call for real; with `atEnd: true`, the stand-in goes in there
+ * too.
  */
 export type InsertOptions<R> = { result: StepResult<R>; args?: StepArgs<R>; name?: string; atEnd?: boolean };
 
@@ -113,9 +118,9 @@ export interface History {
   has(step: StepRef): boolean;
   /** The result of the only step that is `step`, or `undefined` if there's none or it hasn't succeeded. Throws if several match. */
   result<R extends StepRef>(step: R): StepResult<R> | undefined;
-  /** Inserts `step` after `anchor`. Does nothing if `anchor` isn't in the history, or, without `atEnd`, if no journal entry follows it. */
+  /** Inserts `step` after `anchor`. Does nothing if `anchor` isn't in the history, or, without `atEnd`, if no journal entry or stand-in follows it. */
   insertAfter<R extends StepRef>(anchor: StepSelector, step: R, options: InsertOptions<R>): void;
-  /** Inserts `step` before `anchor`. Does nothing if `anchor` isn't in the history, or, without `atEnd`, if no journal entry follows the stand-in. */
+  /** Inserts `step` before `anchor`. Does nothing if `anchor` isn't in the history, or, without `atEnd`, if no journal entry or stand-in follows the stand-in. */
   insertBefore<R extends StepRef>(anchor: StepSelector, step: R, options: InsertOptions<R>): void;
   /** Drops a step the code no longer calls. */
   remove(step: StepSelector): void;
@@ -212,8 +217,8 @@ export class HistoryView implements History {
    * The journal with `overlay` applied in order, and `args`, the workflow's
    * arguments as the run recorded them, before any `workflowArgs` edit.
    * Operations whose step is gone from the journal are dropped: upstream's
-   * `restart({ from })` deletes journal entries, and this package's `restart`
-   * passes it one only for a run with a step still marked running.
+   * `restart({ from })`, which this package's `restart` calls, deletes the
+   * journal from a step on.
    */
   public constructor(
     private readonly journal: readonly RecordedStep[],
@@ -302,9 +307,11 @@ export class HistoryView implements History {
   // --------------------------------------------------- for the manager ---
 
   /**
-   * For `restartFrom` and `restart`: removes every step from `position` on.
-   * The journal entries go in one operation, which leaves entries recorded
-   * later alone; upstream's journal keeps them all.
+   * For `restartFrom`, and for `restart`'s stand-ins: removes every step from
+   * `position` on. The journal entries go in one operation, which leaves
+   * entries recorded later alone; upstream's journal keeps them all.
+   * (`restart` has upstream delete its journal entries, so only stand-ins
+   * are left for this.)
    */
   public truncate(position: number): void {
     const rest = this.nodes.slice(position);
@@ -434,9 +441,9 @@ export class HistoryView implements History {
     const name = options.name ?? refName;
     const kind = refKind === 'function or workflow' ? 'function' : refKind;
     if (!('result' in options)) throw new Error(`${action}(${describe(anchor)}, ${name}): pass { result } for the stand-in.`);
-    // Nothing recorded after it: the run hasn't got past this point, so it makes the call for real.
+    // Nothing replays after it: the run hasn't got past this point, so it makes the call for real.
     const index = this.nodes.indexOf(at);
-    if (options.atEnd !== true && !this.recordedFrom(where === 'after' ? index + 1 : index)) return;
+    if (options.atEnd !== true && !this.nodes.slice(where === 'after' ? index + 1 : index).some((node) => node.recorded || node.standIn)) return;
     const id = `+${this.nextId++}`;
     const op: InsertOp = { op: 'insert', id, where, anchor: at.id, name, kind, result: clone(options.result ?? null) };
     if (options.args !== undefined) op.args = clone(options.args);

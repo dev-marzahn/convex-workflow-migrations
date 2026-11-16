@@ -7,8 +7,10 @@ import { createFunctionHandle, type GenericDataModel, type GenericMutationCtx, m
 import type { ComponentApi } from './component/_generated/component.js';
 import { FORMAT } from './component/schema.ts';
 import { type History, HistoryView, type OverlayOp, type PauseReason, type RecordedStep, ReplayPause, sameOverlay } from './history.ts';
-import type { Replay } from './replay.ts';
+import { argsValid, type Replay } from './replay.ts';
 import type { WorkflowId } from './vendor/workflow/publicTypes.ts';
+import { safeFunctionName } from './vendor/workflow/safeFunctionName.ts';
+import type { StepRequest } from './vendor/workflow/step.ts';
 import type { JournalEntry, WorkflowComponent } from './vendor/workflow/types.ts';
 
 export type { PauseReason } from './history.ts';
@@ -61,10 +63,12 @@ export type PauseInfo = {
   previousReason?: PauseReason;
 };
 
-/** What the vendored workflow mutation gets from the manager: the migrations component, the workflow's migrations and `onPause`. */
+/** What the vendored workflow mutation gets from the manager: the migrations component, the workflow's migrations, its `args` validator and `onPause`. */
 export type WorkflowMigrations = {
   component: MigrationsComponent;
   list: readonly Migration[];
+  /** The workflow's `args` validator, for `prepareRun`. */
+  args?: unknown;
   onPause?: (ctx: GenericMutationCtx<GenericDataModel>, info: PauseInfo) => void | Promise<void>;
 };
 
@@ -184,6 +188,34 @@ export function prepareHistory(journal: readonly RecordedStep[], stored: StoredR
   return { history, applied, ran };
 }
 
+/**
+ * `prepareHistory`, for a record whose `applied` may be unknown: a run without
+ * a record, from before the app adopted this package, or a child workflow
+ * before its first handler run, whose parent's code didn't know its
+ * migrations. With journal entries, the run is from before adoption, and
+ * every migration applies. With none, its args are all its history has: if
+ * they pass the current `args` validator (`valid`), it starts with every
+ * migration applied, as a run this code started would; otherwise every
+ * migration applies to the empty history, where only `updateWorkflowArgs`
+ * does anything, and if the args still don't pass, replay pauses the run with
+ * `args`. The vendored workflow mutation and `replayHistory` in /test both
+ * call this, so the two make the same choice.
+ */
+export function prepareRun(
+  journal: readonly RecordedStep[],
+  stored: Omit<StoredRecord, 'applied'> & { applied?: readonly string[] | undefined },
+  migrations: readonly Migration[],
+  args: unknown,
+  valid: (args: unknown) => boolean,
+): Prepared {
+  const { applied, ...rest } = stored;
+  if (applied !== undefined) return prepareHistory(journal, { ...rest, applied }, migrations, args);
+  if (journal.length > 0) return prepareHistory(journal, { ...rest, applied: [] }, migrations, args);
+  const current = prepareHistory(journal, { ...rest, applied: migrations.map((m) => m.id) }, migrations, args);
+  if (current.blocked || valid(current.history.workflowArgs)) return current;
+  return prepareHistory(journal, { ...rest, applied: [] }, migrations, args);
+}
+
 /** The migrations that edited the history in this handler run. */
 export function editedNow(prepared: Prepared): string[] {
   return prepared.ran.filter((m) => m.edits > 0).map((m) => m.id);
@@ -215,10 +247,8 @@ export class RunRecord implements Replay {
     private readonly migrations: WorkflowMigrations,
     private readonly workflowId: WorkflowId,
     private readonly workflow: string,
-    private readonly stored: { applied: readonly string[]; overlay: readonly OverlayOp[]; dirty: boolean; exists: boolean },
+    private readonly stored: { applied?: readonly string[]; overlay: readonly OverlayOp[]; dirty: boolean; live: boolean },
     private readonly prepared: Prepared,
-    /** Whether the run has journal entries: it isn't new. */
-    public readonly hasHistory: boolean,
   ) {}
 
   /** Loads the run's record and applies pending migrations. Call once per handler run, before replay. */
@@ -229,25 +259,29 @@ export class RunRecord implements Replay {
     journal: readonly JournalEntry[],
   ): Promise<RunRecord> {
     const workflowId = run._id as WorkflowId;
-    const args = run.args;
     const workflow = (await ctx.meta.getFunctionMetadata()).name;
     const row = await ctx.runQuery(migrations.component.runs.load, { workflowId });
-    // A run without a record is new, or from before the app adopted this
-    // package. A new run's history is empty and in the current shape, so it
-    // starts with every migration applied.
-    const applied = row ? row.applied : journal.length === 0 ? migrations.list.map((m) => m.id) : [];
     const overlay = row?.overlay ?? [];
-    const stored: StoredRecord = { applied, overlay };
+    const stored: Parameters<typeof prepareRun>[1] = { applied: row?.applied, overlay };
     if (row) {
       stored.format = row.format;
       if (row.restart !== undefined) stored.restart = row.restart;
-      if (row.restartFrom !== undefined) stored.restartFrom = row.restartFrom;
-      if (row.paused) stored.pause = row.paused;
+      if (row.paused) {
+        stored.pause = row.paused;
+        if (row.paused.restartFrom !== undefined) stored.restartFrom = row.paused.restartFrom;
+      }
     }
-    const prepared = prepareHistory(journal.map(recordedStep), stored, migrations.list, args);
+    const definition = { args: migrations.args };
+    const prepared = prepareRun(journal.map(recordedStep), stored, migrations.list, run.args, (args) => argsValid(definition, args, ctx.db));
     const dirty =
-      !row || row.workflow !== workflow || row.paused !== undefined || row.restart !== undefined || row.restartFrom !== undefined || row.format !== FORMAT;
-    return new RunRecord(migrations, workflowId, workflow, { applied, overlay, dirty, exists: row !== null }, prepared, journal.length > 0);
+      !row || row.applied === undefined || row.workflow !== workflow || row.paused !== undefined || row.restart !== undefined || row.format !== FORMAT;
+    return new RunRecord(
+      migrations,
+      workflowId,
+      workflow,
+      { ...(row?.applied ? { applied: row.applied } : {}), overlay, dirty, live: row?.live ?? false },
+      prepared,
+    );
   }
 
   /** The history to replay against. */
@@ -270,15 +304,33 @@ export class RunRecord implements Replay {
     return editedNow(this.prepared);
   }
 
-  /** After a replay that matched: saves the applied ids and overlay, and ends a pause. Writes nothing if nothing changed. */
-  public async save(ctx: MutationCtx): Promise<void> {
+  /**
+   * After a replay that matched: saves the applied ids and overlay, whether
+   * this handler run completed the run (`done`), and ends a pause. Writes
+   * nothing if nothing changed.
+   */
+  public async save(ctx: MutationCtx, done: boolean): Promise<void> {
     const { applied, history } = this.prepared;
     const overlay = history.overlay();
-    const same = this.stored.applied.length === applied.length && this.stored.applied.every((id, i) => applied[i] === id);
-    if (!this.stored.dirty && same && sameOverlay(this.stored.overlay, overlay)) return;
-    // A missing record already means nothing applied and no overlay.
-    if (!this.stored.exists && applied.length === 0 && overlay.length === 0) return;
-    await ctx.runMutation(this.migrations.component.runs.save, { workflowId: this.workflowId, workflow: this.workflow, applied, overlay });
+    const stored = this.stored.applied;
+    const same = stored !== undefined && stored.length === applied.length && stored.every((id, i) => applied[i] === id);
+    if (!this.stored.dirty && same && sameOverlay(this.stored.overlay, overlay) && this.stored.live !== done) return;
+    await ctx.runMutation(this.migrations.component.runs.save, { workflowId: this.workflowId, workflow: this.workflow, applied, overlay, done });
+  }
+
+  /**
+   * Gives the child workflows that steps this handler run started records,
+   * linked to this run, in its transaction. The vendored executor calls it
+   * with the steps it just started.
+   */
+  public async recordChildren(ctx: MutationCtx, messages: readonly StepRequest[], entries: readonly JournalEntry[]): Promise<void> {
+    const children = entries.flatMap(({ step }, i) => {
+      const target = messages[i]?.target;
+      return step.kind === 'workflow' && step.workflowId && target?.kind === 'workflow'
+        ? [{ workflowId: step.workflowId, workflow: safeFunctionName(target.function) }]
+        : [];
+    });
+    if (children.length > 0) await ctx.runMutation(this.migrations.component.runs.children, { parent: this.workflowId, children });
   }
 
   /**
@@ -313,11 +365,20 @@ export class RunRecord implements Replay {
 }
 
 /**
+ * For the vendored workflow mutation, in the transaction that creates a run:
+ * the run's record, with every migration the workflow lists applied, since
+ * its history starts in the current shape.
+ */
+export async function recordStart(ctx: MutationCtx, migrations: WorkflowMigrations, workflowId: WorkflowId, workflow: string): Promise<void> {
+  await ctx.runMutation(migrations.component.runs.start, { workflowId, workflow, applied: migrations.list.map((m) => m.id) });
+}
+
+/**
  * Upstream's `journal.load`, for the vendored workflow mutation. If the
- * workflow is gone and the run has a record, for example a paused child
- * workflow its parent's cleanup deleted, deletes the record and returns
- * undefined: its retries would otherwise fail forever. Throws upstream's
- * error for a workflow without a record.
+ * workflow is gone and the run has a record or a pause, for example a paused
+ * child workflow its parent's cleanup deleted, deletes them, and its
+ * children's records, and returns undefined: its retries would otherwise fail
+ * forever. Throws upstream's error for a workflow this package never saw.
  */
 export async function loadJournal(ctx: MutationCtx, component: WorkflowComponent, migrations: WorkflowMigrations, workflowId: WorkflowId) {
   try {

@@ -4,12 +4,25 @@ import { anyApi, componentsGeneric } from 'convex/server';
 import { v } from 'convex/values';
 import { expect, test } from 'vite-plus/test';
 
-import { migration, type MigrationsComponent, type Redactable, type WorkflowComponent, type WorkflowCtx, WorkflowManager } from '../src/index.ts';
+import {
+  migration,
+  type MigrationsComponent,
+  type PauseInfo,
+  type Redactable,
+  type WorkflowComponent,
+  type WorkflowCtx,
+  WorkflowManager,
+} from '../src/index.ts';
 import { redactHistory } from '../src/redact.ts';
 import { expectEdits, expectReplays, history, migrate } from '../src/test.ts';
 
 const components = componentsGeneric() as unknown as { workflow: WorkflowComponent; workflowMigrations: MigrationsComponent };
-const manager = new WorkflowManager(components.workflow, { migrationsComponent: components.workflowMigrations });
+// The helpers replay without Convex, so nothing here pauses for real.
+const pauses: PauseInfo[] = [];
+const manager = new WorkflowManager(components.workflow, {
+  migrationsComponent: components.workflowMigrations,
+  onPause: (_ctx, info) => void pauses.push(info),
+});
 const flows = anyApi.flows!;
 
 const notifyAfterGrab = migration('notify-after-grab', (h) => h.insertAfter(flows.grab, flows.notify, { result: { at: null } }));
@@ -206,6 +219,24 @@ test('expectReplays checks the workflow args as the migrations leave them', asyn
   ]);
   const message = await failure(expectReplays(workflows.withArgUnguarded, [release0Waiting]));
   expect(message).toContain("(args): The workflow's args don't match its args validator");
+});
+
+test('an empty history without applied ids replays as a run without a record does: its args pick the migrations', async () => {
+  // A child workflow its parent started before the release that added quality, queued across it: the args lack it, so every migration applies.
+  await expectReplays(workflows.withArg, [history([], { args: {} })]);
+  expect((await migrate(workflows.withArg, history([], { args: {} }))).workflowArgs).toEqual({ quality: 'hd' });
+  // Args that pass mean the code that started it is the current one's: updateWorkflowArgs doesn't run.
+  expect((await migrate(workflows.withArg, history([], { args: { quality: 'sd' } }))).workflowArgs).toEqual({ quality: 'sd' });
+  // A queued run's export has the applied ids its record got when it started: the pending ones apply.
+  expect((await migrate(workflows.withArg, history([], { args: { quality: 'sd' }, applied: [] }))).workflowArgs).toEqual({ quality: 'hd' });
+  // Without the migration, the args pause it, as the runtime's do.
+  const message = await failure(expectReplays(workflows.withArgUnguarded, [history([], { args: {} })]));
+  expect(message).toContain("(args): The workflow's args don't match its args validator");
+});
+
+test('expectReplays fails an unstable export: the record changed while it was read', async () => {
+  const message = await failure(expectReplays(workflows.current, [{ ...release0Done, unstable: true }]));
+  expect(message).toContain('(unstable): The history is unstable');
 });
 
 test('expectReplays reports code that returns before the end of the history', async () => {

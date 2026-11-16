@@ -9,7 +9,7 @@ import { dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 
-import { collectRuns, type Query, runHistory } from './histories.ts';
+import { collectRuns, type Components, type Query, type ReadRun, runHistory } from './histories.ts';
 import type { RecordedHistory } from './history.ts';
 import { type Redact, redactHistory } from './redact.ts';
 
@@ -25,12 +25,19 @@ result and error, and each record's overlay (stand-ins' args and results,
 rewritten args and results, migrated workflow args). Check it, or scrub it
 with --redact, before you commit it.
 
-  --recent <n>                     Finished runs to export too, newest first. Default: 10
-  --max-runs <n>                   Runs to look through, newest first, at least 1.
-                                   If there are more, it exports nothing and
-                                   exits with 1. Default: 1000
-  --allow-partial                  Export anyway when there are more runs than
-                                   --max-runs: older running runs are missing.
+It lists the running runs from this package's component, which has a record
+of every run started since the app adopted the package. Runs from before
+then may have none, so it also looks through those, oldest first.
+
+  --recent <n>                     Finished runs to export too, the newest among
+                                   the newest 1000 runs. Default: 10
+  --max-runs <n>                   Runs from before the app adopted the package
+                                   to look through, oldest first, at least 1. If
+                                   there are more, it exports nothing and exits
+                                   with 1. Default: 1000
+  --allow-partial                  Export anyway when there are more of those
+                                   than --max-runs: newer running ones of them
+                                   are missing.
   --max-steps <n>                  Steps to export per run, at least 1. A longer
                                    run is exported up to there, with
                                    "truncated": true. Default: 1000
@@ -46,7 +53,7 @@ with --redact, before you commit it.
   --migrations-component <name>    Where this package's component is mounted. Default: workflowMigrations
 
 Options after -- go to every \`convex\` command it runs, e.g. -- --prod. It
-runs two \`convex run\` commands per exported run, so it's slow for many runs.
+runs three \`convex run\` commands per exported run, so it's slow for many runs.
 A record that a newer version of this package wrote stops the export.
 Exit codes: 0 exported, 1 more runs than --max-runs, 2 usage or deployment
 error, or a record from a newer version.`;
@@ -137,14 +144,17 @@ async function histories(argv: string[]): Promise<number> {
   const workflowComponent = values['workflow-component'];
   const migrationsComponent = values['migrations-component'];
 
-  const { runs, scanned, more, oldest } = collectRuns(query, workflowComponent, name, { maxRuns, recent });
+  const components: Components = {
+    workflow: workflowComponent,
+    ...(isDeployed(migrationsComponent, convexArgs) ? { migrations: migrationsComponent } : {}),
+  };
+  const { running, finished, scanned, more, last } = collectRuns(query, components, name, { maxRuns, recent });
   if (more) {
-    // The runs it didn't look at are the oldest: running ones there are on the oldest shapes.
     const created =
-      oldest && query<{ workflow: { _creationTime: number } }>(workflowComponent, 'workflow:getStatus', { workflowId: oldest }).workflow._creationTime;
-    const since = created ? `, back to one created ${new Date(created).toISOString()}` : '';
+      last && query<{ workflow: { _creationTime: number } }>(workflowComponent, 'workflow:getStatus', { workflowId: last }).workflow._creationTime;
+    const until = created ? `, up to one created ${new Date(created).toISOString()}` : '';
     console.error(
-      `${name} has more runs than --max-runs ${maxRuns}. The export looked at the newest ${scanned}${since}, so running runs older than that may be missing.`,
+      `${name} has more runs from before the app adopted this package than --max-runs ${maxRuns}. The export looked at the oldest ${scanned}${until}, so newer running runs from before then may be missing.`,
     );
     if (!values['allow-partial']) {
       console.error('Nothing was exported. Raise --max-runs, or pass --allow-partial to export these anyway.');
@@ -152,13 +162,16 @@ async function histories(argv: string[]): Promise<number> {
     }
   }
 
-  const components = { workflow: workflowComponent, ...(isDeployed(migrationsComponent, convexArgs) ? { migrations: migrationsComponent } : {}) };
-  const exported: RecordedHistory[] = [];
-  for (const run of runs) {
-    // Two `convex run`s per run: its steps, and its record.
-    const history = runHistory(query, components, name, run, maxSteps);
-    exported.push(redact ? await redactHistory(history, redact) : history);
+  const read: ReadRun[] = [];
+  const recentIds = new Set(finished);
+  for (const workflowId of new Set([...running, ...finished])) {
+    // Three `convex run`s per run: its record, its journal, and its record again.
+    const run = runHistory(query, components, name, workflowId, maxSteps);
+    // Gone, or listed as running but finished since and not among the recent ones.
+    if (run && (!run.finished || recentIds.has(workflowId))) read.push(run);
   }
+  const exported: RecordedHistory[] = [];
+  for (const { history } of read.sort((a, b) => b.createdAt - a.createdAt)) exported.push(redact ? await redactHistory(history, redact) : history);
   const json = `${JSON.stringify(exported, null, 2)}\n`;
   if (values.out) {
     writeFileSync(values.out, json);

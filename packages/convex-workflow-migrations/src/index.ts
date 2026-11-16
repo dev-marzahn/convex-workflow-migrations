@@ -1,9 +1,25 @@
-import { WorkflowManager as UpstreamWorkflowManager, type WorkflowComponent, type WorkflowDefinition, type WorkflowId } from '@convex-dev/workflow';
+import {
+  type CallbackOptions,
+  start as startWorkflow,
+  WorkflowManager as UpstreamWorkflowManager,
+  type WorkflowComponent,
+  type WorkflowDefinition,
+  type WorkflowId,
+} from '@convex-dev/workflow';
 import type { WorkpoolOptions } from '@convex-dev/workpool';
-import type { GenericActionCtx, GenericDataModel, GenericMutationCtx, GenericQueryCtx, RegisteredMutation } from 'convex/server';
+import {
+  createFunctionHandle,
+  type FunctionArgs,
+  type FunctionReference,
+  type GenericActionCtx,
+  type GenericDataModel,
+  type GenericMutationCtx,
+  type GenericQueryCtx,
+  type RegisteredMutation,
+} from 'convex/server';
 import type { Infer, PropertyValidators, Validator } from 'convex/values';
 
-import { FORMAT, type vPausedPage, type vPausedRun } from './component/schema.ts';
+import { FORGET_BATCH, FORMAT, type vPausedPage, type vPausedRun } from './component/schema.ts';
 import { HistoryView, type OverlayOp, type StepRef } from './history.ts';
 import { checkMigrations, type Migration, type MigrationsComponent, type PauseInfo, recordedStep, type WorkflowMigrations } from './migrations.ts';
 import { REPLAY, type ReplayTarget } from './replay.ts';
@@ -53,6 +69,8 @@ export type { WorkflowArgs } from './vendor/workflow/workflowMutation.ts';
 type QueryCtx = Pick<GenericQueryCtx<GenericDataModel>, 'runQuery'>;
 type MutationCtx = Pick<GenericMutationCtx<GenericDataModel>, 'runQuery' | 'runMutation'>;
 type ActionCtx = Pick<GenericActionCtx<GenericDataModel>, 'runQuery' | 'runMutation' | 'runAction'>;
+/** A mutation's ctx, and not an action's: `db` tells them apart. */
+type MutationOnlyCtx = Pick<GenericMutationCtx<GenericDataModel>, 'runQuery' | 'runMutation' | 'db'>;
 
 type WorkflowMutation<ArgsValidator extends PropertyValidators, ReturnsValidator extends Validator<unknown, 'required', string> | void> = RegisteredMutation<
   'internal',
@@ -72,10 +90,11 @@ type Definition<ArgsValidator extends PropertyValidators, ReturnsValidator exten
  * A paused run, as `WorkflowManager.paused` lists it: its workflow's function
  * name; why it paused (`detail` is always set, and for a mismatch has the
  * position, the call the code made and the step the history has there);
- * `step`, for a mismatch or a throw, the position in the history (from 0) for
- * `restartFrom`; when it first paused, how many attempts have paused it
- * since, and when the next one is; and `lastError`, why the last attempt's
- * workflow mutation threw, if it did.
+ * `step`, for a mismatch and the throw rules 2 and 3, the position in the
+ * history (from 0) for `restartFrom`; when it first paused, how many attempts
+ * it has had, and when the next retry is; and `lastError`, why the last
+ * attempt didn't complete, if it didn't: its workflow mutation threw, or never
+ * finished.
  */
 export type PausedRun = Omit<Infer<typeof vPausedRun>, 'workflowId'> & { workflowId: WorkflowId };
 
@@ -90,9 +109,10 @@ export type WorkflowManagerOptions = {
    * when a retry pauses it for another reason or at another step. `ctx` is
    * the workflow mutation's: cast it to your app's `MutationCtx` to use your
    * tables. An error it throws is logged, and what it wrote before is kept;
-   * the run stays paused.
+   * the run stays paused. Required: a paused run isn't failed, so nothing
+   * else reports it. Pass `null` to opt out.
    */
-  onPause?(ctx: GenericMutationCtx<GenericDataModel>, info: PauseInfo): void | Promise<void>;
+  onPause: ((ctx: GenericMutationCtx<GenericDataModel>, info: PauseInfo) => void | Promise<void>) | null;
   workpoolOptions?: WorkpoolOptions;
 };
 
@@ -104,6 +124,7 @@ export type WorkflowManagerOptions = {
  * ```ts
  * export const workflow = new WorkflowManager(components.workflow, {
  *   migrationsComponent: components.workflowMigrations,
+ *   onPause: async (ctx, info) => console.error(`Workflow ${info.workflowId} paused (${info.reason}): ${info.detail}`),
  * });
  * ```
  */
@@ -113,8 +134,11 @@ export class WorkflowManager extends UpstreamWorkflowManager {
 
   public constructor(component: WorkflowComponent, options: WorkflowManagerOptions) {
     super(component, options.workpoolOptions ? { workpoolOptions: options.workpoolOptions } : undefined);
+    if (options.onPause === undefined) {
+      throw new Error('new WorkflowManager: pass onPause, which is told when a run pauses instead of failing, or onPause: null to opt out.');
+    }
     this.migrationsComponent = options.migrationsComponent;
-    this.onPause = options.onPause?.bind(options);
+    this.onPause = options.onPause ? options.onPause.bind(options) : undefined;
   }
 
   /**
@@ -134,7 +158,12 @@ export class WorkflowManager extends UpstreamWorkflowManager {
     workflow: Definition<ArgsValidator, ReturnsValidator> & { handler?: WorkflowHandler<ArgsValidator, ReturnsValidator> },
   ): unknown {
     const { migrations, handler, ...definition } = workflow;
-    const setup: WorkflowMigrations = { component: this.migrationsComponent, list: checkMigrations(migrations), onPause: this.onPause };
+    const setup: WorkflowMigrations = {
+      component: this.migrationsComponent,
+      list: checkMigrations(migrations),
+      args: definition.args,
+      ...(this.onPause ? { onPause: this.onPause } : {}),
+    };
     const build = (fn: WorkflowHandler<ArgsValidator, ReturnsValidator>) => {
       const registered = { ...definition, handler: fn };
       const mutation = workflowMutation(this.component, setup, registered, this.options?.workpoolOptions);
@@ -151,9 +180,25 @@ export class WorkflowManager extends UpstreamWorkflowManager {
   }
 
   /**
+   * Upstream's `start`, always through the workflow mutation, with or without
+   * `startAsync`: it writes the run's record, with the migrations this code
+   * lists, in the transaction that creates the run, so a run that first runs
+   * on a later release migrates from them. The workflow mutation checks the
+   * args against its validator, with `startAsync` too.
+   */
+  public override async start<Context = unknown, F extends FunctionReference<'mutation', 'internal'> = FunctionReference<'mutation', 'internal'>>(
+    ctx: MutationCtx | ActionCtx,
+    workflow: F,
+    args: FunctionArgs<F>['args'],
+    options?: CallbackOptions<Context> & { startAsync?: boolean },
+  ): Promise<WorkflowId> {
+    return await startWorkflow(ctx, workflow, args, options);
+  }
+
+  /**
    * A page of paused runs (of one workflow, by its function name, like
    * `pipeline:run`), the one that paused first first. `numItems` defaults
-   * to 100.
+   * to 100. It reads only the runs' pauses, not their records.
    */
   public async paused(ctx: QueryCtx, opts?: { workflow?: string; cursor?: string | null; numItems?: number }): Promise<PausedPage> {
     const paginationOpts = { numItems: opts?.numItems ?? 100, cursor: opts?.cursor ?? null };
@@ -168,19 +213,21 @@ export class WorkflowManager extends UpstreamWorkflowManager {
   /**
    * Retries a paused run now, for example after deploying a fix. Returns
    * whether it got past its pause; if not, it stays paused with the new
-   * reason. Throws if the run isn't paused, or `fail` is failing it, and an
-   * error from the workflow mutation is thrown too. One transaction.
+   * reason, and its attempts and next retry stay as they were. Throws if the
+   * run isn't paused, and an error from the workflow mutation is thrown too.
+   * One transaction, from an action too.
    */
   public async resume(ctx: MutationCtx | ActionCtx, workflowId: WorkflowId): Promise<boolean> {
     return !(await ctx.runMutation(this.migrationsComponent.runs.retry, { workflowId, now: true }));
   }
 
   /**
-   * Schedules one retry of every paused run, or of one workflow's (by its
-   * function name), starting now, 100 ms apart. Each retry is its own
-   * transaction, and a retry that throws counts as another failed attempt,
-   * as a scheduled one does. Call it after deploying a fix, for example from
-   * an internal mutation run after the deploy.
+   * Schedules one retry of every run paused now, or of one workflow's (by
+   * its function name), 100 ms apart. Runs that pause after the call aren't
+   * included. Each retry is a scheduled retry that's due now: it counts as an
+   * attempt, and an attempt whose workflow mutation throws or never finishes
+   * records that as `lastError`. Call it after deploying a fix, for example
+   * from an internal mutation run after the deploy.
    */
   public async resumeAll(ctx: MutationCtx | ActionCtx, opts?: { workflow?: string }): Promise<void> {
     await ctx.runMutation(this.migrationsComponent.runs.resumeAll, opts?.workflow === undefined ? {} : { workflow: opts.workflow });
@@ -189,10 +236,11 @@ export class WorkflowManager extends UpstreamWorkflowManager {
   /**
    * Removes every step of a paused run's history from position `step` on
    * (the `step` that `paused` reports), and retries: those steps run again.
-   * Throws, changing nothing, if the run isn't paused, `fail` is failing it,
-   * `step` is past the end of the history, the history changed since the
-   * pause (a release added migrations, or the paused step moved: `resume`,
-   * then read `paused` again), or the run would still pause. One transaction.
+   * Throws, changing nothing, if the run isn't paused, `step` is past the end
+   * of the history, the history changed since the pause (a release added
+   * migrations, or the step at the paused position changed: `resume`, then
+   * read `paused` again), or the run would still pause. One transaction, from
+   * an action too.
    */
   public async restartFrom(ctx: MutationCtx | ActionCtx, workflowId: WorkflowId, step: number): Promise<void> {
     if (!Number.isInteger(step) || step < 0) throw new Error(`restartFrom: step must be a position in the history, got ${step}.`);
@@ -200,30 +248,29 @@ export class WorkflowManager extends UpstreamWorkflowManager {
   }
 
   /**
-   * Completes a paused run as failed, with why it paused as the error, then
-   * ends the pause. `onComplete` runs. Throws if the run isn't paused. It
-   * first claims the run, so no retry resumes it meanwhile. From an action,
-   * those are three transactions; if the last ones don't happen, the claim
-   * runs out after a minute, and the retry then ends the pause if the run
-   * was completed, or retries it as usual if it wasn't.
+   * Completes a paused run as failed, with why it paused as the error, and
+   * ends the pause, in the caller's transaction: so it takes a mutation's
+   * ctx, not an action's. `onComplete` runs. Throws, changing nothing, if
+   * the run isn't paused.
    */
-  public async fail(ctx: MutationCtx | ActionCtx, workflowId: WorkflowId): Promise<void> {
-    const { generationNumber, reason, detail } = await ctx.runMutation(this.migrationsComponent.runs.claim, { workflowId });
+  public async fail(ctx: MutationOnlyCtx, workflowId: WorkflowId): Promise<void> {
+    if (!('db' in ctx)) throw new Error("fail takes a mutation's ctx: it fails the run and ends its pause in one transaction.");
+    const ended = await ctx.runMutation(this.migrationsComponent.runs.end, { workflowId, paused: true });
+    const { generationNumber, reason, detail } = ended!;
     await ctx.runMutation(this.component.workflow.complete, {
       workflowId,
       generationNumber,
       runResult: { kind: 'failed', error: `Paused (${reason}): ${detail}` },
     });
-    await ctx.runMutation(this.migrationsComponent.runs.unpause, { workflowId });
   }
 
   /**
-   * Upstream's `cancel`. A paused run's pause ends too. From an action,
-   * those are two transactions.
+   * Upstream's `cancel`. A paused run's pause ends too, and its record says
+   * it finished. From an action, those are two transactions.
    */
   public override async cancel(ctx: MutationCtx | ActionCtx, workflowId: WorkflowId): Promise<void> {
     await super.cancel(ctx, workflowId);
-    await ctx.runMutation(this.migrationsComponent.runs.unpause, { workflowId });
+    await ctx.runMutation(this.migrationsComponent.runs.end, { workflowId });
   }
 
   /**
@@ -231,17 +278,13 @@ export class WorkflowManager extends UpstreamWorkflowManager {
    * as its last handler run left it, without migrations a newer release
    * added: a position (from 0), a step name or a step reference, which means
    * its last occurrence, as upstream's does. Steps from there on run again,
-   * including steps migrations inserted, and the steps before it replay as
-   * they did. Like `restartFrom`, it stores the step on the run's record,
-   * and the restarted run's first handler run applies any pending
-   * migrations, then removes the history from that step on. Upstream's
-   * journal keeps every entry, except for a run with an entry still marked
-   * running, as a canceled run's wait is: upstream's restart deletes the
-   * entries from that step on, or from the running one if it comes first,
-   * since the run would wait on it forever otherwise. Throws if the run is
-   * still running (for a paused one, use `restartFrom`), or if `from` is past
-   * the end of the history. From an action, the record is updated in a
-   * transaction before the restart.
+   * including stand-ins migrations inserted, and the steps before it replay
+   * as they did. See the README's "How it works". Throws if the run is still
+   * running (for a paused one, use `restartFrom`), if `from` is past the end
+   * of the history or names no step, if the journal is too big to load
+   * whole, or if a newer version of this package wrote the run's record.
+   * From an action, the records are updated in transactions before the
+   * restart.
    */
   public override async restart(
     ctx: MutationCtx | ActionCtx,
@@ -258,31 +301,27 @@ export class WorkflowManager extends UpstreamWorkflowManager {
     const running = entries.some((entry) => entry.step.inProgress);
     const point = options?.from === undefined && !running ? {} : this.restartPoint(workflowId, options?.from, { entries, ok, args: workflow.args }, record);
     if (point.deleteFrom !== undefined) {
-      // Upstream deletes the child workflows of the entries it deletes, and theirs.
+      // Upstream deletes the child workflows of the entries it deletes, and theirs: their records go too.
       const children = entries.flatMap((entry) =>
         entry.stepNumber >= point.deleteFrom! && entry.step.kind === 'workflow' && entry.step.workflowId ? [entry.step.workflowId] : [],
       );
-      if (children.length > 0) {
-        await ctx.runMutation(this.migrationsComponent.runs.cleanupMany, { workflowIds: [...children, ...(await this.descendants(ctx, children))] });
-      }
+      await this.forget(ctx, children);
     }
     // Without a step, this clears a step a restart from an action stored but didn't get to.
-    if (record || point.id !== undefined) {
-      await ctx.runMutation(this.migrationsComponent.runs.restart, {
-        workflowId,
-        workflow: record?.workflow ?? workflow.name ?? '',
-        ...(point.id === undefined ? {} : { from: point.id }),
-      });
-    }
+    await ctx.runMutation(this.migrationsComponent.runs.restart, {
+      workflowId,
+      workflow: record?.workflow ?? workflow.name ?? '',
+      ...(point.id === undefined ? {} : { from: point.id }),
+    });
     await super.restart(ctx, workflowId, { ...startAsync, ...(point.deleteFrom === undefined ? {} : { from: point.deleteFrom }) });
   }
 
   /**
    * Deletes a finished workflow, its journal and its record, and the
    * records of the child workflows upstream deletes with it, and of theirs.
-   * For a workflow that's already gone, it deletes the record. From a
-   * mutation, all in its transaction; from an action, the records go in a
-   * later one.
+   * For a workflow that's already gone, it deletes the record. The run's own
+   * record goes in the caller's transaction, from a mutation; the others in
+   * scheduled batches (see the README's "Limits").
    */
   public override async cleanup(ctx: MutationCtx | ActionCtx, workflowId: WorkflowId): Promise<boolean> {
     let finished: boolean;
@@ -290,45 +329,30 @@ export class WorkflowManager extends UpstreamWorkflowManager {
       finished = (await ctx.runQuery(this.component.workflow.getStatus, { workflowId })).workflow.runResult !== undefined;
     } catch (error) {
       if (!message(error).includes(`Workflow not found: ${workflowId}`)) throw error;
-      // Gone already, for example with its parent: only the record is left.
-      await ctx.runMutation(this.migrationsComponent.runs.cleanupMany, { workflowIds: [workflowId] });
+      // Gone already, for example with its parent: only the records are left.
+      await ctx.runMutation(this.migrationsComponent.runs.forget, { workflowIds: [workflowId] });
       return false;
     }
-    // Read before upstream deletes the journal that names them.
-    const children = finished ? await this.descendants(ctx, [workflowId]) : [];
-    const removed = await super.cleanup(ctx, workflowId);
-    if (removed) await ctx.runMutation(this.migrationsComponent.runs.cleanupMany, { workflowIds: [workflowId, ...children] });
-    return removed;
+    // Before upstream deletes the journal, which names the children of a run from before adoption.
+    if (finished) await this.forget(ctx, [workflowId]);
+    return await super.cleanup(ctx, workflowId);
   }
 
-  /** The child workflows these workflows started, and theirs, from their journals: what upstream's cleanup deletes with them. */
-  private async descendants(ctx: MutationCtx | ActionCtx, workflowIds: readonly string[]): Promise<string[]> {
-    const seen = new Set(workflowIds);
-    const found: string[] = [];
-    for (let i = 0; i < found.length + workflowIds.length; i++) {
-      const parent = i < workflowIds.length ? workflowIds[i]! : found[i - workflowIds.length]!;
-      let cursor: string | null = null;
-      for (;;) {
-        const steps: { page: { kind: string; nestedWorkflowId?: string }[]; isDone: boolean; continueCursor: string } = await ctx.runQuery(
-          this.component.workflow.listSteps,
-          { workflowId: parent, order: 'asc', paginationOpts: { numItems: 1000, cursor } },
-        );
-        for (const step of steps.page) {
-          if (step.kind !== 'workflow' || !step.nestedWorkflowId || seen.has(step.nestedWorkflowId)) continue;
-          seen.add(step.nestedWorkflowId);
-          found.push(step.nestedWorkflowId);
-        }
-        if (steps.isDone) break;
-        cursor = steps.continueCursor;
-      }
+  /** Deletes the records of these runs and of their descendants, through `runs.forget`, which can read upstream's journals. */
+  private async forget(ctx: MutationCtx | ActionCtx, workflowIds: readonly string[]): Promise<void> {
+    if (workflowIds.length === 0) return;
+    const journal = await createFunctionHandle(this.component.journal.load);
+    for (let i = 0; i < workflowIds.length; i += FORGET_BATCH) {
+      await ctx.runMutation(this.migrationsComponent.runs.forget, { workflowIds: workflowIds.slice(i, i + FORGET_BATCH), journal });
     }
-    return found;
   }
 
   /**
    * Where `restart` restarts from: the id of the step, stored on the record,
-   * and, for a run with an entry still marked running, the step number from
-   * which upstream deletes the journal. Throws if it can't restart from there.
+   * and the step number from which upstream deletes the journal: that of the
+   * first journal entry at or after the step, or of an entry still marked
+   * running, as a canceled run's wait is, if it comes first, since the run
+   * would wait on it forever otherwise. Throws if it can't restart from there.
    */
   private restartPoint(
     workflowId: WorkflowId,
@@ -352,17 +376,15 @@ export class WorkflowManager extends UpstreamWorkflowManager {
       if (position < 0)
         throw new Error(`restart: workflow ${workflowId}'s history has no step ${typeof from === 'string' ? `"${from}"` : 'that matches from'}.`);
     }
+    // The id stays on the record for the stand-ins from there on, which aren't in the journal.
     const id = position === undefined ? undefined : history.idAt(position);
-    const running = run.entries.filter((entry) => entry.step.inProgress).map((entry) => entry.stepNumber);
-    if (running.length === 0) {
-      // Throws now, rather than in the restarted run, if the history can't be cut there.
-      if (position !== undefined) history.truncate(position);
-      return id === undefined ? {} : { id };
-    }
     const stepNumbers = new Map(run.entries.map((entry) => [entry._id, entry.stepNumber]));
     const recorded = position === undefined ? undefined : history.recordedAt(position);
-    const deleteFrom = Math.min(...running, ...(recorded === undefined ? [] : [stepNumbers.get(recorded)!]));
-    return { ...(id === undefined ? {} : { id }), deleteFrom };
+    const cuts = [
+      ...run.entries.filter((entry) => entry.step.inProgress).map((entry) => entry.stepNumber),
+      ...(recorded === undefined ? [] : [stepNumbers.get(recorded)!]),
+    ];
+    return { ...(id === undefined ? {} : { id }), ...(cuts.length === 0 ? {} : { deleteFrom: Math.min(...cuts) }) };
   }
 }
 

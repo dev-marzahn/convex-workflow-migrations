@@ -29,7 +29,7 @@
  
  export type WorkerResult =
    | { type: "handlerDone"; runResult: RunResult }
-@@ -60,16 +69,23 @@
+@@ -60,16 +69,27 @@
  
  export class StepExecutor {
    private journalEntrySize: number;
@@ -51,10 +51,14 @@
      private workpoolOptions: WorkpoolOptions | undefined,
 +    // PATCHES:
 +    history: HistoryView,
++    private recordChildren?: (
++      messages: StepRequest[],
++      entries: JournalEntry[],
++    ) => Promise<void>,
    ) {
      this.journalEntrySize = journalEntries.reduce(
        (size, entry) => size + getConvexSize(entry),
-@@ -80,6 +96,8 @@
+@@ -80,6 +100,8 @@
        // This should never happen, but we'll throw an error just in case.
        throw new Error(journalSizeError(this.journalEntrySize, this.workflowId));
      }
@@ -63,7 +67,7 @@
    }
    async run(): Promise<WorkerResult> {
      while (true) {
-@@ -87,6 +105,13 @@
+@@ -87,6 +109,13 @@
        // In the future we can correlate the calls to entries by handle, args,
        // etc. instead of just ordering. As is, the fn order can't change.
        const entry = this.journalEntries.shift();
@@ -77,7 +81,7 @@
        if (entry) {
          this.completeMessage(message, entry);
          continue;
-@@ -97,6 +122,8 @@
+@@ -97,6 +126,8 @@
          const message = await this.receiver.get();
          messages.push(message);
        }
@@ -86,7 +90,7 @@
        const entries = await this.startSteps(messages);
        if (entries.every((entry) => entry.step.runResult)) {
          for (let i = 0; i < entries.length; i++) {
-@@ -125,17 +152,33 @@
+@@ -125,17 +156,33 @@
      };
    }
  
@@ -124,7 +128,7 @@
        ? { name: message.name, kind: message.target.kind }
        : {
            name: message.name,
-@@ -145,10 +188,20 @@
+@@ -145,10 +192,20 @@
      const stepJson = JSON.stringify(convexToJson(stepFields));
      const messageJson = JSON.stringify(convexToJson(messageFields));
      if (stepJson !== messageJson) {
@@ -145,6 +149,16 @@
      if (entry.step.runResult === undefined) {
        throw new Error(
          `Assertion failed: no outcome for completed function call`,
+@@ -254,6 +311,9 @@
+         workpoolOptions: this.workpoolOptions,
+       },
+     )) as JournalEntry[];
++    // PATCHES: records the child workflows these steps started, linked to
++    // this run, in this transaction (`RunRecord.recordChildren`).
++    await this.recordChildren?.(messages, entries);
+     for (const entry of entries) {
+       this.journalEntrySize += getConvexSize(entry);
+       if (this.journalEntrySize > MAX_JOURNAL_SIZE) {
 --- upstream/types.ts
 +++ vendor/types.ts
 @@ -1,10 +1,42 @@
@@ -210,7 +224,7 @@
  import type {
 --- upstream/workflowMutation.ts
 +++ vendor/workflowMutation.ts
-@@ -16,20 +16,30 @@
+@@ -16,20 +16,31 @@
    type PropertyValidators,
    type Validator,
  } from "convex/values";
@@ -239,6 +253,7 @@
 +import { ReplayPause } from "../../history.js";
 +import {
 +  loadJournal,
++  recordStart,
 +  RunRecord,
 +  type WorkflowMigrations,
 +} from "../../migrations.js";
@@ -246,7 +261,7 @@
  
  export type WorkflowArgs<V extends PropertyValidators, Context = unknown> = {
    /**
-@@ -108,6 +118,8 @@
+@@ -108,6 +119,8 @@
    ReturnsValidator extends Validator<any, "required", any> | void,
  >(
    component: WorkflowComponent,
@@ -255,7 +270,16 @@
    registered: WorkflowDefinition<ArgsValidator, ReturnsValidator> & {
      handler: WorkflowHandler<ArgsValidator, ReturnsValidator>;
    },
-@@ -184,10 +196,11 @@
+@@ -175,6 +188,8 @@
+           startAsync: args.startAsync ?? undefined,
+           createOnly: !args.startAsync, // either start async or run inline here
+         })) as WorkflowId;
++        // PATCHES: every run starts with a record, written with the run.
++        await recordStart(ctx, migrations, workflowId, metadata.name);
+         if (args.startAsync) {
+           return workflowId;
+         }
+@@ -184,10 +199,11 @@
          generationNumber = args.generationNumber;
        }
  
@@ -271,7 +295,7 @@
        const inProgress = journalEntries.filter(({ step }) => step.inProgress);
        const console = createLogger(logLevel);
        if (!ok) {
-@@ -205,7 +218,9 @@
+@@ -205,7 +221,9 @@
          );
          return workflowId;
        }
@@ -282,7 +306,7 @@
          console.log(`Workflow ${workflowId} completed, returning.`);
          return workflowId;
        }
-@@ -224,6 +239,13 @@
+@@ -224,6 +242,13 @@
            `Assertion failed: not blocked but have in-progress journal entry`,
          );
        }
@@ -296,12 +320,13 @@
        const channel = new BaseChannel<StepRequest>(
          workpoolOptions.maxParallelism ?? 10,
        );
-@@ -237,55 +259,27 @@
+@@ -237,55 +262,29 @@
          channel,
          Date.now(),
          workpoolOptions,
 +        // PATCHES:
 +        run.history,
++        (messages, entries) => run.recordChildren(ctx, messages, entries),
        );
        const restoreEnvironment = setupEnvironment(
          executor.getGenerationState.bind(executor),
@@ -362,12 +387,13 @@
 +          paused = result;
 +          return workflowId;
 +        }
-+        // PATCHES: save what this handler run applied, in its transaction.
-+        await run.save(ctx);
++        // PATCHES: save what this handler run applied, and whether it
++        // completed the run, in its transaction.
++        await run.save(ctx, result.type === "handlerDone");
          switch (result.type) {
            case "handlerDone": {
              await ctx.runMutation(component.workflow.complete, {
-@@ -305,6 +299,11 @@
+@@ -305,6 +304,11 @@
          }
        } finally {
          restoreEnvironment();

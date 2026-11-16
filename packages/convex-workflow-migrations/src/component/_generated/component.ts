@@ -24,10 +24,34 @@ import type { FunctionReference } from "convex/server";
 export type ComponentApi<Name extends string | undefined = string | undefined> =
   {
     runs: {
-      claim: FunctionReference<
+      attempt: FunctionReference<
+        "mutation",
+        "internal",
+        { attempts: number; workflowId: string },
+        null,
+        Name
+      >;
+      children: FunctionReference<
+        "mutation",
+        "internal",
+        {
+          children: Array<{ workflow: string; workflowId: string }>;
+          parent: string;
+        },
+        null,
+        Name
+      >;
+      cleanup: FunctionReference<
         "mutation",
         "internal",
         { workflowId: string },
+        number,
+        Name
+      >;
+      end: FunctionReference<
+        "mutation",
+        "internal",
+        { paused?: boolean; workflowId: string },
         {
           detail: string;
           generationNumber: number;
@@ -38,20 +62,17 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
             | "migration"
             | "migrations"
             | "overlay";
+        } | null,
+        Name
+      >;
+      forget: FunctionReference<
+        "mutation",
+        "internal",
+        {
+          from?: { cursor: string | null; workflowId: string };
+          journal?: string;
+          workflowIds: Array<string>;
         },
-        Name
-      >;
-      cleanup: FunctionReference<
-        "mutation",
-        "internal",
-        { workflowId: string },
-        number,
-        Name
-      >;
-      cleanupMany: FunctionReference<
-        "mutation",
-        "internal",
-        { workflowIds: Array<string> },
         null,
         Name
       >;
@@ -92,13 +113,32 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         },
         Name
       >;
+      live: FunctionReference<
+        "query",
+        "internal",
+        {
+          paginationOpts: {
+            cursor: string | null;
+            endCursor?: string | null;
+            id?: number;
+            maximumBytesRead?: number;
+            maximumRowsRead?: number;
+            numItems: number;
+          };
+          workflow: string;
+        },
+        { continueCursor: string; isDone: boolean; page: Array<string> },
+        Name
+      >;
       load: FunctionReference<
         "query",
         "internal",
         { workflowId: string },
         {
-          applied: Array<string>;
+          applied?: Array<string>;
           format: number;
+          live: boolean;
+          origin: "start" | "child" | "adopted";
           overlay: Array<
             | {
                 anchor: string;
@@ -121,16 +161,17 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
               }
             | { args: any; op: "workflowArgs" }
           >;
+          parent?: string;
           paused?: {
             appliedCount: number;
             at: number;
             attempts: number;
-            claimedUntil?: number;
             detail: string;
             generationNumber: number;
             handle: string;
             lastError?: string;
             nextAttemptAt: number;
+            pausedRuns: number;
             reason:
               | "mismatch"
               | "args"
@@ -138,13 +179,20 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
               | "migration"
               | "migrations"
               | "overlay";
+            restartFrom?: number;
             step?: number;
             stepId?: string;
           };
           restart?: string;
-          restartFrom?: number;
           workflow: string;
         } | null,
+        Name
+      >;
+      origins: FunctionReference<
+        "query",
+        "internal",
+        { workflowIds: Array<string> },
+        Array<{ origin: "start" | "child" | "adopted"; workflowId: string }>,
         Name
       >;
       pause: FunctionReference<
@@ -190,12 +238,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
       resumeAll: FunctionReference<
         "mutation",
         "internal",
-        {
-          cursor?: string | null;
-          numItems?: number;
-          until?: number;
-          workflow?: string;
-        },
+        { cursor?: string | null; until?: number; workflow?: string },
         null,
         Name
       >;
@@ -216,6 +259,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         "internal",
         {
           applied: Array<string>;
+          done: boolean;
           overlay: Array<
             | {
                 anchor: string;
@@ -244,10 +288,10 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         null,
         Name
       >;
-      unpause: FunctionReference<
+      start: FunctionReference<
         "mutation",
         "internal",
-        { workflowId: string },
+        { applied: Array<string>; workflow: string; workflowId: string },
         null,
         Name
       >;

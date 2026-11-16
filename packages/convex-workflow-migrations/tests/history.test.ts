@@ -4,7 +4,7 @@ import { expect, test } from 'vite-plus/test';
 
 import { capDetail, DETAIL_LIMIT } from '../src/component/schema.ts';
 import { HistoryView, type OverlayOp, type RecordedStep, ReplayMismatch, ReplayPause } from '../src/history.ts';
-import { migration, OVERLAY_LIMIT, prepareHistory, recordedStep } from '../src/migrations.ts';
+import { migration, OVERLAY_LIMIT, prepareHistory, prepareRun, recordedStep } from '../src/migrations.ts';
 import { redactHistory } from '../src/redact.ts';
 import { returnedEarly, threwEarly } from '../src/replay.ts';
 import type { JournalEntry } from '../src/vendor/workflow/types.ts';
@@ -121,19 +121,21 @@ test('a running step can be inserted around, but not removed, renamed or given o
   expect(names(h)).toEqual(['grab', 'notify', 'downloadDone (running)', 'after']);
 });
 
-test('an insert where no journal entry follows does nothing, so the run makes the call; atEnd inserts it anyway', () => {
+test('an insert where no journal entry or stand-in follows does nothing, so the run makes the call; atEnd inserts it anyway', () => {
   // grab ran across the deploy: its result came in, and the run hasn't got further.
   const h = new HistoryView([done('j0', 'grab')]);
   h.insertAfter(fn.grab, fn.notify, { result: null });
   expect(names(h)).toEqual(['grab']);
-  // Only stand-ins after the anchor count as nothing.
   h.insertAfter(fn.grab, fn.log, { result: null, atEnd: true });
+  expect(names(h)).toEqual(['grab', 'log']);
+  // A stand-in follows now, which replay gets before any new call: a call in front of it needs one too.
   h.insertAfter(fn.grab, fn.notify, { result: null });
   h.insertBefore(fn.log, fn.check, { result: null });
-  expect(names(h)).toEqual(['grab', 'log']);
-  h.insertBefore(fn.log, fn.check, { result: null, atEnd: true });
-  expect(names(h)).toEqual(['grab', 'check', 'log']);
-  expect(h.overlay().map((op) => (op.op === 'insert' ? op.id : op.op))).toEqual(['+1', '+2']);
+  expect(names(h)).toEqual(['grab', 'notify', 'check', 'log']);
+  // Nothing after the last stand-in still means the run makes the call.
+  h.insertAfter(fn.log, fn.publish, { result: null });
+  expect(names(h)).toEqual(['grab', 'notify', 'check', 'log']);
+  expect(h.overlay().map((op) => (op.op === 'insert' ? op.id : op.op))).toEqual(['+1', '+2', '+3']);
   // insertBefore a journal entry always has one after it.
   const waiting = new HistoryView([done('j0', 'grab'), event('j1', 'downloadDone', true)]);
   waiting.insertAfter(fn.grab, fn.notify, { result: null });
@@ -307,7 +309,7 @@ test('returnedEarly: returning before the end of the history is a mismatch', () 
 });
 
 test('threwEarly: which throws pause the run and which fail it', () => {
-  const ctx = { validated: true, hasHistory: true, editedNow: [] as string[] };
+  const ctx = { validated: true, editedNow: [] as string[] };
   const error = new Error('boom');
   const h = new HistoryView(journal());
   // Before a recorded step: pause.
@@ -344,9 +346,9 @@ test('threwEarly: which throws pause the run and which fail it', () => {
   const caught = new HistoryView([done('j0', 'grab'), { ...done('j1', 'notify'), runResult: { kind: 'failed', error: 'no' } }, event('j2', 'downloadDone')]);
   caught.remove({ event: 'downloadDone' });
   expect(threwEarly(caught, { started: false }, error, { ...ctx, editedNow: ['m'] })).toMatchObject({ reason: 'threw' });
-  // Args that don't validate: pause a run with history, fail a new one.
+  // Args that don't validate pause the run, with history or without: the workflow mutation refuses them when it creates a run.
   expect(threwEarly(h, { next: { position: 0 }, started: false }, error, { ...ctx, validated: false })).toMatchObject({ reason: 'args' });
-  expect(threwEarly(new HistoryView([]), { started: false }, error, { ...ctx, validated: false, hasHistory: false })).toBeUndefined();
+  expect(threwEarly(new HistoryView([]), { started: false }, error, { ...ctx, validated: false })).toMatchObject({ reason: 'args' });
   // A pause passes through.
   const pause = new ReplayPause('mismatch', 'x');
   expect(threwEarly(h, { started: false }, pause, ctx)).toBe(pause);
@@ -427,6 +429,30 @@ test("prepareHistory's restart: a step upstream deleted leaves nothing to cut, a
     expect(names(prepared.history)).toEqual(['grab', 'notify']);
   }
   expect(prepareHistory(journal(), { applied: [], overlay: [], restart: 'j1' }, [drop], {}).blocked?.detail).toContain('a migration removed it');
+});
+
+test('prepareRun: a record that says what was applied is used; without one, the journal or the args decide', () => {
+  const notify = migration('notify', (h) => h.insertAfter(fn.grab, fn.notify, { result: null }));
+  const channel = migration('channel', (h) => h.updateWorkflowArgs((args) => ({ ...args, channel: 'default' })));
+  const hasChannel = (args: unknown) => typeof (args as { channel?: unknown }).channel === 'string';
+  const list = [notify, channel];
+  // Applied ids on the record: the pending ones apply, to the journal or to an empty history (a queued run).
+  expect(prepareRun([], { applied: ['notify'], overlay: [] }, list, { grabId: 'g' }, hasChannel).history.workflowArgs).toEqual({
+    grabId: 'g',
+    channel: 'default',
+  });
+  // No record, with journal entries: from before adoption, so every migration applies.
+  expect(prepareRun(journal(), { overlay: [] }, list, {}, hasChannel).applied).toEqual(['notify', 'channel']);
+  expect(prepareRun(journal(), { overlay: [] }, list, {}, hasChannel).ran.map((m) => m.id)).toEqual(['notify', 'channel']);
+  // None, and an empty journal: args that pass mean the code that started it is this one's.
+  const current = prepareRun([], { overlay: [] }, list, { channel: 'main' }, hasChannel);
+  expect([current.applied, current.ran, current.history.workflowArgs]).toEqual([['notify', 'channel'], [], { channel: 'main' }]);
+  // Args that don't pass: the list runs from the start, where only updateWorkflowArgs does anything.
+  const old = prepareRun([], { overlay: [] }, list, { grabId: 'g' }, hasChannel);
+  expect([old.applied, old.history.workflowArgs, old.history.length]).toEqual([['notify', 'channel'], { grabId: 'g', channel: 'default' }, 0]);
+  // And if they still don't pass, replay pauses the run with `args`.
+  const unfixed = prepareRun([], { overlay: [] }, [notify], { grabId: 'g' }, hasChannel);
+  expect([unfixed.blocked, unfixed.history.workflowArgs]).toEqual([undefined, { grabId: 'g' }]);
 });
 
 test('redactHistory passes every step and the run args through redact', async () => {

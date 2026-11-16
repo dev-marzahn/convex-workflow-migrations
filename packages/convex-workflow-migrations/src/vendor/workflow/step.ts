@@ -86,6 +86,10 @@ export class StepExecutor {
     private workpoolOptions: WorkpoolOptions | undefined,
     // PATCHES:
     history: HistoryView,
+    private recordChildren?: (
+      messages: StepRequest[],
+      entries: JournalEntry[],
+    ) => Promise<void>,
   ) {
     this.journalEntrySize = journalEntries.reduce(
       (size, entry) => size + getConvexSize(entry),
@@ -307,6 +311,9 @@ export class StepExecutor {
         workpoolOptions: this.workpoolOptions,
       },
     )) as JournalEntry[];
+    // PATCHES: records the child workflows these steps started, linked to
+    // this run, in this transaction (`RunRecord.recordChildren`).
+    await this.recordChildren?.(messages, entries);
     for (const entry of entries) {
       this.journalEntrySize += getConvexSize(entry);
       if (this.journalEntrySize > MAX_JOURNAL_SIZE) {

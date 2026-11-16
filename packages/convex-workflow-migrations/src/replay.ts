@@ -38,8 +38,6 @@ export type Replay = {
   history: HistoryView;
   /** The workflow's args, as the migrations left them. */
   args: unknown;
-  /** Whether the run has journal entries: it isn't new. */
-  hasHistory: boolean;
   /** The migrations that edited the history in this handler run. */
   editedNow: readonly string[];
   /** For a history whose run is known to have failed: see `threwEarly`. */
@@ -55,6 +53,12 @@ export type ReplayOptions = {
 };
 
 const message = (error: unknown) => (error instanceof Error ? error.message : String(error));
+
+/** Whether `args` pass the workflow's `args` validator, if it has one. With `db`, ids are checked against it, as upstream's handler run checks them. */
+export function argsValid(definition: { args?: unknown }, args: unknown, db?: GenericDatabaseReader<any>): boolean {
+  if (!definition.args) return true;
+  return validate(asObjectValidator(definition.args as ObjectValidator), args, db ? { db } : {});
+}
 
 /** Where replay got to when the handler threw or returned: the first history step it hasn't called, and whether it started a step past the history. */
 export type ReplayProgress = { next?: { position: number }; started: boolean };
@@ -78,16 +82,17 @@ export function returnedEarly(history: HistoryView, progress: ReplayProgress): R
 
 /**
  * What `threwEarly` knows about the handler run: whether the args validated,
- * whether the run has journal entries, which migrations edited its history in
- * this handler run, and whether only an unreplayed recorded step counts (for
- * a history whose run is known to have failed).
+ * which migrations edited its history in this handler run, and whether only
+ * an unreplayed recorded step counts (for a history whose run is known to
+ * have failed).
  */
-export type ThrowContext = { validated: boolean; hasHistory: boolean; editedNow: readonly string[]; recordedOnly?: boolean };
+export type ThrowContext = { validated: boolean; editedNow: readonly string[]; recordedOnly?: boolean };
 
 /**
  * Whether a handler that threw should pause the run instead of failing it,
  * by the rules in the README's "Pausing and recovery", in their order. Args
- * that don't validate pause a run that has history, and fail a new one.
+ * that don't validate pause the run: the workflow mutation refuses args that
+ * don't validate when it creates a run, so they're from older code.
  * Otherwise, the run:
  *
  * 1. fails if the handler run started a step past the history, since that
@@ -107,9 +112,7 @@ export type ThrowContext = { validated: boolean; hasHistory: boolean; editedNow:
  */
 export function threwEarly(history: HistoryView, progress: ReplayProgress, error: unknown, context: ThrowContext): ReplayPause | undefined {
   if (error instanceof ReplayPause) return error;
-  if (!context.validated) {
-    return context.hasHistory ? new ReplayPause('args', `The workflow's args don't match its args validator: ${message(error)}`) : undefined;
-  }
+  if (!context.validated) return new ReplayPause('args', `The workflow's args don't match its args validator: ${message(error)}`);
   if (progress.started) return undefined;
   const next = progress.next?.position ?? history.length;
   if (history.recordedFrom(next)) {
@@ -169,7 +172,6 @@ export async function replayHandler(
     } catch (error) {
       const pause = threwEarly(replay.history, executor.progress(), error, {
         validated,
-        hasHistory: replay.hasHistory,
         editedNow: replay.editedNow,
         ...(replay.recordedOnly === undefined ? {} : { recordedOnly: replay.recordedOnly }),
       });

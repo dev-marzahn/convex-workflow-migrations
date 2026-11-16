@@ -36,6 +36,7 @@ import { createWorkflowCtx } from "./workflowContext.js";
 import { ReplayPause } from "../../history.js";
 import {
   loadJournal,
+  recordStart,
   RunRecord,
   type WorkflowMigrations,
 } from "../../migrations.js";
@@ -187,6 +188,8 @@ export function workflowMutation<
           startAsync: args.startAsync ?? undefined,
           createOnly: !args.startAsync, // either start async or run inline here
         })) as WorkflowId;
+        // PATCHES: every run starts with a record, written with the run.
+        await recordStart(ctx, migrations, workflowId, metadata.name);
         if (args.startAsync) {
           return workflowId;
         }
@@ -261,6 +264,7 @@ export function workflowMutation<
         workpoolOptions,
         // PATCHES:
         run.history,
+        (messages, entries) => run.recordChildren(ctx, messages, entries),
       );
       const restoreEnvironment = setupEnvironment(
         executor.getGenerationState.bind(executor),
@@ -278,8 +282,9 @@ export function workflowMutation<
           paused = result;
           return workflowId;
         }
-        // PATCHES: save what this handler run applied, in its transaction.
-        await run.save(ctx);
+        // PATCHES: save what this handler run applied, and whether it
+        // completed the run, in its transaction.
+        await run.save(ctx, result.type === "handlerDone");
         switch (result.type) {
           case "handlerDone": {
             await ctx.runMutation(component.workflow.complete, {
