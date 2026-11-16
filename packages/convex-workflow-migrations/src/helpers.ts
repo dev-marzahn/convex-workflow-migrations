@@ -4,6 +4,7 @@
 // tests that use only these need no Vitest setup.
 import { BaseChannel } from 'async-channel';
 import type { FunctionReference, GenericDataModel, GenericMutationCtx, RegisteredMutation } from 'convex/server';
+import { type JSONValue, jsonToConvex } from 'convex/values';
 
 import type { History, HistoryStep, RecordedHistory, RecordedStep, StepKind } from './history.ts';
 import { type Prepared, prepareRun } from './migrations.ts';
@@ -74,8 +75,27 @@ function target(workflow: Workflow, helper: string): ReplayTarget {
   return found;
 }
 
+/** An exported history (`encoding: 'json'`) with its values decoded with `jsonToConvex`; any other as it is. */
+function decoded(recorded: RecordedHistory): RecordedHistory {
+  if (recorded.encoding !== 'json') return recorded;
+  const value = (encoded: unknown) => (encoded === undefined ? undefined : jsonToConvex(encoded as JSONValue));
+  const values = <T extends object>(item: T, keys: readonly string[]) =>
+    Object.fromEntries(Object.entries(item).map(([key, field]) => [key, keys.includes(key) ? value(field) : field])) as T;
+  return {
+    ...recorded,
+    args: value(recorded.args),
+    steps: recorded.steps.map((step) => ({
+      ...step,
+      args: value(step.args),
+      ...(step.runResult ? { runResult: values(step.runResult, ['returnValue']) } : {}),
+    })),
+    ...(recorded.overlay ? { overlay: recorded.overlay.map((op) => values(op, ['args', 'result'])) } : {}),
+  };
+}
+
 /** As the workflow mutation prepares a run, but checking args without the database (ids only as strings), and `strict`. */
-function prepare(replay: ReplayTarget, recorded: RecordedHistory): Prepared {
+function prepare(replay: ReplayTarget, exported: RecordedHistory): Prepared {
+  const recorded = decoded(exported);
   const stored = { applied: recorded.applied, overlay: recorded.overlay ?? [] };
   const valid = (args: unknown) => argsValid(replay.definition, args);
   return prepareRun(recorded.steps, stored, replay.migrations, recorded.args ?? {}, valid, { strict: true });
@@ -128,7 +148,7 @@ async function replayHistory(replay: ReplayTarget, recorded: RecordedHistory, pr
   return undefined;
 }
 
-/** Why an exported history can't be checked: the export cut it short, or its record and journal may not match. */
+/** Why an exported history can't be checked: the export cut it short at --max-steps, or its record and journal may not match. */
 function incomplete(recorded: RecordedHistory): string | undefined {
   if (recorded.truncated)
     return `(truncated): The export stopped at ${recorded.steps.length} steps, so the rest can't be checked. Export it with a larger --max-steps.`;
@@ -145,10 +165,13 @@ function incomplete(recorded: RecordedHistory): string | undefined {
  * output when run on it again fails too, and so does a handler that throws,
  * unless it's passing on a failure (throw rule 4; README, "Testing"), or
  * returns a value its `returns` validator rejects; a finished run's
- * `outcome` adjusts that. A `truncated` or `unstable` history fails.
+ * `outcome` adjusts that. A `truncated` or `unstable` history fails, and so
+ * does an empty list.
  */
 export async function expectReplays(workflow: Workflow, histories: readonly RecordedHistory[]): Promise<void> {
   const replay = target(workflow, 'expectReplays');
+  // An empty export checks nothing, which would pass.
+  if (histories.length === 0) throw new Error('expectReplays got no histories to check.');
   const failures: string[] = [];
   for (const [i, recorded] of histories.entries()) {
     const label = `history ${i}${recorded.workflowId ? ` (${recorded.workflowId})` : ''}`;

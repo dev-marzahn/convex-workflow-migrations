@@ -35,6 +35,14 @@ export type RecordedHistory = {
   truncated?: boolean;
   /** The run's record changed every time the export read its journal, so the two may not match. */
   unstable?: boolean;
+  /**
+   * `json`: the args, the steps' args and results, and the overlay's values
+   * are as `convexToJson` encodes them (an int64 as `{ $integer }`), as
+   * `convex run` prints them; the `histories` CLI marks its exports so, and
+   * `/replay` decodes them. Without it, they're Convex values, as `history()`
+   * builds them.
+   */
+  encoding?: 'json';
 };
 
 /** A step of a history, as a migration reads it. */

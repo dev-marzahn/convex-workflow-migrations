@@ -122,13 +122,15 @@ const scenarios: Record<string, (backend: Backend) => Promise<void>> = {
    * of release 3, which lists the migrations of releases 1 to 3: it replays
    * without releases 1 and 2 ever being deployed. A run started on release 3
    * has every migration applied from the start. The `histories` CLI exports
-   * the release 0 run before the deploy, without the migrations component,
-   * and once it finished on release 3, with its record.
+   * the release 0 run before the deploy, without the migrations component
+   * (only with --before-adoption), and once it finished on release 3, with
+   * its record.
    */
   async skip(backend) {
     deploy('v1', backend);
     const old = await startWaitingRun('v1', backend, 1);
-    const before = histories('v1', backend, []);
+    histories('v1', backend, [], 2);
+    const before = histories('v1', backend, ['--before-adoption']);
     const args = { grabId: old.grabId };
     expectEqual(
       before.exported.map(shape),

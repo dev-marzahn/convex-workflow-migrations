@@ -1,10 +1,10 @@
 // The /replay helpers replay histories without Convex: they take the workflow
 // mutation `define` returned, and no convex-test instance.
 import { anyApi, componentsGeneric } from 'convex/server';
-import { v } from 'convex/values';
+import { convexToJson, v, type Value } from 'convex/values';
 import { expect, test } from 'vite-plus/test';
 
-import { expectReplays, history, migrate } from '../src/helpers.ts';
+import { expectReplays, history, migrate, type RecordedHistory } from '../src/helpers.ts';
 import { type EventId, migration, type MigrationsComponent, type WorkflowComponent, type WorkflowCtx, WorkflowManager } from '../src/index.ts';
 
 const components = componentsGeneric() as unknown as { workflow: WorkflowComponent; workflowMigrations: MigrationsComponent };
@@ -262,4 +262,43 @@ test('an exported history: its outcome decides which throws fail, and a truncate
   expect(await failure(expectReplays(workflows.current, [{ ...release0Waiting, truncated: true }]))).toContain('(truncated): The export stopped at 2 steps');
   expect(await failure(expectReplays(workflows.current, [{ ...release0Waiting, unstable: true }]))).toContain("(unstable): The run's record changed");
   expect(() => migrate(workflows.current, { ...release0Waiting, truncated: true })).toThrow('(truncated)');
+});
+
+test("an exported history's values are decoded from convex run's JSON: the handler sees an int64 arg, a step's bigint result and a stand-in's", async () => {
+  const seen: unknown[] = [];
+  const counts = manager.define({
+    args: { n: v.int64() },
+    migrations: [notifyAfterGrab],
+    handler: async (step: WorkflowCtx, { n }: { n: bigint }) => {
+      const grabbed = await step.runMutation(flows.grab, { n });
+      const notified = (await step.runMutation(flows.notify, {})) as { at: bigint };
+      seen.push(n, grabbed, notified.at);
+      await step.awaitEvent({ name: 'downloadDone' });
+    },
+  });
+  const live = history(
+    [
+      { step: flows.grab, args: { n: 5n }, result: 7n },
+      { event: 'downloadDone', status: 'running' },
+    ],
+    {
+      args: { n: 5n },
+      applied: ['notify-after-grab'],
+    },
+  );
+  const overlay = [{ op: 'insert', id: '+1', where: 'after', anchor: 'h0', name: 'flows:notify', kind: 'function', result: { at: 9n } }] as const;
+  // As the CLI exports it: everything `convex run` printed, through JSON.
+  const exported = { ...(JSON.parse(JSON.stringify(convexToJson({ ...live, overlay } as unknown as Value))) as RecordedHistory), encoding: 'json' as const };
+  expect(exported.args).toEqual({ n: { $integer: expect.any(String) } });
+  await expectReplays(counts, [exported]);
+  expect(seen).toEqual([5n, 7n, 9n]);
+  expect(migrate(counts, exported).steps.map((s) => s.result)).toEqual([7n, { at: 9n }, undefined]);
+  // A hand-built history's values are Convex values already.
+  seen.length = 0;
+  await expectReplays(counts, [{ ...live, overlay: [...overlay] }]);
+  expect(seen).toEqual([5n, 7n, 9n]);
+});
+
+test('expectReplays throws for no histories: an empty export checks nothing', async () => {
+  expect(await failure(expectReplays(workflows.current, []))).toBe('expectReplays got no histories to check.');
 });

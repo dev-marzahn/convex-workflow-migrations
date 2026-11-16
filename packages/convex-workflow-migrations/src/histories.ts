@@ -2,7 +2,8 @@
 // run histories from a deployment as JSON, for `expectReplays`. It reads
 // through the app's `convex run`, which `main` takes as `io.convex`, so tests
 // drive it with a fake deployment.
-import { writeFileSync } from 'node:fs';
+import { accessSync, constants, mkdirSync, writeFileSync } from 'node:fs';
+import { dirname } from 'node:path';
 import { parseArgs } from 'node:util';
 
 import type { OverlayOp, RecordedHistory } from './history.ts';
@@ -49,6 +50,9 @@ export function collectRuns(query: Query, component: string, name: string, { rec
   }
 }
 
+/** Whether `error` is upstream's for a run that's gone, as `convex run` reports it. */
+const isNotFound = (error: unknown, workflowId: string) => error instanceof Error && error.message.includes(`Workflow not found: ${workflowId}`);
+
 const sameRecord = (a: RunRecord, b: RunRecord) => JSON.stringify(a && [a.applied, a.overlay]) === JSON.stringify(b && [b.applied, b.overlay]);
 
 /**
@@ -57,22 +61,24 @@ const sameRecord = (a: RunRecord, b: RunRecord) => JSON.stringify(a && [a.applie
  * outcome if it finished, and its record's `applied` and `overlay` if it has
  * one. The record is read before and after the journal, up to `READS` times
  * until the two reads agree; if they never do, the history is `unstable`.
- * Undefined if the run is gone.
+ * `gone` if the run is gone, and `tooBig` if its journal is too big to load
+ * (over 8 MiB), which upstream fails at the run's next handler run.
  */
-export function runHistory(query: Query, components: Components, name: string, workflowId: string, maxSteps: number): RecordedHistory | undefined {
+export function runHistory(query: Query, components: Components, name: string, workflowId: string, maxSteps: number): RecordedHistory | 'gone' | 'tooBig' {
   const load = (): RunRecord => (components.migrations === undefined ? null : query(components.migrations, 'runs:load', { workflowId }));
   let [record, stable, journal] = [load(), false, undefined as Journal | undefined];
   for (let read = 0; read < READS && !stable; read++) {
     try {
       journal = query(components.workflow, 'journal:load', { workflowId });
     } catch (error) {
-      if (error instanceof Error && error.message.includes(`Workflow not found: ${workflowId}`)) return undefined;
+      if (isNotFound(error, workflowId)) return 'gone';
       throw error;
     }
+    if (!journal!.ok) return 'tooBig';
     const after = load();
     [stable, record] = [sameRecord(record, after), after];
   }
-  const { workflow, journalEntries, ok } = journal!;
+  const { workflow, journalEntries } = journal!;
   return {
     workflowId,
     workflow: name,
@@ -80,8 +86,7 @@ export function runHistory(query: Query, components: Components, name: string, w
     steps: journalEntries.slice(0, maxSteps).map(recordedStep),
     ...(record ? { applied: record.applied, overlay: record.overlay } : {}),
     ...(workflow.runResult ? { outcome: workflow.runResult.kind } : {}),
-    // `ok` is false for a journal too big to load whole.
-    ...(journalEntries.length > maxSteps || !ok ? { truncated: true } : {}),
+    ...(journalEntries.length > maxSteps ? { truncated: true } : {}),
     ...(stable ? {} : { unstable: true }),
   };
 }
@@ -103,12 +108,19 @@ environment (CONVEX_DEPLOY_KEY, CONVEX_SELF_HOSTED_*) pick the deployment.
   --allow-partial     Export anyway when --max-scan stopped the scan.
   --max-steps <n>     Steps to export per run, at least 1. A longer run is cut
                       there and marked "truncated". Default: 1000
-  --out <file>        Write the JSON to <file> instead of stdout.
+  --out <file>        Write the JSON to <file> instead of stdout, creating
+                      its directory.
   --workflow-component <name>    Default: workflow
-  --migrations-component <name>  Default: workflowMigrations
+  --migrations-component <name>  Default: workflowMigrations. If it isn't
+                      deployed, it exits with 2, unless --before-adoption.
+  --before-adoption   The app hasn't adopted this package yet, so there's no
+                      migrations component: every run is exported without
+                      "applied", as a run from before adoption.
 
 It runs three \`convex run\` commands per exported run, so it's slow for many.
-Exit codes: 0 exported, 1 stopped by --max-scan, 2 usage or deployment error.`;
+A run whose journal is too big to load (over 8 MiB) is left out, with a note.
+Exit codes: 0 exported, 1 stopped by --max-scan, 2 usage or deployment
+error, or no runs of that name.`;
 
 const WARNING =
   "The export holds production data: every run's args, and every step's args, result and error, and each record's overlay. Check it before you commit it.";
@@ -121,7 +133,12 @@ const count = (value: string, option: string, min: number) => {
   return n;
 };
 
-/** `convex run` as a `Query`. Its JSON output encodes Convex values as `convexToJson` does, which the export keeps. */
+/**
+ * `convex run` as a `Query`. Its JSON output encodes Convex values as
+ * `convexToJson` does (an int64 as `{ $integer }`), and the result isn't
+ * decoded: the export keeps that encoding, marked `encoding: 'json'`, and
+ * `/replay` decodes it.
+ */
 function cliQuery(convex: Convex): Query {
   return <T>(component: string, path: string, args: object) => {
     const result = convex(['run', '--component', component, path, JSON.stringify(args)]);
@@ -152,6 +169,7 @@ function histories(argv: string[], io: Io): number {
       out: { type: 'string' },
       'workflow-component': { type: 'string', default: 'workflow' },
       'migrations-component': { type: 'string', default: 'workflowMigrations' },
+      'before-adoption': { type: 'boolean', default: false },
       help: { type: 'boolean', short: 'h' },
     },
   });
@@ -166,24 +184,54 @@ function histories(argv: string[], io: Io): number {
   const convex: Convex = (args) => io.convex([...args, ...convexArgs]);
   const query = cliQuery(convex);
 
+  if (values.out !== undefined) {
+    // Now, not after the scan.
+    mkdirSync(dirname(values.out), { recursive: true });
+    accessSync(dirname(values.out), constants.W_OK);
+  }
+
   const components: Components = { workflow: values['workflow-component'] };
   const migrations = values['migrations-component'];
-  if (isDeployed(convex, migrations)) components.migrations = migrations;
-  else io.stderr(`The ${migrations} component isn't deployed: every run is exported without "applied", as a run from before the app adopted this package.`);
+  const deployed = isDeployed(convex, migrations);
+  if (deployed && values['before-adoption'])
+    throw new Error(`The ${migrations} component is deployed, so the app has adopted this package: drop --before-adoption.`);
+  if (deployed) components.migrations = migrations;
+  else if (values['before-adoption'])
+    io.stderr(`The ${migrations} component isn't deployed: every run is exported without "applied", as a run from before the app adopted this package.`);
+  else
+    throw new Error(
+      `The ${migrations} component isn't deployed. If this package's component is mounted under another name, pass --migrations-component <name>; if the app hasn't adopted this package yet, pass --before-adoption.`,
+    );
 
   const collected = collectRuns(query, components.workflow, name, { recent, maxScan });
+  if (collected.scanned === 0) throw new Error(`No runs named ${name}; the name is the function's path, e.g. \`pipeline:run\`.`);
   if (collected.stopped) {
-    const status = query<{ workflow: { _creationTime: number } }>(components.workflow, 'workflow:getStatus', { workflowId: collected.oldest });
-    const created = new Date(status.workflow._creationTime).toISOString();
+    let created = '';
+    try {
+      const status = query<{ workflow: { _creationTime: number } }>(components.workflow, 'workflow:getStatus', { workflowId: collected.oldest });
+      created = `, the oldest created ${new Date(status.workflow._creationTime).toISOString()}`;
+    } catch (error) {
+      // Cleaned up since the scan read it.
+      if (!isNotFound(error, collected.oldest!)) throw error;
+    }
     io.stderr(
-      `${name} has more than --max-scan ${maxScan} runs. The export read the newest ${collected.scanned}, the oldest created ${created}, so older running runs may be missing.`,
+      `${name} has more than --max-scan ${maxScan} runs. The export read the newest ${collected.scanned}${created}, so older running runs may be missing.`,
     );
     if (!values['allow-partial']) {
       io.stderr('Nothing was exported. Raise --max-scan, or pass --allow-partial to export these anyway.');
       return 1;
     }
   }
-  const exported = collected.workflowIds.flatMap((workflowId) => runHistory(query, components, name, workflowId, maxSteps) ?? []);
+  const [exported, tooBig] = [[] as RecordedHistory[], [] as string[]];
+  for (const workflowId of collected.workflowIds) {
+    const history = runHistory(query, components, name, workflowId, maxSteps);
+    if (history === 'tooBig') tooBig.push(workflowId);
+    else if (history !== 'gone') exported.push({ ...history, encoding: 'json' });
+  }
+  if (tooBig.length > 0)
+    io.stderr(
+      `Skipped ${tooBig.length} runs whose journal is over 8 MiB, too big to load; upstream fails a running one at its next handler run: ${tooBig.join(', ')}.`,
+    );
   const json = `${JSON.stringify(exported, null, 2)}\n`;
   if (values.out === undefined) io.stdout(json);
   else writeFileSync(values.out, json);
