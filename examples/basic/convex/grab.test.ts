@@ -26,5 +26,5 @@ test('a grab started on the current release runs every step', async () => {
   await t.finishAllScheduledFunctions(vi.runAllTimers);
   await t.mutation(api.pipeline.downloadDone, { workflowId });
   await t.finishAllScheduledFunctions(vi.runAllTimers);
-  expect((await t.run((ctx) => ctx.db.get('grabs', grabId)))?.log).toEqual(['grab', 'notify', 'import', 'transcode', 'publish']);
+  expect(await t.query(api.pipeline.status, { grabId })).toEqual({ log: ['grab', 'notify', 'import', 'transcode', 'publish'], status: 'completed' });
 });

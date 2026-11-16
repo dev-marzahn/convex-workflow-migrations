@@ -1,6 +1,7 @@
 // End-to-end tests on a real self-hosted backend: a fixture app starts a run
-// that waits on `awaitEvent`, another fixture app is deployed over it as a
-// later release, and the run finishes on the new code, or fails.
+// that waits on `awaitEvent`, a later release (another fixture, or
+// examples/basic) is deployed over it, and the run finishes on the new code,
+// or fails.
 //
 //   bun run e2e                 all scenarios
 //   bun run e2e skip            only these
@@ -27,7 +28,9 @@ const log = (message: string) => console.log(message);
 
 // ------------------------------------------------------------------ apps ---
 
-const appDir = (app: string) => join(ROOT, 'e2e/apps', app);
+// Release 3 is the example app; the other releases are fixtures in e2e/apps.
+const release3 = 'examples/basic';
+const appDir = (app: string) => join(ROOT, app === release3 ? app : `e2e/apps/${app}`);
 const convex = (app: string, backend: Backend, args: string[]) =>
   sh(join(appDir(app), 'node_modules/.bin/convex'), args, { cwd: appDir(app), env: backend.env });
 
@@ -93,22 +96,22 @@ const scenarios: Record<string, (backend: Backend) => Promise<void>> = {
   async skip(backend) {
     deploy('v1', backend);
     const old = await startWaitingRun('v1', backend, 1);
-    deploy('v3', backend);
-    expectEqual(record('v3', backend, old), null, 'the release 0 run’s record before its next handler run');
-    const fresh = await startWaitingRun('v3', backend, 2);
-    expectEqual(record('v3', backend, fresh), { applied: ALL, overlay: [] }, 'the release 3 run’s record');
-    for (const ids of [old, fresh]) call('v3', backend, 'pipeline:downloadDone', { workflowId: ids.workflowId });
+    deploy(release3, backend);
+    expectEqual(record(release3, backend, old), null, 'the release 0 run’s record before its next handler run');
+    const fresh = await startWaitingRun(release3, backend, 2);
+    expectEqual(record(release3, backend, fresh), { applied: ALL, overlay: [] }, 'the release 3 run’s record');
+    for (const ids of [old, fresh]) call(release3, backend, 'pipeline:downloadDone', { workflowId: ids.workflowId });
 
     // notify is a stand-in for the old run: it was past that point.
     expectEqual(
-      await finished('v3', backend, old, 'the release 0 run to finish'),
+      await finished(release3, backend, old, 'the release 0 run to finish'),
       { log: ['grab', 'import', 'transcode', 'publish'], status: 'completed' },
       'the release 0 run',
     );
-    expectEqual(record('v3', backend, old)?.applied, ALL, 'the release 0 run’s applied migrations');
-    const freshGrab = await finished('v3', backend, fresh, 'the release 3 run to finish');
+    expectEqual(record(release3, backend, old)?.applied, ALL, 'the release 0 run’s applied migrations');
+    const freshGrab = await finished(release3, backend, fresh, 'the release 3 run to finish');
     expectEqual(freshGrab, { log: ['grab', 'notify', 'import', 'transcode', 'publish'], status: 'completed' }, 'the release 3 run');
-    expectEqual(record('v3', backend, fresh)?.overlay, [], 'the release 3 run’s overlay');
+    expectEqual(record(release3, backend, fresh)?.overlay, [], 'the release 3 run’s overlay');
   },
 
   /**

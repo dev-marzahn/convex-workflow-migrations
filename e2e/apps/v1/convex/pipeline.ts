@@ -33,7 +33,7 @@ export const importFiles = step('import');
 export const prepare = step('prepare');
 export const publish = step('publish');
 
-// Everything below is the same in every fixture release.
+// Everything below is the same in every release, examples/basic too.
 
 export const startGrab = mutation({
   args: { title: v.string() },
