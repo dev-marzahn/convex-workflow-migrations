@@ -196,7 +196,7 @@ export function workflowMutation<
         generationNumber = args.generationNumber;
       }
 
-      // PATCHES: a paused run whose workflow is gone, like a child its
+      // PATCHES: a run whose workflow is gone, like a paused child its
       // parent's cleanup deleted, loses its record (src/migrations.ts).
       const loaded = await loadJournal(ctx, component, migrations, workflowId);
       if (!loaded) return workflowId;
