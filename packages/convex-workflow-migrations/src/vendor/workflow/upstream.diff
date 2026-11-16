@@ -224,7 +224,7 @@
  import type {
 --- upstream/workflowMutation.ts
 +++ vendor/workflowMutation.ts
-@@ -16,20 +16,31 @@
+@@ -16,20 +16,32 @@
    type PropertyValidators,
    type Validator,
  } from "convex/values";
@@ -253,6 +253,7 @@
 +import { ReplayPause } from "../../history.js";
 +import {
 +  loadJournal,
++  recordFinished,
 +  recordStart,
 +  RunRecord,
 +  type WorkflowMigrations,
@@ -261,7 +262,7 @@
  
  export type WorkflowArgs<V extends PropertyValidators, Context = unknown> = {
    /**
-@@ -108,6 +119,8 @@
+@@ -108,6 +120,8 @@
    ReturnsValidator extends Validator<any, "required", any> | void,
  >(
    component: WorkflowComponent,
@@ -270,7 +271,7 @@
    registered: WorkflowDefinition<ArgsValidator, ReturnsValidator> & {
      handler: WorkflowHandler<ArgsValidator, ReturnsValidator>;
    },
-@@ -175,6 +188,8 @@
+@@ -175,6 +189,8 @@
            startAsync: args.startAsync ?? undefined,
            createOnly: !args.startAsync, // either start async or run inline here
          })) as WorkflowId;
@@ -279,7 +280,7 @@
          if (args.startAsync) {
            return workflowId;
          }
-@@ -184,10 +199,11 @@
+@@ -184,12 +200,18 @@
          generationNumber = args.generationNumber;
        }
  
@@ -294,8 +295,15 @@
 +      const { workflow, logLevel, journalEntries, ok } = loaded;
        const inProgress = journalEntries.filter(({ step }) => step.inProgress);
        const console = createLogger(logLevel);
++      // PATCHES: a run upstream's component finished past the manager, like
++      // a child canceled with its parent, isn't live any more.
++      if (workflow.runResult) {
++        await recordFinished(ctx, migrations, workflowId);
++      }
        if (!ok) {
-@@ -205,7 +221,9 @@
+         console.error(`Failed to load journal for ${workflowId}`);
+         await ctx.runMutation(component.workflow.complete, {
+@@ -205,7 +227,9 @@
          );
          return workflowId;
        }
@@ -306,7 +314,7 @@
          console.log(`Workflow ${workflowId} completed, returning.`);
          return workflowId;
        }
-@@ -224,6 +242,13 @@
+@@ -224,6 +248,13 @@
            `Assertion failed: not blocked but have in-progress journal entry`,
          );
        }
@@ -320,7 +328,7 @@
        const channel = new BaseChannel<StepRequest>(
          workpoolOptions.maxParallelism ?? 10,
        );
-@@ -237,55 +262,29 @@
+@@ -237,55 +268,29 @@
          channel,
          Date.now(),
          workpoolOptions,
@@ -393,7 +401,7 @@
          switch (result.type) {
            case "handlerDone": {
              await ctx.runMutation(component.workflow.complete, {
-@@ -305,6 +304,11 @@
+@@ -305,6 +310,11 @@
          }
        } finally {
          restoreEnvironment();

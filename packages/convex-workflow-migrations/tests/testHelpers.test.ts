@@ -114,6 +114,27 @@ const workflows = {
       await step.awaitEvent({ name: 'downloadDone' });
     },
   }),
+  // Grab now returns { value }, which older code returned bare: a transform that wraps any result, and one that leaves a wrapped one alone.
+  wraps: manager.define({
+    args: {},
+    migrations: [migration('grab-wraps', (h) => h.updateResult(flows.grab, (result) => ({ value: result })))],
+    handler: async (step) => {
+      void ((await step.runMutation(flows.grab, {})) as { value: unknown }).value;
+      await step.awaitEvent({ name: 'downloadDone' });
+    },
+  }),
+  normalizes: manager.define({
+    args: {},
+    migrations: [
+      migration('grab-wraps', (h) =>
+        h.updateResult(flows.grab, (result) => (typeof result === 'object' && result !== null && 'value' in result ? result : { value: result })),
+      ),
+    ],
+    handler: async (step) => {
+      void ((await step.runMutation(flows.grab, {})) as { value: unknown }).value;
+      await step.awaitEvent({ name: 'downloadDone' });
+    },
+  }),
   // Waits on two steps started together, and passes either one's failure on.
   parallel: manager.define({
     args: {},
@@ -232,6 +253,26 @@ test('an empty history without applied ids replays as a run without a record doe
   // Without the migration, the args pause it, as the runtime's do.
   const message = await failure(expectReplays(workflows.withArgUnguarded, [history([], { args: {} })]));
   expect(message).toContain("(args): The workflow's args don't match its args validator");
+});
+
+test('expectReplays and migrate fail an updateResult that changes its own output, since a step can finish on the new code', async () => {
+  // Grab was running across the deploy, and returned on the new code: its result is in the new shape already.
+  const finishedOnNewCode = history([
+    { step: flows.grab, result: { value: 'file' } },
+    { event: 'downloadDone', status: 'running' },
+  ]);
+  const oldShape = history([
+    { step: flows.grab, result: 'file' },
+    { event: 'downloadDone', status: 'running' },
+  ]);
+  const message = await failure(expectReplays(workflows.wraps, [oldShape]));
+  expect(message).toContain(
+    '(migration): Migration "grab-wraps" threw: updateResult(flows:grab): run again on its own output, the update changed it ({"value":"file"} became {"value":{"value":"file"}})',
+  );
+  await expect(migrate(workflows.wraps, finishedOnNewCode)).rejects.toThrow('run again on its own output, the update changed it');
+  await expectReplays(workflows.normalizes, [oldShape, finishedOnNewCode]);
+  expect((await migrate(workflows.normalizes, finishedOnNewCode)).result(flows.grab)).toEqual({ value: 'file' });
+  expect((await migrate(workflows.normalizes, oldShape)).result(flows.grab)).toEqual({ value: 'file' });
 });
 
 test('expectReplays fails an unstable export: the record changed while it was read', async () => {

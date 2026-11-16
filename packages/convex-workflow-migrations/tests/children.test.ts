@@ -28,6 +28,8 @@ const marker = migration('marker', () => {});
 const channelArg = migration('channel-arg', (h) => h.updateWorkflowArgs((args) => ({ ...args, channel: 'default' })));
 /** What upstream's `journal.load` returns for runs a test makes up: entries without a kind, as older upstream versions wrote them, and child workflows. */
 const journals: Record<string, { step: { name: string; args: object; inProgress: boolean; kind?: string; workflowId?: string } }[]> = {};
+/** The made-up runs whose journals are too big to load whole: `journal.load` returns what fit, with `ok: false`. */
+const tooBig = new Set<string>();
 
 const releases = {
   // The parent runs a child, which runs a grandchild; each waits for an event.
@@ -151,7 +153,7 @@ const functions: Record<string, unknown> = {
     handler: async (_ctx, { workflowId }) => {
       const journalEntries = journals[workflowId];
       if (!journalEntries) throw new Error(`Workflow not found: ${workflowId}`);
-      return { journalEntries };
+      return { journalEntries, ok: !tooBig.has(workflowId) };
     },
   }),
 };
@@ -191,6 +193,7 @@ beforeEach(() => {
   deploy('kid', 'kid');
   ran.length = 0;
   for (const id of Object.keys(journals)) delete journals[id];
+  tooBig.clear();
 });
 afterEach(() => vi.useRealTimers());
 
@@ -225,8 +228,78 @@ test("cancelling the parent cancels the child past the manager: the child's paus
   await settle(t, 1_000);
   expect(await status(t, child)).toEqual({ type: 'canceled' });
   expect(await paused(t, child)).toMatchObject({ attempts: 1 });
+  // The manager's cancel marks the records of the children upstream canceled with it finished, so the CLI doesn't list them as running.
+  expect(await record(t, child)).toMatchObject({ live: false });
   await settle(t, 73_000);
   expect(await paused(t, child)).toBeUndefined();
+});
+
+test('fail, cancel and restartFrom on a paused child that upstream canceled with its parent: fail and cancel end the pause, restartFrom throws', async () => {
+  for (const method of ['fail', 'cancel'] as const) {
+    const t = setup();
+    deploy('child', 'child');
+    const { parent, child } = await startParent(t);
+    deploy('child', 'childUnguarded');
+    await send(t, child, 'childDone');
+    // Upstream cancels the child, past the manager: the child stays paused, with a generation that's gone.
+    await t.run((ctx) => ctx.runMutation(components.workflow.workflow.cancel, { workflowId: parent }));
+    await settle(t, 1_000);
+    expect(await status(t, child)).toEqual({ type: 'canceled' });
+    expect(await paused(t, child)).toMatchObject({ attempts: 1 });
+    expect(await record(t, child)).toMatchObject({ live: true });
+    // There's nothing to restart: it throws, and the pause stays.
+    await expect(t.run((ctx) => manager.restartFrom(ctx, child, 0))).rejects.toThrow(
+      `restartFrom: workflow ${child} isn't running in upstream's component any more (it finished, for example canceled with its parent, or was restarted, past the manager), so nothing was restarted.`,
+    );
+    expect(await paused(t, child)).toMatchObject({ attempts: 1 });
+    // fail and cancel keep the run's result, and end the pause.
+    await t.run((ctx) => manager[method](ctx, child));
+    expect(await paused(t, child)).toBeUndefined();
+    expect(await status(t, child)).toEqual({ type: 'canceled' });
+    expect(await record(t, child)).toMatchObject({ live: false });
+    // A finished run that isn't paused: upstream's cancel throws, as it would without this package.
+    await expect(t.run((ctx) => manager.cancel(ctx, child))).rejects.toThrow('Workflow not running');
+    await expect(t.run((ctx) => manager.fail(ctx, child))).rejects.toThrow("isn't paused");
+  }
+});
+
+test("cancel marks finished the live records of the descendants upstream cancels, in batches; a child that finished on its own keeps its children's", async () => {
+  // Far more children than a transaction can read, each with a grandchild, linked as runWorkflow steps link them.
+  const t = setup({ documentsRead: 1_000 });
+  const { runs } = components.workflowMigrations;
+  const ids = Array.from({ length: 1_200 }, (_, i) => `c${i}`);
+  for (let i = 0; i < ids.length; i += FORGET_BATCH) {
+    const batch = ids.slice(i, i + FORGET_BATCH);
+    await t.run(async (ctx) => {
+      await ctx.runMutation(runs.children, { parent: 'p', children: batch.map((workflowId) => ({ workflowId, workflow: 'flows:twig' })) });
+      for (const id of batch) await ctx.runMutation(runs.children, { parent: id, children: [{ workflowId: `${id}g`, workflow: 'flows:twig' }] });
+    });
+  }
+  // c7 completed before the cancel: upstream doesn't cancel it, or its child.
+  await t.run((ctx) => ctx.runMutation(runs.save, { workflowId: 'c7', workflow: 'flows:twig', applied: [], overlay: [], done: true }));
+  await t.run((ctx) => ctx.runMutation(runs.end, { workflowId: 'p', canceled: true }));
+  await settle(t, 5_000);
+  for (const id of ['c0', 'c1199', 'c0g', 'c600g', 'c1199g']) expect(await record(t, id)).toMatchObject({ live: false });
+  expect(await record(t, 'c7')).toMatchObject({ live: false });
+  expect(await record(t, 'c7g')).toMatchObject({ live: true });
+});
+
+test("upstream's restart without from keeps a canceled run's wait running, so the run would block on it: restart works around that", async () => {
+  // This documents upstream's behaviour, which WorkflowManager.restart works around by having upstream delete from that
+  // entry. If upstream fixes its restart, this test fails: then the workaround can go.
+  const t = setup();
+  const id = await t.run((ctx) => manager.start(ctx, flows.waits as Ref, {}));
+  await settle(t);
+  const wait = (await t.run((ctx) => ctx.runQuery(components.workflow.workflow.getStatus, { workflowId: id }))).inProgress.map((entry) => entry._id);
+  expect(wait).toHaveLength(1);
+  await t.run((ctx) => ctx.runMutation(components.workflow.workflow.cancel, { workflowId: id }));
+  await t.run((ctx) => ctx.runMutation(components.workflow.workflow.restart, { workflowId: id }));
+  await settle(t);
+  const after = await t.run((ctx) => ctx.runQuery(components.workflow.workflow.getStatus, { workflowId: id }));
+  // Still the old wait, still running: the restarted run's handler runs return "blocked by" it.
+  expect(after.inProgress.map((entry) => entry._id)).toEqual(wait);
+  expect(after.workflow.runResult).toBeUndefined();
+  expect(ran).toEqual(['grab']);
 });
 
 test("cleaning up a parent deletes its children's and grandchildren's records with its own", async () => {
@@ -338,6 +411,41 @@ test('a run from before adoption has no links: its children come from its journa
   await settle(t, 1_000);
   for (const id of ['c', 'g']) expect(await record(t, id)).toBeNull();
   expect(await paused(t, 'c')).toBeUndefined();
+});
+
+test('a journal too big to load whole names only the children in the part that loaded: forget deletes those, and says so', async () => {
+  const t = setup();
+  const { runs } = components.workflowMigrations;
+  journals.root = [{ step: { name: 'flows:child', args: {}, inProgress: false, kind: 'workflow', workflowId: 'c' } }];
+  tooBig.add('root');
+  await t.run((ctx) => ctx.runMutation(runs.save, { workflowId: 'c', workflow: 'flows:child', applied: [], overlay: [], done: true }));
+  const journal = await t.run(() => createFunctionHandle(flows.journal));
+  const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  await t.run((ctx) => ctx.runMutation(runs.forget, { workflowIds: ['root'], journal }));
+  await settle(t, 1_000);
+  expect(warn.mock.calls.map(([message]) => String(message))).toContain(
+    "Workflow root's journal is too big to load whole: the records of its child workflows past what loaded are left.",
+  );
+  warn.mockRestore();
+  expect(await record(t, 'c')).toBeNull();
+});
+
+test("runs:cleanup, for a run whose workflow is gone, passes the journal handle on: its linked children's unlinked children go too", async () => {
+  const t = setup();
+  const { runs } = components.workflowMigrations;
+  // A gone run with a record, a linked child from before adoption, and that child's unlinked child, named in its journal.
+  journals.linked = [{ step: { name: 'flows:grandchild', args: {}, inProgress: false, kind: 'workflow', workflowId: 'unlinked' } }];
+  await t.run(async (ctx) => {
+    await ctx.runMutation(runs.save, { workflowId: 'gone', workflow: 'flows:parent', applied: [], overlay: [], done: false });
+    await ctx.runMutation(runs.save, { workflowId: 'linked', workflow: 'flows:child', applied: [], overlay: [], done: false });
+    await ctx.runMutation(runs.children, { parent: 'gone', children: [{ workflowId: 'linked', workflow: 'flows:child' }] });
+    await ctx.runMutation(runs.save, { workflowId: 'unlinked', workflow: 'flows:grandchild', applied: [], overlay: [], done: true });
+  });
+  expect(await record(t, 'linked')).toMatchObject({ origin: 'adopted', parent: 'gone' });
+  const journal = await t.run(() => createFunctionHandle(flows.journal));
+  expect(await t.run((ctx) => ctx.runMutation(runs.cleanup, { workflowId: 'gone', journal }))).toBe(1);
+  await settle(t, 1_000);
+  for (const id of ['gone', 'linked', 'unlinked']) expect(await record(t, id)).toBeNull();
 });
 
 test('forget takes at most a batch of runs per call', async () => {

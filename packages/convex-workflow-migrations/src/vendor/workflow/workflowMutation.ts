@@ -36,6 +36,7 @@ import { createWorkflowCtx } from "./workflowContext.js";
 import { ReplayPause } from "../../history.js";
 import {
   loadJournal,
+  recordFinished,
   recordStart,
   RunRecord,
   type WorkflowMigrations,
@@ -206,6 +207,11 @@ export function workflowMutation<
       const { workflow, logLevel, journalEntries, ok } = loaded;
       const inProgress = journalEntries.filter(({ step }) => step.inProgress);
       const console = createLogger(logLevel);
+      // PATCHES: a run upstream's component finished past the manager, like
+      // a child canceled with its parent, isn't live any more.
+      if (workflow.runResult) {
+        await recordFinished(ctx, migrations, workflowId);
+      }
       if (!ok) {
         console.error(`Failed to load journal for ${workflowId}`);
         await ctx.runMutation(component.workflow.complete, {

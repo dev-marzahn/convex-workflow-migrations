@@ -19,7 +19,7 @@ import {
 } from 'convex/server';
 import type { Infer, PropertyValidators, Validator } from 'convex/values';
 
-import { FORGET_BATCH, FORMAT, type vPausedPage, type vPausedRun } from './component/schema.ts';
+import { FORGET_BATCH, FORMAT, isWorkflowNotFound, type vPausedPage, type vPausedRun } from './component/schema.ts';
 import { HistoryView, type OverlayOp, type StepRef } from './history.ts';
 import { checkMigrations, type Migration, type MigrationsComponent, type PauseInfo, recordedStep, type WorkflowMigrations } from './migrations.ts';
 import { REPLAY, type ReplayTarget } from './replay.ts';
@@ -92,9 +92,9 @@ type Definition<ArgsValidator extends PropertyValidators, ReturnsValidator exten
  * position, the call the code made and the step the history has there);
  * `step`, for a mismatch and the throw rules 2 and 3, the position in the
  * history (from 0) for `restartFrom`; when it first paused, how many attempts
- * it has had, and when the next retry is; and `lastError`, why the last
- * attempt didn't complete, if it didn't: its workflow mutation threw, or never
- * finished.
+ * it has had (see `PauseInfo`), and when the next retry is; and `lastError`,
+ * why the last attempt didn't complete, if it didn't: its workflow mutation
+ * threw, or never finished.
  */
 export type PausedRun = Omit<Infer<typeof vPausedRun>, 'workflowId'> & { workflowId: WorkflowId };
 
@@ -106,11 +106,12 @@ export type WorkflowManagerOptions = {
   migrationsComponent: MigrationsComponent;
   /**
    * Called when a run pauses, in the transaction that pauses it, and again
-   * when a retry pauses it for another reason or at another step. `ctx` is
-   * the workflow mutation's: cast it to your app's `MutationCtx` to use your
-   * tables. An error it throws is logged, and what it wrote before is kept;
-   * the run stays paused. Required: a paused run isn't failed, so nothing
-   * else reports it. Pass `null` to opt out.
+   * when a retry pauses it on changed code: for another reason, at another
+   * step, with another number of migrations applied, or, for a mismatch,
+   * with another detail. `ctx` is the workflow mutation's: cast it to your
+   * app's `MutationCtx` to use your tables. An error it throws is logged, and
+   * what it wrote before is kept; the run stays paused. Required: a paused
+   * run isn't failed, so nothing else reports it. Pass `null` to opt out.
    */
   onPause: ((ctx: GenericMutationCtx<GenericDataModel>, info: PauseInfo) => void | Promise<void>) | null;
   workpoolOptions?: WorkpoolOptions;
@@ -213,12 +214,14 @@ export class WorkflowManager extends UpstreamWorkflowManager {
   /**
    * Retries a paused run now, for example after deploying a fix. Returns
    * whether it got past its pause; if not, it stays paused with the new
-   * reason, and its attempts and next retry stay as they were. Throws if the
-   * run isn't paused, and an error from the workflow mutation is thrown too.
-   * One transaction, from an action too.
+   * reason, and its attempts and next retry stay as they were. A run that
+   * upstream's component finished past the manager, for example a child
+   * canceled with its parent, just loses its pause, and that counts as
+   * getting past it. Throws if the run isn't paused, and an error from the
+   * workflow mutation is thrown too. One transaction, from an action too.
    */
   public async resume(ctx: MutationCtx | ActionCtx, workflowId: WorkflowId): Promise<boolean> {
-    return !(await ctx.runMutation(this.migrationsComponent.runs.retry, { workflowId, now: true }));
+    return !(await ctx.runMutation(this.migrationsComponent.runs.resume, { workflowId }));
   }
 
   /**
@@ -236,26 +239,31 @@ export class WorkflowManager extends UpstreamWorkflowManager {
   /**
    * Removes every step of a paused run's history from position `step` on
    * (the `step` that `paused` reports), and retries: those steps run again.
-   * Throws, changing nothing, if the run isn't paused, `step` is past the end
-   * of the history, the history changed since the pause (a release added
-   * migrations, or the step at the paused position changed: `resume`, then
-   * read `paused` again), or the run would still pause. One transaction, from
-   * an action too.
+   * Throws, changing nothing, if the run isn't paused, if `step` is past the
+   * end of the history, if the history changed since the pause (a release
+   * added migrations, the step at the paused position changed, or the run
+   * paused before its migrations had all applied: `resume`, then read
+   * `paused` again), if the run would still pause, or if upstream's component
+   * finished the run past the manager. One transaction, from an action too.
    */
   public async restartFrom(ctx: MutationCtx | ActionCtx, workflowId: WorkflowId, step: number): Promise<void> {
     if (!Number.isInteger(step) || step < 0) throw new Error(`restartFrom: step must be a position in the history, got ${step}.`);
-    await ctx.runMutation(this.migrationsComponent.runs.retry, { workflowId, restartFrom: step });
+    await ctx.runMutation(this.migrationsComponent.runs.resume, { workflowId, restartFrom: step });
   }
 
   /**
    * Completes a paused run as failed, with why it paused as the error, and
    * ends the pause, in the caller's transaction: so it takes a mutation's
-   * ctx, not an action's. `onComplete` runs. Throws, changing nothing, if
+   * ctx, not an action's. `onComplete` runs. A run that upstream's component
+   * finished past the manager, for example a child canceled with its parent,
+   * keeps its result, and only its pause ends. Throws, changing nothing, if
    * the run isn't paused.
    */
   public async fail(ctx: MutationOnlyCtx, workflowId: WorkflowId): Promise<void> {
     if (!('db' in ctx)) throw new Error("fail takes a mutation's ctx: it fails the run and ends its pause in one transaction.");
+    const { workflow } = await ctx.runQuery(this.component.workflow.getStatus, { workflowId });
     const ended = await ctx.runMutation(this.migrationsComponent.runs.end, { workflowId, paused: true });
+    if (workflow.runResult) return;
     const { generationNumber, reason, detail } = ended!;
     await ctx.runMutation(this.component.workflow.complete, {
       workflowId,
@@ -266,11 +274,18 @@ export class WorkflowManager extends UpstreamWorkflowManager {
 
   /**
    * Upstream's `cancel`. A paused run's pause ends too, and its record says
-   * it finished. From an action, those are two transactions.
+   * it finished, as do the records of the child workflows upstream cancels
+   * with it, in scheduled batches. A paused run that upstream's component
+   * finished past the manager, for example a child canceled with its parent,
+   * keeps its result, and only its pause ends. From an action, those are two
+   * transactions.
    */
   public override async cancel(ctx: MutationCtx | ActionCtx, workflowId: WorkflowId): Promise<void> {
+    const { workflow } = await ctx.runQuery(this.component.workflow.getStatus, { workflowId });
+    // Ended past the manager: upstream's cancel would throw "Workflow not running". A run that wasn't paused still throws below.
+    if (workflow.runResult && (await ctx.runMutation(this.migrationsComponent.runs.end, { workflowId }))) return;
     await super.cancel(ctx, workflowId);
-    await ctx.runMutation(this.migrationsComponent.runs.end, { workflowId });
+    await ctx.runMutation(this.migrationsComponent.runs.end, { workflowId, canceled: true });
   }
 
   /**
@@ -279,12 +294,12 @@ export class WorkflowManager extends UpstreamWorkflowManager {
    * added: a position (from 0), a step name or a step reference, which means
    * its last occurrence, as upstream's does. Steps from there on run again,
    * including stand-ins migrations inserted, and the steps before it replay
-   * as they did. See the README's "How it works". Throws if the run is still
-   * running (for a paused one, use `restartFrom`), if `from` is past the end
-   * of the history or names no step, if the journal is too big to load
-   * whole, or if a newer version of this package wrote the run's record.
-   * From an action, the records are updated in transactions before the
-   * restart.
+   * as they did. See the README's "What restart does". Throws, with `from` or
+   * without, if the run is still running (for a paused one, use
+   * `restartFrom`), if the journal is too big to load whole, or if a newer
+   * version of this package wrote the run's record; and if `from` is past
+   * the end of the history or names no step. From an action, the records are
+   * updated in transactions before the restart.
    */
   public override async restart(
     ctx: MutationCtx | ActionCtx,
@@ -297,9 +312,16 @@ export class WorkflowManager extends UpstreamWorkflowManager {
     if (!workflow.runResult) {
       throw new Error(`restart: workflow ${workflowId} is still running.${record?.paused ? ' It is paused: use restartFrom.' : ''}`);
     }
+    // With from or without: the restarted run reads the whole journal, and this version reads the record.
+    if (!ok) throw new Error(`restart: workflow ${workflowId}'s journal is too big to load whole, so its history can't be read.`);
+    if (record && record.format > FORMAT) {
+      throw new Error(`restart: workflow ${workflowId}'s record has format ${record.format}, from a newer version of this package; this one reads ${FORMAT}.`);
+    }
     const entries = journalEntries as JournalEntry[];
+    // A workaround for upstream's restart, which without `from` keeps a journal entry still marked running, as a
+    // canceled run's wait is, so the restarted run would block on it (tests/children.test.ts checks upstream still does).
     const running = entries.some((entry) => entry.step.inProgress);
-    const point = options?.from === undefined && !running ? {} : this.restartPoint(workflowId, options?.from, { entries, ok, args: workflow.args }, record);
+    const point = options?.from === undefined && !running ? {} : this.restartPoint(workflowId, options?.from, { entries, args: workflow.args }, record);
     if (point.deleteFrom !== undefined) {
       // Upstream deletes the child workflows of the entries it deletes, and theirs: their records go too.
       const children = entries.flatMap((entry) =>
@@ -321,14 +343,14 @@ export class WorkflowManager extends UpstreamWorkflowManager {
    * records of the child workflows upstream deletes with it, and of theirs.
    * For a workflow that's already gone, it deletes the record. The run's own
    * record goes in the caller's transaction, from a mutation; the others in
-   * scheduled batches (see the README's "Limits").
+   * scheduled batches (see CONTRIBUTING.md's "Internals").
    */
   public override async cleanup(ctx: MutationCtx | ActionCtx, workflowId: WorkflowId): Promise<boolean> {
     let finished: boolean;
     try {
       finished = (await ctx.runQuery(this.component.workflow.getStatus, { workflowId })).workflow.runResult !== undefined;
     } catch (error) {
-      if (!message(error).includes(`Workflow not found: ${workflowId}`)) throw error;
+      if (!isWorkflowNotFound(error, workflowId)) throw error;
       // Gone already, for example with its parent: only the records are left.
       await ctx.runMutation(this.migrationsComponent.runs.forget, { workflowIds: [workflowId] });
       return false;
@@ -352,18 +374,15 @@ export class WorkflowManager extends UpstreamWorkflowManager {
    * and the step number from which upstream deletes the journal: that of the
    * first journal entry at or after the step, or of an entry still marked
    * running, as a canceled run's wait is, if it comes first, since the run
-   * would wait on it forever otherwise. Throws if it can't restart from there.
+   * would block on it otherwise (a workaround: upstream's restart keeps such
+   * an entry). Throws if it can't restart from there.
    */
   private restartPoint(
     workflowId: WorkflowId,
     from: number | string | StepRef | undefined,
-    run: { entries: JournalEntry[]; ok: boolean; args: unknown },
-    record: { overlay: OverlayOp[]; format: number } | null,
+    run: { entries: JournalEntry[]; args: unknown },
+    record: { overlay: OverlayOp[] } | null,
   ): { id?: string; deleteFrom?: number } {
-    if (!run.ok) throw new Error(`restart: workflow ${workflowId}'s journal is too big to load whole, so its history can't be read.`);
-    if (record && record.format > FORMAT) {
-      throw new Error(`restart: workflow ${workflowId}'s record has format ${record.format}, from a newer version of this package; this one reads ${FORMAT}.`);
-    }
     const history = new HistoryView(run.entries.map(recordedStep), record?.overlay ?? [], run.args);
     let position: number | undefined;
     if (typeof from === 'number') {
@@ -387,5 +406,3 @@ export class WorkflowManager extends UpstreamWorkflowManager {
     return { ...(id === undefined ? {} : { id }), ...(cuts.length === 0 ? {} : { deleteFrom: Math.min(...cuts) }) };
   }
 }
-
-const message = (error: unknown) => (error instanceof Error ? error.message : String(error));

@@ -5,7 +5,7 @@
 import { createFunctionHandle, type GenericDataModel, type GenericMutationCtx, makeFunctionReference } from 'convex/server';
 
 import type { ComponentApi } from './component/_generated/component.js';
-import { FORMAT } from './component/schema.ts';
+import { FORMAT, isWorkflowNotFound } from './component/schema.ts';
 import { type History, HistoryView, type OverlayOp, type PauseReason, type RecordedStep, ReplayPause, sameOverlay } from './history.ts';
 import { argsValid, type Replay } from './replay.ts';
 import type { WorkflowId } from './vendor/workflow/publicTypes.ts';
@@ -55,11 +55,24 @@ export type PauseInfo = {
   workflow: string;
   reason: PauseReason;
   detail: string;
-  /** For a mismatch or a throw: the position in the history (from 0), for `restartFrom`. */
+  /**
+   * The position in the history (from 0), for `restartFrom`: for a mismatch,
+   * where replay stopped matching; for the throw rule 2, the first step not
+   * replayed; for rule 3, the step the handler got last. Unset for rule 5
+   * and the other reasons.
+   */
   step?: number;
-  /** How many attempts have paused the run, this one included: 1 the first time. */
+  /**
+   * How many attempts the run has had: the first pause, and every scheduled
+   * retry and every retry `resumeAll` schedules, each counted when it starts.
+   * `resume` and `restartFrom` don't count. 1 the first time.
+   */
   attempts: number;
-  /** Why the run was paused before this attempt, if it was: `onPause` is called again when the reason or the step changes. */
+  /**
+   * Why the run was paused before, if it was: `onPause` is called again when
+   * the code it paused on changed (another reason, step or number of
+   * migrations applied, or for a mismatch another detail).
+   */
   previousReason?: PauseReason;
 };
 
@@ -97,9 +110,15 @@ export type StoredRecord = {
   /** From `restartFrom`: the position to remove the history from, in the history the pause saw. */
   restartFrom?: number;
   /** The pause `restartFrom`'s position was read from. */
-  pause?: { step?: number; stepId?: string; appliedCount: number };
+  pause?: { reason: PauseReason; step?: number; stepId?: string; appliedCount: number };
   format?: number;
 };
+
+/**
+ * `strict`, for `/test`'s helpers: each `updateResult` runs a second time on
+ * its own output, and throws if that changes it (`HistoryView`).
+ */
+export type PrepareOptions = { strict?: boolean };
 
 /**
  * Builds the history from the journal and the stored overlay and applies the
@@ -109,7 +128,13 @@ export type StoredRecord = {
  * changed since the pause it was read from: a release added migrations, or
  * the paused step moved.
  */
-export function prepareHistory(journal: readonly RecordedStep[], stored: StoredRecord, migrations: readonly Migration[], args: unknown): Prepared {
+export function prepareHistory(
+  journal: readonly RecordedStep[],
+  stored: StoredRecord,
+  migrations: readonly Migration[],
+  args: unknown,
+  options: PrepareOptions = {},
+): Prepared {
   const applied = [...stored.applied];
   const ran: Prepared['ran'] = [];
   if ((stored.format ?? 1) > FORMAT) {
@@ -117,7 +142,7 @@ export function prepareHistory(journal: readonly RecordedStep[], stored: StoredR
     const detail = `The run's record has format ${stored.format}, from a newer version of @dev-marzahn/convex-workflow-migrations; this one reads format ${FORMAT}. Deploy the newer version again.`;
     return { history: new HistoryView(journal, [], args), applied, ran, blocked: new ReplayPause('migrations', detail) };
   }
-  const history = new HistoryView(journal, stored.overlay, args);
+  const history = new HistoryView(journal, stored.overlay, args, options);
   const ids = migrations.map((m) => m.id);
   const blocked = (pause: ReplayPause): Prepared => ({ history, applied, ran, blocked: pause });
   if (applied.length > ids.length || applied.some((id, i) => ids[i] !== id)) {
@@ -158,6 +183,12 @@ export function prepareHistory(journal: readonly RecordedStep[], stored: StoredR
   }
   if (stored.restartFrom !== undefined) {
     const { pause, restartFrom } = stored;
+    if (pause?.reason === 'migration' && pause.appliedCount !== applied.length) {
+      // It paused partway through its migrations, which apply now: `paused` gave no position in this history.
+      throw new Error(
+        `restartFrom: the run paused before its migrations had all applied (a migration threw), so it has no position to restart from yet. Call resume: with the fixed code its migrations apply, and it replays, or pauses again at a position paused reports.`,
+      );
+    }
     if (
       pause &&
       (pause.appliedCount !== applied.length || (pause.step !== undefined && pause.stepId !== undefined && history.idAt(pause.step) !== pause.stepId))
@@ -207,13 +238,14 @@ export function prepareRun(
   migrations: readonly Migration[],
   args: unknown,
   valid: (args: unknown) => boolean,
+  options: PrepareOptions = {},
 ): Prepared {
   const { applied, ...rest } = stored;
-  if (applied !== undefined) return prepareHistory(journal, { ...rest, applied }, migrations, args);
-  if (journal.length > 0) return prepareHistory(journal, { ...rest, applied: [] }, migrations, args);
-  const current = prepareHistory(journal, { ...rest, applied: migrations.map((m) => m.id) }, migrations, args);
+  if (applied !== undefined) return prepareHistory(journal, { ...rest, applied }, migrations, args, options);
+  if (journal.length > 0) return prepareHistory(journal, { ...rest, applied: [] }, migrations, args, options);
+  const current = prepareHistory(journal, { ...rest, applied: migrations.map((m) => m.id) }, migrations, args, options);
   if (current.blocked || valid(current.history.workflowArgs)) return current;
-  return prepareHistory(journal, { ...rest, applied: [] }, migrations, args);
+  return prepareHistory(journal, { ...rest, applied: [] }, migrations, args, options);
 }
 
 /** The migrations that edited the history in this handler run. */
@@ -384,10 +416,21 @@ export async function loadJournal(ctx: MutationCtx, component: WorkflowComponent
   try {
     return await ctx.runQuery(component.journal.load, { workflowId, shortCircuit: true });
   } catch (error) {
-    if (!message(error).includes(`Workflow not found: ${workflowId}`)) throw error;
-    const removed = await ctx.runMutation(migrations.component.runs.cleanup, { workflowId });
+    if (!isWorkflowNotFound(error, workflowId)) throw error;
+    const journal = await createFunctionHandle(component.journal.load);
+    const removed = await ctx.runMutation(migrations.component.runs.cleanup, { workflowId, journal });
     if (removed === 0) throw error;
     console.warn(`Workflow ${workflowId} is gone, so its record in the migrations component was deleted.`);
     return undefined;
   }
+}
+
+/**
+ * For the vendored workflow mutation, called for a run that has finished,
+ * which upstream's component finished past the manager, for example at a
+ * retry of a paused child canceled with its parent: its record stops being
+ * live, so the CLI doesn't list it as running.
+ */
+export async function recordFinished(ctx: MutationCtx, migrations: WorkflowMigrations, workflowId: WorkflowId): Promise<void> {
+  await ctx.runMutation(migrations.component.runs.finished, { workflowId });
 }

@@ -32,15 +32,17 @@ class ReplayOnly extends StepExecutor {
  * Replays the history as the workflow mutation would, with the same
  * `replayHandler`, or, with `replay: false`, only migrates it. The
  * differences: the args are checked without the database, so ids are
- * checked only as strings; a handler run that would fail the run passes
- * unless the history says the run succeeded; and for a run that failed,
- * only a throw before its last recorded step fails, since its own failure
- * came after it.
+ * checked only as strings; each `updateResult` must leave its own output as
+ * it is; a handler run that would fail the run passes unless the history
+ * says the run succeeded; and for a run that failed, only a throw before its
+ * last recorded step fails, since its own failure came after it.
  */
 export async function replayHistory(target: ReplayTarget, recorded: RecordedHistory, replay: boolean): Promise<ReplayOutcome> {
   const stored = { applied: recorded.applied, overlay: recorded.overlay ?? [], ...(recorded.restart === undefined ? {} : { restart: recorded.restart }) };
-  // Without `applied`, as the workflow mutation treats a run whose record doesn't say.
-  const prepared = prepareRun(recorded.steps, stored, target.migrations, recorded.args ?? {}, (args) => argsValid(target.definition, args));
+  // Without `applied`, as the workflow mutation treats a run whose record doesn't say. Strict: each
+  // updateResult must leave a result already in the new shape as it is, which only a test can check.
+  const valid = (args: unknown) => argsValid(target.definition, args);
+  const prepared = prepareRun(recorded.steps, stored, target.migrations, recorded.args ?? {}, valid, { strict: true });
   const { history, ran } = prepared;
   const failed = (pause: ReplayPause): ReplayOutcome => ({
     ok: false,

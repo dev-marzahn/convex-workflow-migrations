@@ -1,7 +1,7 @@
 // Runs on convex-test across simulated releases: `deploy(release)` swaps the
 // function registered as flows:pipeline, as a deploy would.
 import { convexTest } from 'convex-test';
-import { anyApi, componentsGeneric, defineSchema, type FunctionReference, internalMutationGeneric } from 'convex/server';
+import { anyApi, componentsGeneric, defineSchema, type FunctionReference, internalMutationGeneric, mutationGeneric } from 'convex/server';
 import { v } from 'convex/values';
 import { afterEach, beforeEach, expect, test, vi } from 'vite-plus/test';
 
@@ -98,6 +98,15 @@ const releases = {
   // Release 1's change with a migration that does nothing, and then with the same migration fixed.
   noopX: release({ notify: true }, [migration('x', () => {})]),
   fixedX: release({ notify: true }, [migration('x', (h) => h.insertAfter(flows.grab, flows.notify, { result: { at: null } }))]),
+  // Another change without its migration, with noopX's list: it imports where the history has the wait.
+  skipsWaitX: manager.define({
+    args: {},
+    migrations: [migration('x', () => {})],
+    handler: async (step: WorkflowCtx): Promise<void> => {
+      await step.runMutation(flows.grab, {});
+      await step.runMutation(flows.importFiles, {});
+    },
+  }),
   // A migration that throws.
   broken: release({ notify: true }, [
     migration('broken', () => {
@@ -158,12 +167,28 @@ const functions: Record<string, unknown> = {
 };
 const deploy = (name: keyof typeof releases) => void (functions.pipeline = releases[name]);
 
+/** A test-only module of the migrations component: `setFormat` makes a record look like a newer version wrote it. */
+const overrides = {
+  setFormat: mutationGeneric({
+    args: { workflowId: v.string(), format: v.number() },
+    handler: async (ctx, { workflowId, format }) => {
+      const run = await ctx.db
+        .query('runs')
+        .withIndex('workflowId', (q) => q.eq('workflowId', workflowId))
+        .first();
+      await ctx.db.patch('runs', run!._id, { format });
+    },
+  }),
+};
+const setFormat = (components.workflowMigrations as unknown as { overrides: { setFormat: FunctionReference<'mutation'> } }).overrides.setFormat;
+
 function setup() {
   const t = convexTest(defineSchema({}), {
     './_generated/api.ts': async () => ({}),
     './flows.ts': async () => functions,
   });
   migrationsTest.register(t);
+  t.registerComponent('workflowMigrations', migrationsTest.schema, { ...migrationsTest.modules, './component/overrides.ts': async () => overrides });
   return t;
 }
 type T = ReturnType<typeof setup>;
@@ -468,10 +493,13 @@ test('a retry left over from a paused run that was completed ends its pause', as
     await ctx.runMutation(components.workflow.workflow.complete, { workflowId: id, generationNumber: workflow.generationNumber, runResult });
   });
   expect(await paused(t, id)).toMatchObject({ attempts: 1 });
+  expect(await record(t, id)).toMatchObject({ live: true });
   await settle(t, 73_000);
   expect(await paused(t, id)).toBeUndefined();
   expect(await status(t, id)).toEqual({ type: 'failed', error: 'gave up' });
   expect(completions.map((c) => c.result.kind)).toEqual(['failed']);
+  // The workflow mutation found the run finished: its record isn't live any more, so the CLI doesn't list it.
+  expect(await record(t, id)).toMatchObject({ live: false });
 });
 
 test('an overlay over the size limit pauses the run, naming the migration, and saves nothing', async () => {
@@ -485,7 +513,7 @@ test('an overlay over the size limit pauses the run, naming the migration, and s
   expect((await record(t, id))?.overlay).toEqual([]);
 });
 
-test('a retry whose workflow mutation throws counts as another failed attempt', async () => {
+test('a retry whose workflow mutation throws keeps the pause, with the error as lastError', async () => {
   const t = setup();
   const id = await start(t);
   deploy('unguarded');
@@ -504,7 +532,9 @@ test('a retry whose workflow mutation throws counts as another failed attempt', 
   expect(run?.lastError).toContain('The workflow mutation threw: ');
   expect(run?.lastError).toContain('boom');
   expect(run!.nextAttemptAt - run!.at).toBeGreaterThan(400_000); // the next backoff step
-  expect(warn.mock.calls.some(([message]) => String(message).startsWith(`Retrying paused workflow ${id} threw`))).toBe(true);
+  expect(
+    warn.mock.calls.some(([message]) => String(message).startsWith(`Retrying paused workflow ${id}: its workflow mutation threw, so it stays paused`)),
+  ).toBe(true);
   warn.mockRestore();
   // The same pause again: no second onPause, and no previousReason it never saw. resume doesn't count an attempt.
   deploy('unguarded');
@@ -712,6 +742,98 @@ test('onPause is called again when the reason or step changes, with the attempts
   ]);
 });
 
+test('onPause is called again when the code a retry pauses on changed: another number of migrations applied, or another mismatch', async () => {
+  const t = setup();
+  const id = await start(t);
+  deploy('unguarded');
+  await downloadDone(t, id);
+  // The same code again: no alert.
+  await t.run((ctx) => manager.resume(ctx, id));
+  expect(pauses).toHaveLength(1);
+  // A release with a migration that does nothing: the same mismatch, at the same step, with one more migration applied.
+  deploy('noopX');
+  await t.run((ctx) => manager.resume(ctx, id));
+  expect(pauses).toHaveLength(2);
+  expect(pauses[1]).toMatchObject({ reason: 'mismatch', step: 1, detail: pauses[0]!.detail, previousReason: 'mismatch' });
+  await t.run((ctx) => manager.resume(ctx, id));
+  expect(pauses).toHaveLength(2);
+  // The same reason, step and migrations, but the code makes another call there.
+  deploy('skipsWaitX');
+  await t.run((ctx) => manager.resume(ctx, id));
+  expect(pauses).toHaveLength(3);
+  expect(pauses[2]?.detail).toContain('the code calls {"args":{},"kind":"function","name":"flows:importFiles"}');
+});
+
+test('restartFrom after a pause where a migration threw says to resume first, since no position was read', async () => {
+  const t = setup();
+  const id = await start(t);
+  deploy('broken');
+  await downloadDone(t, id);
+  expect(await paused(t, id)).toMatchObject({ reason: 'migration' });
+  expect((await paused(t, id))?.step).toBeUndefined();
+  // Still broken: it would pause again.
+  await expect(t.run((ctx) => manager.restartFrom(ctx, id, 1))).rejects.toThrow('would pause it again (migration)');
+  // Fixed: the migrations apply now, so the pause gave no position in this history.
+  deploy('r1');
+  await expect(t.run((ctx) => manager.restartFrom(ctx, id, 1))).rejects.toThrow(
+    'restartFrom: the run paused before its migrations had all applied (a migration threw), so it has no position to restart from yet. Call resume',
+  );
+  expect(await paused(t, id)).toMatchObject({ reason: 'migration', attempts: 1 });
+  expect(await t.run((ctx) => manager.resume(ctx, id))).toBe(true);
+  await settle(t);
+  expect(await status(t, id)).toEqual(completed);
+});
+
+test('restart without from checks the journal and the record too: a journal too big to load whole, and a record from a newer version', async () => {
+  const t = setup();
+  const id = await start(t);
+  await downloadDone(t, id);
+  expect(await status(t, id)).toEqual(completed);
+  // As upstream's journal.load answers for a journal over its size limit.
+  const tooBig = await t.run(async (ctx) => {
+    const fake = {
+      runQuery: async (ref: FunctionReference<'query', 'public' | 'internal'>, args: Record<string, unknown>) => {
+        const result = (await ctx.runQuery(ref as never, args as never)) as unknown;
+        return typeof result === 'object' && result !== null && 'journalEntries' in result ? { ...result, ok: false } : result;
+      },
+      runMutation: ctx.runMutation,
+    };
+    return await manager.restart(fake as never, id).then(
+      () => 'restarted',
+      (error: Error) => error.message,
+    );
+  });
+  expect(tooBig).toBe(`restart: workflow ${id}'s journal is too big to load whole, so its history can't be read.`);
+  expect(await status(t, id)).toEqual(completed);
+
+  await t.run((ctx) => ctx.runMutation(setFormat, { workflowId: id, format: 2 }));
+  await expect(t.run((ctx) => manager.restart(ctx, id))).rejects.toThrow(
+    `restart: workflow ${id}'s record has format 2, from a newer version of this package; this one reads 1.`,
+  );
+  expect(await status(t, id)).toEqual(completed);
+  expect(await record(t, id)).toMatchObject({ live: false, format: 2 });
+});
+
+test('a record from a newer version: the component refuses to restart or end it, so restart, cancel and fail change nothing', async () => {
+  const t = setup();
+  const id = await start(t);
+  deploy('unguarded');
+  await downloadDone(t, id);
+  await t.run((ctx) => ctx.runMutation(setFormat, { workflowId: id, format: 2 }));
+  const before = await record(t, id);
+  const { runs } = components.workflowMigrations;
+  const newer = `record has format 2, from a newer version of @dev-marzahn/convex-workflow-migrations; this one reads 1.`;
+  await expect(t.run((ctx) => ctx.runMutation(runs.restart, { workflowId: id, workflow: 'flows:pipeline' }))).rejects.toThrow(
+    `restart: workflow ${id}'s ${newer}`,
+  );
+  await expect(t.run((ctx) => ctx.runMutation(runs.end, { workflowId: id }))).rejects.toThrow(`cancel: workflow ${id}'s ${newer}`);
+  await expect(t.run((ctx) => manager.fail(ctx, id))).rejects.toThrow(`fail: workflow ${id}'s ${newer}`);
+  await expect(t.run((ctx) => manager.cancel(ctx, id))).rejects.toThrow(`cancel: workflow ${id}'s ${newer}`);
+  // Upstream's cancel ran, and its onComplete, but the transaction rolled back.
+  expect(await record(t, id)).toEqual(before);
+  expect(await status(t, id)).toMatchObject({ type: 'inProgress' });
+});
+
 test('a migration that throws pauses the run', async () => {
   const t = setup();
   const id = await start(t);
@@ -822,10 +944,10 @@ test('resume and restartFrom throw for a run that is no longer paused, in the sa
   // The scheduled retry resumes it before the calls land.
   await settle(t, 73_000);
   expect(await paused(t, id)).toBeUndefined();
-  await expect(t.run((ctx) => ctx.runMutation(components.workflowMigrations.runs.retry, { workflowId: id, now: true }))).rejects.toThrow(
+  await expect(t.run((ctx) => ctx.runMutation(components.workflowMigrations.runs.resume, { workflowId: id }))).rejects.toThrow(
     `resume: workflow ${id} isn't paused.`,
   );
-  await expect(t.run((ctx) => ctx.runMutation(components.workflowMigrations.runs.retry, { workflowId: id, restartFrom: 0 }))).rejects.toThrow(
+  await expect(t.run((ctx) => ctx.runMutation(components.workflowMigrations.runs.resume, { workflowId: id, restartFrom: 0 }))).rejects.toThrow(
     `restartFrom: workflow ${id} isn't paused.`,
   );
   // A scheduled one just finds nothing to do.

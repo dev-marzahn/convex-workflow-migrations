@@ -218,12 +218,16 @@ export class HistoryView implements History {
    * arguments as the run recorded them, before any `workflowArgs` edit.
    * Operations whose step is gone from the journal are dropped: upstream's
    * `restart({ from })`, which this package's `restart` calls, deletes the
-   * journal from a step on.
+   * journal from a step on. With `strict`, for `/test`'s helpers, each
+   * `updateResult` runs again on its own output and throws if that changes
+   * it: a step can finish on the new code, so its result may already be in
+   * the new shape.
    */
   public constructor(
     private readonly journal: readonly RecordedStep[],
     overlay: readonly OverlayOp[] = [],
     args: unknown = {},
+    private readonly options: { strict?: boolean } = {},
   ) {
     this.order = new Map(journal.map((step, i) => [step.id, i]));
     this.nodes = journal.map((step) => ({ id: step.id, name: step.name, kind: step.kind, args: step.args, argsKnown: true, recorded: step }));
@@ -293,6 +297,15 @@ export class HistoryView implements History {
     const result = update(clone(current.result));
     if (result === undefined || (result as unknown) instanceof Promise)
       throw new Error(`updateResult(${describe(step)}): the update must return the new result.`);
+    if (this.options.strict) {
+      const again = update(clone(result));
+      if (json(again) !== json(result)) {
+        throw new Error(
+          `updateResult(${describe(step)}): run again on its own output, the update changed it (${capDetail(json(result), 1024)} became ${capDetail(json(again), 1024)}). ` +
+            "A step can finish on the new code, so its result may already be in the new shape: leave such a result as it is, for example r => ('size' in r ? r : { ...r, size: null }).",
+        );
+      }
+    }
     this.push({ op: 'rewrite', target: node.id, result: clone(result) });
   }
 
@@ -479,10 +492,23 @@ export class HistoryView implements History {
     return kind === 'function or workflow' ? node.kind === 'function' || node.kind === 'workflow' : node.kind === kind;
   }
 
-  /** Applies and keeps an edit; `edit: false` for the restart's, which no migration made. */
+  /**
+   * Applies and keeps an edit; `edit: false` for the restart's, which no
+   * migration made. A `rewrite` of a step that has one already is merged
+   * into it, the latest value of each field winning, so repeated edits of a
+   * step don't grow the overlay. That's safe because operations name steps by
+   * id, and none reads a step's name, args or result.
+   */
   private push(op: OverlayOp, edit = true): void {
     if (!this.apply(op)) throw new Error(`Assertion failed: ${op.op} of a step that isn't in the history`);
     if (edit) this.edits++;
+    if (op.op !== 'rewrite') return;
+    const earlier = this.ops.find((o): o is Extract<OverlayOp, { op: 'rewrite' }> => o !== op && o.op === 'rewrite' && o.target === op.target);
+    if (!earlier) return;
+    if (op.name !== undefined) earlier.name = op.name;
+    if (op.args !== undefined) earlier.args = op.args;
+    if ('result' in op) earlier.result = op.result;
+    this.dropOp(op);
   }
 
   private dropOp(op: OverlayOp): void {

@@ -401,18 +401,104 @@ test("prepareHistory's restartFrom checks the position still means what the paus
   const log = migration('log', (h) => h.insertAfter({ event: 'downloadDone' }, fn.log, { result: null }));
   const stored = { applied: [], overlay: [] };
   // Paused at the stand-in, position 1, with one migration applied.
-  const pause = { step: 1, stepId: '+1', appliedCount: 1 };
+  const pause = { reason: 'mismatch' as const, step: 1, stepId: '+1', appliedCount: 1 };
   expect(names(prepareHistory(journal(), { ...stored, restartFrom: 1, pause }, [notify], {}).history)).toEqual(['grab']);
   // A release added a migration: the count changed.
   expect(() => prepareHistory(journal(), { ...stored, restartFrom: 1, pause }, [notify, log], {})).toThrow(
     'restartFrom: the history changed since the run paused',
   );
   // The paused step moved: another step is at its position.
-  const moved = { step: 1, stepId: 'j1', appliedCount: 1 };
+  const moved = { ...pause, stepId: 'j1' };
   expect(() => prepareHistory(journal(), { ...stored, restartFrom: 2, pause: moved }, [notify], {})).toThrow('the history changed since the run paused');
   // A pause without a step only checks the count.
-  expect(names(prepareHistory(journal(), { ...stored, restartFrom: 2, pause: { appliedCount: 1 } }, [notify], {}).history)).toEqual(['grab', 'notify']);
+  const noStep = { reason: 'threw' as const, appliedCount: 1 };
+  expect(names(prepareHistory(journal(), { ...stored, restartFrom: 2, pause: noStep }, [notify], {}).history)).toEqual(['grab', 'notify']);
   expect(() => prepareHistory(journal(), { ...stored, restartFrom: 4 }, [notify], {})).toThrow('step must be below 4, got 4');
+  // A migration threw before the others applied: no position was read from this history, so it says to resume first.
+  const partway = { reason: 'migration' as const, appliedCount: 0 };
+  expect(() => prepareHistory(journal(), { ...stored, restartFrom: 1, pause: partway }, [notify], {})).toThrow(
+    'restartFrom: the run paused before its migrations had all applied (a migration threw), so it has no position to restart from yet. Call resume',
+  );
+});
+
+test('rewrites of a step merge into one operation, the latest value of each field winning', () => {
+  const h = new HistoryView(journal(), [{ op: 'rewrite', target: 'j2', name: 'flows:ingest' }]);
+  h.updateArgs(fn.ingest, (args) => ({ ...args, notifiedAt: null }));
+  h.updateResult(fn.ingest, () => 'first');
+  h.insertAfter(fn.grab, fn.notify, { result: null });
+  h.updateResult(fn.ingest, () => 'second');
+  h.rename(fn.ingest, fn.importAll);
+  // One rewrite of j2, where the stored one was, and the insert after it.
+  expect(h.overlay()).toEqual([
+    { op: 'rewrite', target: 'j2', name: 'flows:importAll', args: { grabId: 'g', notifiedAt: null }, result: 'second' },
+    { op: 'insert', id: '+1', where: 'after', anchor: 'j0', name: 'flows:notify', kind: 'function', result: null },
+  ]);
+  // The merged overlay builds the same history as the edits did.
+  const reloaded = new HistoryView(journal(), h.overlay());
+  expect(reloaded.steps).toEqual(h.steps);
+  expect(reloaded.replay(0)).toEqual(h.replay(0));
+  // Each edit counted, merged or not.
+  expect(h.migrateAs(() => h.updateArgs(fn.importAll, (args) => ({ ...args, x: 1 })))).toBe(1);
+  expect(h.overlay()).toHaveLength(2);
+});
+
+test('strict, as /test runs it, an updateResult must leave its own output as it is; at runtime it is not run twice', () => {
+  const wraps = (h: HistoryView) => h.updateResult(fn.grab, (r: unknown) => ({ value: r }));
+  const normalizes = (h: HistoryView) => h.updateResult(fn.grab, (r: unknown) => (typeof r === 'object' && r !== null && 'value' in r ? r : { value: r }));
+  expect(() => wraps(new HistoryView(journal(), [], {}, { strict: true }))).toThrow(
+    'updateResult(flows:grab): run again on its own output, the update changed it ({"value":"grabbed"} became {"value":{"value":"grabbed"}}).',
+  );
+  const strict = new HistoryView(journal(), [], {}, { strict: true });
+  normalizes(strict);
+  expect(strict.result(fn.grab)).toEqual({ value: 'grabbed' });
+  let calls = 0;
+  const runtime = new HistoryView(journal());
+  runtime.updateResult(fn.grab, (r: unknown) => {
+    calls++;
+    return { value: r };
+  });
+  expect([calls, runtime.result(fn.grab)]).toEqual([1, { value: 'grabbed' }]);
+});
+
+test("the README's recipes for moving a step and for changing its kind: remove it, and insert a stand-in with its args and result", () => {
+  // Moving notify after the download, as the README's recipe does.
+  const notifyAfterDownload = migration('notify-after-download', (h) => {
+    const notified = h.steps.find((step) => step.name === 'flows:notify');
+    if (!notified || notified.error !== undefined || !h.has({ event: 'downloadDone' })) return;
+    h.remove(notified);
+    h.insertAfter({ event: 'downloadDone' }, fn.notify, { result: notified.result as never, args: notified.args, atEnd: true });
+  });
+  const notified = done('j1', 'notify', { at: 5 }, { grabId: 'g' });
+  const moved = (steps: RecordedStep[]) => prepareHistory(steps, { applied: [], overlay: [] }, [notifyAfterDownload], {}).history;
+  // Past both: the wait was the last step, so the stand-in needs atEnd.
+  const waited = moved([done('j0', 'grab'), notified, event('j2', 'downloadDone')]);
+  expect(names(waited)).toEqual(['grab', 'downloadDone', 'notify']);
+  expect(waited.replay(0)[2]).toMatchObject({
+    argsKnown: true,
+    standIn: true,
+    step: { args: { grabId: 'g' }, runResult: { kind: 'success', returnValue: { at: 5 } } },
+  });
+  expect(names(moved([done('j0', 'grab'), notified, event('j2', 'downloadDone'), done('j3', 'importFiles')]))).toEqual([
+    'grab',
+    'downloadDone',
+    'notify',
+    'importFiles',
+  ]);
+  // Notified, but the wait isn't in the history: there's no place for it yet, so the run is left to pause.
+  expect(names(moved([done('j0', 'grab'), notified]))).toEqual(['grab', 'notify']);
+  // Changing the kind: grab became a child workflow. The stand-in goes before the step, which then goes.
+  const grabBecomesWorkflow = migration('grab-becomes-workflow', (h) => {
+    const step = h.steps.find((s) => s.name === 'flows:grab' && s.kind === 'function');
+    if (!step || step.status !== 'done' || step.error !== undefined) return;
+    h.insertBefore(step, { workflow: fn.grab }, { result: step.result as never, args: step.args });
+    h.remove(step);
+  });
+  const kind = prepareHistory(journal(), { applied: [], overlay: [] }, [grabBecomesWorkflow], {}).history;
+  expect(kind.steps[0]).toMatchObject({ name: 'flows:grab', kind: 'workflow', result: 'grabbed' });
+  expect(kind.length).toBe(3);
+  // A running step is left alone: the migration applies once it has finished.
+  const { runResult: _, ...running } = done('j0', 'grab');
+  expect(prepareHistory([running], { applied: [], overlay: [] }, [grabBecomesWorkflow], {}).blocked).toBeUndefined();
 });
 
 test("prepareHistory's restart: a step upstream deleted leaves nothing to cut, a step a migration removed pauses", () => {

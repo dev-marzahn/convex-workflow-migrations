@@ -44,14 +44,14 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
       cleanup: FunctionReference<
         "mutation",
         "internal",
-        { workflowId: string },
+        { journal?: string; workflowId: string },
         number,
         Name
       >;
       end: FunctionReference<
         "mutation",
         "internal",
-        { paused?: boolean; workflowId: string },
+        { canceled?: boolean; paused?: boolean; workflowId: string },
         {
           detail: string;
           generationNumber: number;
@@ -63,6 +63,23 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
             | "migrations"
             | "overlay";
         } | null,
+        Name
+      >;
+      finishDescendants: FunctionReference<
+        "mutation",
+        "internal",
+        {
+          from?: { cursor: string | null; workflowId: string };
+          workflowIds: Array<string>;
+        },
+        null,
+        Name
+      >;
+      finished: FunctionReference<
+        "mutation",
+        "internal",
+        { workflowId: string },
+        null,
         Name
       >;
       forget: FunctionReference<
@@ -235,6 +252,13 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         null,
         Name
       >;
+      resume: FunctionReference<
+        "mutation",
+        "internal",
+        { restartFrom?: number; workflowId: string },
+        boolean,
+        Name
+      >;
       resumeAll: FunctionReference<
         "mutation",
         "internal",
@@ -245,12 +269,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
       retry: FunctionReference<
         "mutation",
         "internal",
-        {
-          due?: boolean;
-          now?: boolean;
-          restartFrom?: number;
-          workflowId: string;
-        },
+        { due?: boolean; workflowId: string },
         boolean,
         Name
       >;
