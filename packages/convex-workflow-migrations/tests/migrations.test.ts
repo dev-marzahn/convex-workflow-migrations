@@ -18,14 +18,18 @@ import {
   WorkflowManager,
 } from '../src/index.ts';
 import migrationsTest from '../src/test.ts';
+import { StepExecutor } from '../src/vendor/workflow/step.ts';
 
 const components = componentsGeneric() as unknown as { workflow: WorkflowComponent; workflowMigrations: MigrationsComponent };
 const pauses: PauseInfo[] = [];
 let onPauseThrows = false;
+/** Set by a test: awaited in onPause, while the workflow mutation records the pause. */
+let whilePausing: (() => Promise<void>) | undefined;
 const manager = new WorkflowManager(components.workflow, {
   migrationsComponent: components.workflowMigrations,
-  onPause: (_ctx, info) => {
+  onPause: async (_ctx, info) => {
     pauses.push(info);
+    await whilePausing?.();
     if (onPauseThrows) throw new Error('alerting is down');
   },
 });
@@ -59,6 +63,8 @@ const badStandIn = migration('notify-after-grab', (h) => h.insertAfter(flows.gra
 const fixStandIn = migration('notify-result-has-at', (h) => h.updateResult(flows.notify, () => ({ at: null })));
 // Release 0 plus a required `channel` arg, which publish gets.
 const channelArg = migration('channel-arg', (h) => h.updateWorkflowArgs((args) => ({ ...args, channel: 'default' })));
+/** Set by a test: what the racing release's second branch waits for before it calls a step past the history. */
+let raceCall: Promise<void> | undefined;
 // A stand-in for validate before the import, and one for scan before that, anchored to validate's.
 const validates = migration('validate-before-import', (h) => {
   h.insertBefore(flows.importFiles, flows.validate, { result: 'valid' });
@@ -143,6 +149,23 @@ const releases = {
   channel: withChannel([channelArg]),
   importing: importing(false),
   validating: importing(true),
+  // Release 1, then a Promise.all after the history: one branch throws, which pauses the run (rule 5), and the other calls a step past the history.
+  racing: manager.define({
+    args: {},
+    migrations: [m1],
+    handler: async (step: WorkflowCtx): Promise<void> => {
+      await step.runMutation(flows.grab, {});
+      await step.runMutation(flows.notify, {});
+      await step.awaitEvent({ name: 'downloadDone' });
+      await Promise.all([
+        Promise.reject(new Error('the files are not ready')),
+        (async () => {
+          await raceCall;
+          await step.runMutation(flows.importFiles, {});
+        })(),
+      ]);
+    },
+  }),
   // Release 1's stand-in, which a later release removes.
   notifyRemoved: release({}, [m1, migration('notify-removed', (h) => h.remove(flows.notify))]),
   // Code that stops after grab: shorter than the histories of runs past it.
@@ -254,6 +277,8 @@ beforeEach(() => {
   completions.length = 0;
   onPauseThrows = false;
   onImport = undefined;
+  whilePausing = undefined;
+  raceCall = undefined;
 });
 afterEach(() => vi.useRealTimers());
 
@@ -471,6 +496,29 @@ test('a handler that returns before the end of its history pauses the run', asyn
   expect(run).toMatchObject({ reason: 'mismatch', step: 1 });
   expect(run?.detail).toBe('Journal entry mismatch at step 1: the code returned before it, the history has {"args":{},"kind":"event","name":"downloadDone"}');
   expect(await status(t, id)).toMatchObject({ type: 'inProgress' });
+});
+
+test('a handler run that pauses starts no step, though another branch calls one past the history while the pause is recorded', async () => {
+  const t = setup();
+  const id = await start(t);
+  deploy('racing');
+  // The second branch calls importFiles once the pause has been decided, while the workflow mutation awaits onPause.
+  let pausing!: () => void;
+  raceCall = new Promise<void>((resolve) => (pausing = resolve));
+  whilePausing = async () => {
+    pausing();
+    for (let i = 0; i < 100; i++) await Promise.resolve();
+  };
+  const startSteps = vi.spyOn(StepExecutor.prototype, 'startSteps');
+  await downloadDone(t, id);
+  expect(startSteps.mock.calls.length).toBe(0);
+  startSteps.mockRestore();
+  const run = await paused(t, id);
+  expect(run).toMatchObject({ reason: 'threw' });
+  expect(run?.detail).toBe('The handler threw after migrations "notify-after-grab" changed its history: the files are not ready');
+  expect(await steps(t, id)).toEqual(['grab', 'downloadDone']);
+  expect(ran).toEqual(['grab']);
+  expect(await status(t, id)).toMatchObject({ type: 'inProgress', running: [] });
 });
 
 test("a step's failure after the history fails the run, as before", async () => {

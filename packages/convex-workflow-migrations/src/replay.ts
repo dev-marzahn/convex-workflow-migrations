@@ -138,7 +138,8 @@ export function threwEarly(history: HistoryView, progress: ReplayProgress, error
  * Runs the handler against `replay.history`, racing it against the executor
  * as upstream's workflow mutation does. Returns what upstream's race returns,
  * `handlerDone` or `executorBlocked`, or the `ReplayPause` the run should
- * pause with. Call it inside the replay's environment (`setupEnvironment`).
+ * pause with, after halting the executor, so it starts no step. Call it
+ * inside the replay's environment (`setupEnvironment`).
  */
 export async function replayHandler(
   registered: ReplayDefinition,
@@ -175,7 +176,11 @@ export async function replayHandler(
         editedNow: replay.editedNow,
         ...(replay.recordedOnly === undefined ? {} : { recordedOnly: replay.recordedOnly }),
       });
-      if (pause) throw pause;
+      if (pause) {
+        // Before anything else runs: another branch of the handler, as in a Promise.all, may still call a step.
+        executor.halted = true;
+        throw pause;
+      }
       const message = formatErrorWithStack(error);
       console.error(message);
       runResult = { kind: 'failed', error: message };
@@ -185,7 +190,10 @@ export async function replayHandler(
   try {
     return await Promise.race([handlerWorker(), executor.run()]);
   } catch (error) {
-    if (error instanceof ReplayPause) return error;
+    if (error instanceof ReplayPause) {
+      executor.halted = true;
+      return error;
+    }
     throw error;
   }
 }

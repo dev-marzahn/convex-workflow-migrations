@@ -29,7 +29,7 @@
  
  export type WorkerResult =
    | { type: "handlerDone"; runResult: RunResult }
-@@ -60,16 +69,27 @@
+@@ -60,16 +69,30 @@
  
  export class StepExecutor {
    private journalEntrySize: number;
@@ -38,6 +38,9 @@
 +  private journalEntries: ReplayEntry[];
 +  // PATCHES: whether this handler run started a step past the history.
 +  private started = false;
++  // PATCHES: set by `replayHandler` when the handler run pauses: no step
++  // starts after that, though the handler may still make calls.
++  halted = false;
  
    constructor(
      private workflowId: string,
@@ -58,7 +61,7 @@
    ) {
      this.journalEntrySize = journalEntries.reduce(
        (size, entry) => size + getConvexSize(entry),
-@@ -80,6 +100,8 @@
+@@ -80,6 +103,8 @@
        // This should never happen, but we'll throw an error just in case.
        throw new Error(journalSizeError(this.journalEntrySize, this.workflowId));
      }
@@ -67,7 +70,7 @@
    }
    async run(): Promise<WorkerResult> {
      while (true) {
-@@ -87,6 +109,13 @@
+@@ -87,6 +112,13 @@
        // In the future we can correlate the calls to entries by handle, args,
        // etc. instead of just ordering. As is, the fn order can't change.
        const entry = this.journalEntries.shift();
@@ -81,16 +84,20 @@
        if (entry) {
          this.completeMessage(message, entry);
          continue;
-@@ -97,6 +126,8 @@
+@@ -97,6 +129,12 @@
          const message = await this.receiver.get();
          messages.push(message);
        }
-+      // PATCHES:
++      // PATCHES: a paused handler run starts no step. Nothing reads this
++      // result any more, and the calls stay unresolved.
++      if (this.halted) {
++        return { type: "executorBlocked" };
++      }
 +      this.started = true;
        const entries = await this.startSteps(messages);
        if (entries.every((entry) => entry.step.runResult)) {
          for (let i = 0; i < entries.length; i++) {
-@@ -125,17 +156,33 @@
+@@ -125,17 +163,33 @@
      };
    }
  
@@ -128,7 +135,7 @@
        ? { name: message.name, kind: message.target.kind }
        : {
            name: message.name,
-@@ -145,10 +192,20 @@
+@@ -145,10 +199,20 @@
      const stepJson = JSON.stringify(convexToJson(stepFields));
      const messageJson = JSON.stringify(convexToJson(messageFields));
      if (stepJson !== messageJson) {
@@ -149,7 +156,7 @@
      if (entry.step.runResult === undefined) {
        throw new Error(
          `Assertion failed: no outcome for completed function call`,
-@@ -254,6 +311,9 @@
+@@ -254,6 +318,9 @@
          workpoolOptions: this.workpoolOptions,
        },
      )) as JournalEntry[];

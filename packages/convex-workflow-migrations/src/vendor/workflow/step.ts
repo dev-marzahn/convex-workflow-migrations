@@ -74,6 +74,9 @@ export class StepExecutor {
   private journalEntries: ReplayEntry[];
   // PATCHES: whether this handler run started a step past the history.
   private started = false;
+  // PATCHES: set by `replayHandler` when the handler run pauses: no step
+  // starts after that, though the handler may still make calls.
+  halted = false;
 
   constructor(
     private workflowId: string,
@@ -126,7 +129,11 @@ export class StepExecutor {
         const message = await this.receiver.get();
         messages.push(message);
       }
-      // PATCHES:
+      // PATCHES: a paused handler run starts no step. Nothing reads this
+      // result any more, and the calls stay unresolved.
+      if (this.halted) {
+        return { type: "executorBlocked" };
+      }
       this.started = true;
       const entries = await this.startSteps(messages);
       if (entries.every((entry) => entry.step.runResult)) {
