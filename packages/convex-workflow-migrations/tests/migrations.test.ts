@@ -259,21 +259,23 @@ test('a replay that does not match pauses the run instead of failing it, and ale
   expect(run).toMatchObject({ workflow: 'flows:pipeline', reason: 'mismatch', step: 1, attempts: 1 });
   expect(run?.detail).toContain('Journal entry mismatch at step 1: the code calls {"args":{},"kind":"function","name":"flows:notify"}');
   expect(run?.detail).toContain('the history has {"args":{},"kind":"event","name":"downloadDone"}');
-  expect(run!.nextAttemptAt - run!.at).toBe(60_000);
-  expect(pauses).toEqual([{ workflowId: id, workflow: 'flows:pipeline', reason: 'mismatch', detail: run!.detail }]);
+  // A minute, ±20%.
+  expect(run!.nextAttemptAt - run!.at).toBeGreaterThanOrEqual(48_000);
+  expect(run!.nextAttemptAt - run!.at).toBeLessThanOrEqual(72_000);
+  expect(pauses).toEqual([{ workflowId: id, workflow: 'flows:pipeline', reason: 'mismatch', detail: run!.detail, step: 1, attempts: 1 }]);
 
   // Retried with backoff; still the same code, so still paused, and no second alert.
-  await settle(t, 61_000);
+  await settle(t, 73_000);
   const again = await paused(t, id);
   expect(again).toMatchObject({ attempts: 2, at: run!.at });
-  // The retry ran when it was due (settle advances time in 250ms steps), and the next waits 10 minutes.
-  expect(again!.nextAttemptAt - run!.nextAttemptAt - 600_000).toBeGreaterThanOrEqual(0);
-  expect(again!.nextAttemptAt - run!.nextAttemptAt - 600_000).toBeLessThan(250);
+  // The retry ran when it was due (settle advances time in 250ms steps), and the next waits 10 minutes, ±20%.
+  expect(again!.nextAttemptAt - run!.nextAttemptAt).toBeGreaterThanOrEqual(480_000);
+  expect(again!.nextAttemptAt - run!.nextAttemptAt).toBeLessThan(720_250);
   expect(pauses).toHaveLength(1);
 
   // A release with the migration: the next retry resumes the run.
   deploy('r1');
-  await settle(t, 601_000);
+  await settle(t, 721_000);
   expect(await paused(t, id)).toBeUndefined();
   expect(await status(t, id)).toEqual(completed);
   expect(ran).toEqual(['grab', 'import', 'prepare', 'publish']);
@@ -412,13 +414,16 @@ test('a retry whose workflow mutation throws counts as another failed attempt', 
       throw new Error('boom');
     },
   });
-  await settle(t, 61_000);
+  const warn = vi.spyOn(console, 'warn');
+  await settle(t, 73_000);
   const run = await paused(t, id);
   expect(run).toMatchObject({ reason: 'error', attempts: 2 });
   expect(run?.detail).toContain('The workflow mutation threw: ');
   expect(run?.detail).toContain('boom');
+  expect(warn.mock.calls.some(([message]) => String(message).startsWith(`Retrying paused workflow ${id} threw`))).toBe(true);
+  warn.mockRestore();
   deploy('r1');
-  await settle(t, 601_000);
+  await settle(t, 721_000);
   expect(await status(t, id)).toEqual(completed);
   expect(pauses).toHaveLength(1);
 });
@@ -473,6 +478,55 @@ test('resumeAll retries every paused run of a workflow now; paused() pages and f
   await settle(t, 10_000); // well before the next scheduled retry, a minute after the pause
   for (const id of ids) expect(await status(t, id)).toEqual(completed);
   expect((await t.run((ctx) => manager.paused(ctx))).page).toEqual([]);
+});
+
+test('resumeAll retries each paused run once, spaced out, though each retry pauses it again', async () => {
+  const t = setup();
+  const ids = [await start(t), await start(t), await start(t)];
+  deploy('unguarded');
+  for (const workflowId of ids) await t.run((ctx) => manager.sendEvent(ctx, { workflowId, name: 'downloadDone' }));
+  await settle(t, 10_000);
+  const before = (await t.run((ctx) => manager.paused(ctx))).page;
+  expect(before.map((run) => run.attempts)).toEqual([1, 1, 1]);
+  // Jitter: runs that paused together don't retry together.
+  expect(new Set(before.map((run) => run.nextAttemptAt - run.at)).size).toBeGreaterThan(1);
+
+  // A page of one run per transaction, still on code that doesn't match.
+  await t.run((ctx) => ctx.runMutation(components.workflowMigrations.runs.resumeAll, { numItems: 1 }));
+  await settle(t, 5_000); // well before the scheduled retries
+  const after = (await t.run((ctx) => manager.paused(ctx))).page;
+  expect(after.map((run) => run.attempts)).toEqual([2, 2, 2]);
+});
+
+test('the record of a paused run whose workflow is gone is deleted at its next retry', async () => {
+  // Upstream deletes a child workflow, paused or not, when it cleans up its parent.
+  const t = setup();
+  const [gone, kept] = [await start(t), await start(t)];
+  deploy('unguarded');
+  for (const workflowId of [gone, kept]) await t.run((ctx) => manager.sendEvent(ctx, { workflowId, name: 'downloadDone' }));
+  await settle(t, 10_000);
+  await t.run((ctx) => ctx.runMutation(components.workflow.workflow.cleanup, { workflowId: gone, force: true }));
+  await settle(t, 73_000);
+  expect(await record(t, gone)).toBeNull();
+  expect(await paused(t, kept)).toMatchObject({ attempts: 2 });
+  // A workflow that is gone and has no record still fails as upstream's does.
+  const retryGone = { workflowId: gone, generationNumber: 0 } as unknown as { args: Record<string, unknown> };
+  await expect(t.mutation(pipeline, retryGone)).rejects.toThrow('Workflow not found');
+});
+
+test('onPause is called again when the reason or step changes, with the attempts and the reason before', async () => {
+  const t = setup();
+  const id = await start(t);
+  deploy('unguarded');
+  await downloadDone(t, id);
+  await t.run((ctx) => manager.resume(ctx, id)); // the same pause again: no alert
+  expect(pauses.map((p) => [p.reason, p.attempts, p.previousReason])).toEqual([['mismatch', 1, undefined]]);
+  deploy('badStandIn'); // now it throws on the stand-in's result
+  await t.run((ctx) => manager.resume(ctx, id));
+  expect(pauses.map((p) => [p.reason, p.attempts, p.previousReason])).toEqual([
+    ['mismatch', 1, undefined],
+    ['threw', 3, 'mismatch'],
+  ]);
 });
 
 test('a migration that throws pauses the run', async () => {
@@ -549,7 +603,7 @@ test('fail completes a paused run as failed, and onComplete runs', async () => {
   expect(await paused(t, id)).toBeUndefined();
   await expect(t.run((ctx) => manager.fail(ctx, id))).rejects.toThrow("isn't paused");
   // The scheduled retry finds nothing to do.
-  await settle(t, 61_000);
+  await settle(t, 73_000);
   expect(completions).toHaveLength(1);
 });
 
@@ -584,7 +638,8 @@ test('restart takes a position in the migrated history, and steps from there run
   await t.run((ctx) => manager.restart(ctx, id, { from: 1 })); // the stand-in: notify runs for real now
   await settle(t);
   expect(ran).toEqual(['notify']);
-  expect((await record(t, id))?.overlay).toEqual([]);
+  // The restarts hide the old steps, which stay in upstream's journal; the stand-in is removed.
+  expect((await record(t, id))?.overlay.map((op) => op.op)).toEqual(['insert', 'truncate', 'truncate', 'remove']);
   await downloadDone(t, id);
   expect(ran).toEqual(['notify', 'import {"notifiedAt":1234}', 'transcode', 'publish']);
   expect((await record(t, id))?.applied).toHaveLength(3);
@@ -597,6 +652,34 @@ test('restart takes a position in the migrated history, and steps from there run
   await t.run((ctx) => manager.restart(ctx, id, { from: 'downloadDone' })); // by name
   await settle(t);
   expect(ran).toEqual([]);
+  expect((await record(t, id))?.restart).toBeUndefined();
+});
+
+test('restart stores the step on the record, and a pending migration that inserts before it leaves it on that step', async () => {
+  const t = setup();
+  const id = await start(t);
+  await downloadDone(t, id); // release 0: grab, downloadDone, importFiles, prepare, publish
+  expect(await status(t, id)).toEqual(completed);
+  const [, , , prepare] = await t.run(async (ctx) => (await manager.listSteps(ctx, id)).page.map((s) => s.stepId));
+  deploy('r1'); // its migration inserts notify after grab, so prepare moves from 3 to 4
+
+  ran.length = 0;
+  await t.run((ctx) => manager.restart(ctx, id, { from: 3, startAsync: true }));
+  expect((await record(t, id))?.restart).toBe(prepare);
+  await settle(t);
+  expect(ran).toEqual(['prepare', 'publish']);
+  expect(await status(t, id)).toEqual(completed);
+  const saved = await record(t, id);
+  expect(saved?.restart).toBeUndefined();
+  expect(saved?.applied).toEqual(['notify-after-grab']);
+
+  // Without from, nothing is removed; a step a restart stored and didn't get to is cleared.
+  await t.run((ctx) => ctx.runMutation(components.workflowMigrations.runs.restart, { workflowId: id, workflow: 'flows:pipeline', from: prepare! }));
+  ran.length = 0;
+  await t.run((ctx) => manager.restart(ctx, id));
+  await settle(t);
+  expect(ran).toEqual([]);
+  expect((await record(t, id))?.restart).toBeUndefined();
 });
 
 test('restart throws for a running run, and points a paused one to restartFrom', async () => {

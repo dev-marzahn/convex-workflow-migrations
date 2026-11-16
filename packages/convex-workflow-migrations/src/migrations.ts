@@ -9,7 +9,7 @@ import { FORMAT } from './component/schema.ts';
 import { type History, HistoryView, type OverlayOp, type PauseReason, type RecordedStep, ReplayPause, RESTART, sameOverlay } from './history.ts';
 import type { Replay } from './replay.ts';
 import type { WorkflowId } from './vendor/workflow/publicTypes.ts';
-import type { JournalEntry } from './vendor/workflow/types.ts';
+import type { JournalEntry, WorkflowComponent } from './vendor/workflow/types.ts';
 
 export type { PauseReason } from './history.ts';
 
@@ -47,7 +47,19 @@ export function checkMigrations(migrations: readonly Migration[] | undefined): r
 }
 
 /** What `onPause` is told about a run that paused. */
-export type PauseInfo = { workflowId: WorkflowId; workflow: string; reason: PauseReason; detail: string };
+export type PauseInfo = {
+  workflowId: WorkflowId;
+  /** The workflow's function name. */
+  workflow: string;
+  reason: PauseReason;
+  detail: string;
+  /** For a mismatch or a throw: the position in the history (from 0), for `restartFrom`. */
+  step?: number;
+  /** How many attempts have paused the run, this one included: 1 the first time. */
+  attempts: number;
+  /** Why the run was paused before this attempt, if it was: `onPause` is called again when the reason or the step changes. */
+  previousReason?: PauseReason;
+};
 
 /** What the vendored workflow mutation gets from the manager: the migrations component, the workflow's migrations and `onPause`. */
 export type WorkflowMigrations = {
@@ -74,12 +86,13 @@ const kib = (bytes: number) => `${Math.ceil(bytes / 1024)} KiB`;
 
 /**
  * Builds the history from the journal and the stored overlay and applies the
- * migrations the run hasn't had, in memory. `restart` (from `restartFrom`)
- * then removes every step from that position on.
+ * migrations the run hasn't had, in memory. `restart` then removes every
+ * step from that position on (from `restartFrom`), or from that step on
+ * (from `restart`, by id).
  */
 export function prepareHistory(
   journal: readonly RecordedStep[],
-  stored: { applied: readonly string[]; overlay: readonly OverlayOp[]; restart?: number; format?: number },
+  stored: { applied: readonly string[]; overlay: readonly OverlayOp[]; restart?: number | string; format?: number },
   migrations: readonly Migration[],
   args: unknown,
 ): Prepared {
@@ -115,8 +128,14 @@ export function prepareHistory(
     applied.push(m.id);
   }
   if (stored.restart !== undefined) {
+    // From `restart`, the id of the step it named: where that step is now.
+    const position = typeof stored.restart === 'number' ? stored.restart : history.position(stored.restart);
+    if (position < 0) {
+      const detail = `Can't restart from step ${stored.restart}: a migration removed it. Use restartFrom with a position in the history.`;
+      return blocked(new ReplayPause('migration', detail));
+    }
     try {
-      history.truncate(stored.restart);
+      history.truncate(position);
     } catch (error) {
       return blocked(new ReplayPause('migration', message(error)));
     }
@@ -189,7 +208,7 @@ export class RunRecord implements Replay {
     const overlay = row?.overlay ?? [];
     const prepared = prepareHistory(
       journal.map(recordedStep),
-      { applied, overlay, ...(row?.restart === undefined ? {} : { restart: row.restart }), ...(row?.format === undefined ? {} : { format: row.format }) },
+      { applied, overlay, ...(row?.restart === undefined ? {} : { restart: row.restart }), ...(row ? { format: row.format } : {}) },
       migrations.list,
       args,
     );
@@ -229,13 +248,14 @@ export class RunRecord implements Replay {
   /**
    * Pauses the run: records why, schedules a retry through this workflow
    * mutation's function handle, and calls `onPause` if the run wasn't paused
-   * already. Saves nothing else, so the next attempt migrates again. Logs a
-   * warning on every attempt that pauses.
+   * already, or was for another reason or at another step. Saves nothing
+   * else, so the next attempt migrates again. Logs a warning on every attempt
+   * that pauses.
    */
   public async pause(ctx: MutationCtx, generationNumber: number, cause: ReplayPause, console: Logger): Promise<void> {
     const pause = { reason: cause.reason, detail: cause.detail, ...(cause.position === undefined ? {} : { step: cause.position }) };
     const handle = await createFunctionHandle(makeFunctionReference<'mutation'>(this.workflow));
-    const { first } = await ctx.runMutation(this.migrations.component.runs.pause, {
+    const { notify, attempts, previousReason } = await ctx.runMutation(this.migrations.component.runs.pause, {
       workflowId: this.workflowId,
       workflow: this.workflow,
       ...pause,
@@ -243,11 +263,31 @@ export class RunRecord implements Replay {
       generationNumber,
     });
     console.warn(`Workflow ${this.workflow} (${this.workflowId}) paused (${pause.reason}): ${pause.detail}`);
-    if (!first || !this.migrations.onPause) return;
+    if (!notify || !this.migrations.onPause) return;
     try {
-      await this.migrations.onPause(ctx, { workflowId: this.workflowId, workflow: this.workflow, reason: pause.reason, detail: pause.detail });
+      const info: PauseInfo = { workflowId: this.workflowId, workflow: this.workflow, ...pause, attempts, ...(previousReason ? { previousReason } : {}) };
+      await this.migrations.onPause(ctx, info);
     } catch (error) {
       console.error(`onPause threw for workflow ${this.workflowId}:`, error);
     }
+  }
+}
+
+/**
+ * Upstream's `journal.load`, for the vendored workflow mutation. If the
+ * workflow is gone and the run has a record, for example a paused child
+ * workflow its parent's cleanup deleted, deletes the record and returns
+ * undefined: its retries would otherwise fail forever. Throws upstream's
+ * error for a workflow without a record.
+ */
+export async function loadJournal(ctx: MutationCtx, component: WorkflowComponent, migrations: WorkflowMigrations, workflowId: WorkflowId) {
+  try {
+    return await ctx.runQuery(component.journal.load, { workflowId, shortCircuit: true });
+  } catch (error) {
+    if (!message(error).includes(`Workflow not found: ${workflowId}`)) throw error;
+    const removed = await ctx.runMutation(migrations.component.runs.cleanup, { workflowId });
+    if (removed === 0) throw error;
+    console.warn(`Workflow ${workflowId} is gone, so its record in the migrations component was deleted.`);
+    return undefined;
   }
 }

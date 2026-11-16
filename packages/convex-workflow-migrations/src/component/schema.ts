@@ -63,6 +63,15 @@ export const vPaused = v.object({
   generationNumber: v.number(),
 });
 
+/**
+ * Where the next handler run removes the history from, and the steps after
+ * it run again: a position in the migrated history (`restartFrom`, from the
+ * position `paused` reports), or the id of the step there (`restart`, which
+ * resolves its position before the run's pending migrations apply, so the id
+ * keeps it on the same step).
+ */
+export const vRestart = v.union(v.number(), v.string());
+
 /** The format of the rows this version writes. A row with a higher one is from a newer version. */
 export const FORMAT = 1;
 
@@ -87,13 +96,16 @@ export default defineSchema({
     applied: v.array(v.string()),
     overlay: v.array(vOverlayOp),
     paused: v.optional(vPaused),
-    // Set by `restartFrom` for the handler run it starts: remove every step
-    // from this position of the migrated history on.
-    restart: v.optional(v.number()),
-    // FORMAT when this version wrote the row; missing means 1.
-    format: v.optional(v.number()),
+    restart: v.optional(vRestart),
+    // The FORMAT of the version that wrote the row.
+    format: v.number(),
   })
     .index('workflowId', ['workflowId'])
+    // For `list`, the next one due first.
     .index('paused', ['paused.nextAttemptAt'])
-    .index('workflowPaused', ['workflow', 'paused.nextAttemptAt']),
+    .index('workflowPaused', ['workflow', 'paused.nextAttemptAt'])
+    // For `resumeAll`: a retry that pauses again keeps its `at`, so it
+    // doesn't move past the cursor and get retried twice.
+    .index('pausedAt', ['paused.at'])
+    .index('workflowPausedAt', ['workflow', 'paused.at']),
 });

@@ -74,7 +74,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         { workflowId: string },
         {
           applied: Array<string>;
-          format?: number;
+          format: number;
           overlay: Array<
             | {
                 anchor: string;
@@ -114,7 +114,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
               | "error";
             step?: number;
           };
-          restart?: number;
+          restart?: number | string;
           workflow: string;
         } | null,
         Name
@@ -138,13 +138,31 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           workflow: string;
           workflowId: string;
         },
-        { first: boolean },
+        {
+          attempts: number;
+          notify: boolean;
+          previousReason?:
+            | "mismatch"
+            | "args"
+            | "threw"
+            | "migration"
+            | "migrations"
+            | "overlay"
+            | "error";
+        },
+        Name
+      >;
+      restart: FunctionReference<
+        "mutation",
+        "internal",
+        { from?: string; workflow: string; workflowId: string },
+        null,
         Name
       >;
       resumeAll: FunctionReference<
         "mutation",
         "internal",
-        { cursor?: string | null; workflow?: string },
+        { cursor?: string | null; numItems?: number; workflow?: string },
         null,
         Name
       >;

@@ -11,7 +11,6 @@ import type { RunResult, WorkflowReturnType } from './vendor/workflow/types.ts';
 export type StepKind = Infer<typeof vStepKind>;
 export type OverlayOp = Infer<typeof vOverlayOp>;
 type InsertOp = Extract<OverlayOp, { op: 'insert' }>;
-type RewriteOp = Extract<OverlayOp, { op: 'rewrite' }>;
 
 /** A journal entry, as much of it as a history needs. `runResult` is missing while the step runs. */
 export type RecordedStep = {
@@ -203,7 +202,6 @@ export class HistoryView implements History {
   /** Journal entry id → its position in the journal. */
   private readonly order: ReadonlyMap<string, number>;
   private args: unknown;
-  private argsChanged = false;
   private nextId = 1;
   /** The migration running now, and the operations each one added and the edits it made. */
   private migrating: string | typeof RESTART | undefined;
@@ -298,8 +296,9 @@ export class HistoryView implements History {
   // --------------------------------------------------- for the manager ---
 
   /**
-   * For `restartFrom`: removes every step from `position` on. The journal
-   * entries go in one operation, which leaves entries recorded later alone.
+   * For `restartFrom` and `restart`: removes every step from `position` on.
+   * The journal entries go in one operation, which leaves entries recorded
+   * later alone; upstream's journal keeps them all.
    */
   public truncate(position: number): void {
     const rest = this.nodes.slice(position);
@@ -315,51 +314,6 @@ export class HistoryView implements History {
     } finally {
       this.migrating = undefined;
     }
-  }
-
-  /**
-   * For `restart({ from: position })`: the journal entry upstream's restart
-   * deletes the journal from (none if no recorded step is at or after
-   * `position`), and an overlay that gives the steps before `position` on
-   * the journal that's left. Throws if those steps are all stand-ins, which
-   * have no journal entry to keep their place.
-   */
-  public cut(position: number): { from?: string; overlay: OverlayOp[] } {
-    const kept = this.nodes.slice(0, position);
-    const from = this.nodes.slice(position).find((node) => node.recorded)?.id;
-    const journal = [...this.order.keys()].slice(0, from === undefined ? undefined : this.order.get(from));
-    const firstRecorded = kept.find((node) => node.recorded);
-    if (!firstRecorded && kept.length > 0) {
-      throw new Error(`Can't restart from step ${position}: every step before it was inserted by a migration. Restart from step 0 instead.`);
-    }
-    const ops: OverlayOp[] = [];
-    if (this.argsChanged) ops.push({ op: 'workflowArgs', args: clone(this.args) });
-    // Journal entries the history doesn't show, as ranges.
-    const visible = new Set(kept.map((node) => node.id));
-    for (let i = 0; i < journal.length; i++) {
-      if (visible.has(journal[i]!)) continue;
-      let j = i;
-      while (j + 1 < journal.length && !visible.has(journal[j + 1]!)) j++;
-      ops.push(i === j ? { op: 'remove', target: journal[i]! } : { op: 'truncate', from: journal[i]!, through: journal[j]! });
-      i = j;
-    }
-    let previous: Node | undefined;
-    for (const node of kept) {
-      if (node.recorded) {
-        const rewrite: RewriteOp = { op: 'rewrite', target: node.id };
-        if (node.name !== node.recorded.name) rewrite.name = node.name;
-        if (json(node.args) !== json(node.recorded.args)) rewrite.args = clone(node.args);
-        if (node.result) rewrite.result = clone(node.result.value);
-        if (Object.keys(rewrite).length > 2) ops.push(rewrite);
-      } else {
-        const anchor = previous ? { where: 'after' as const, anchor: previous.id } : { where: 'before' as const, anchor: firstRecorded!.id };
-        const insert: InsertOp = { op: 'insert', id: node.id, ...anchor, name: node.name, kind: node.kind, result: clone(node.standIn!.result) };
-        if (node.argsKnown) insert.args = clone(node.args);
-        ops.push(insert);
-      }
-      previous = node;
-    }
-    return { ...(from === undefined ? {} : { from }), overlay: ops };
   }
 
   /** The position of the last step named `name` or matching `ref`, for `restart({ from })`; -1 if there's none. */
@@ -540,7 +494,6 @@ export class HistoryView implements History {
     switch (op.op) {
       case 'workflowArgs':
         this.args = op.args;
-        this.argsChanged = true;
         break;
       case 'truncate': {
         const from = this.order.get(op.from);

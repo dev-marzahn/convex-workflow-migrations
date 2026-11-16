@@ -208,50 +208,19 @@ test('updateWorkflowArgs gives replay new workflow args, and keeps one operation
   expect(() => h.updateWorkflowArgs(() => undefined)).toThrow('updateWorkflowArgs: the update must return the new args.');
 });
 
-test('cut gives the journal entry a restart deletes from, and an overlay for the steps before it', () => {
-  const h = new HistoryView(journal(), [], { grabId: 'g' });
-  h.updateWorkflowArgs(() => ({ grabId: 'g', quality: 'hd' }));
-  h.insertBefore({ event: 'downloadDone' }, fn.notify, { result: { at: null } }); // anchored to the wait
-  h.rename(fn.grab, fn.fetch);
-  h.insertAfter({ event: 'downloadDone' }, fn.check, { result: 1, args: { x: 1 } });
-
-  // From the wait: it and import are deleted, so notify is anchored again, after fetch.
-  const cut = h.cut(2);
-  expect(cut.from).toBe('j1');
-  const kept = new HistoryView(journal().slice(0, 1), cut.overlay, { grabId: 'g' });
-  expect(names(kept)).toEqual(['fetch', 'notify']);
-  expect(kept.result(fn.notify)).toEqual({ at: null });
-  expect(kept.workflowArgs).toEqual({ grabId: 'g', quality: 'hd' });
-
-  // From the stand-in after the wait: import is deleted, and the stand-in goes.
-  const late = h.cut(3);
-  expect(late.from).toBe('j2');
-  expect(names(new HistoryView(journal().slice(0, 2), late.overlay))).toEqual(['fetch', 'notify', 'downloadDone']);
-
-  // Past the end: nothing is deleted, and the overlay gives the same history.
-  const all = h.cut(h.length);
-  expect(all.from).toBeUndefined();
-  expect(names(new HistoryView(journal(), all.overlay))).toEqual(names(h));
-});
-
-test('cut keeps journal entries the history hides hidden, as ranges', () => {
-  const steps = [done('j0', 'grab'), done('j1', 'a'), done('j2', 'b'), done('j3', 'c'), done('j4', 'd'), done('j5', 'e')];
-  const h = new HistoryView(steps);
-  h.truncate(1); // hides j1..j5
-  const later = new HistoryView([...steps, done('j6', 'f'), done('j7', 'g')], h.overlay());
-  expect(names(later)).toEqual(['grab', 'f', 'g']);
-  later.remove(later.steps[1]!);
-  const cut = later.cut(1); // from g
-  expect(cut.from).toBe('j7');
-  expect(cut.overlay).toEqual([{ op: 'truncate', from: 'j1', through: 'j6' }]);
-  expect(names(new HistoryView([...steps, done('j6', 'f')], cut.overlay))).toEqual(['grab']);
-});
-
-test('cut throws when every step before the position is a stand-in', () => {
+test('truncate from a stand-in that leads the history, and position and idAt find steps by id', () => {
   const h = new HistoryView(journal());
   h.insertBefore(fn.grab, fn.first, { result: null });
-  expect(h.cut(0)).toEqual({ from: 'j0', overlay: [] });
-  expect(() => h.cut(1)).toThrow("Can't restart from step 1: every step before it was inserted by a migration.");
+  expect(h.idAt(0)).toBe('+1');
+  expect(h.idAt(4)).toBeUndefined();
+  expect(h.position('j1')).toBe(2);
+  expect(h.position('gone')).toBe(-1);
+  h.truncate(0);
+  expect(names(h)).toEqual([]);
+  expect(h.overlay().slice(1)).toEqual([
+    { op: 'truncate', from: 'j0', through: 'j2' },
+    { op: 'remove', target: '+1' },
+  ]);
 });
 
 test('lastPosition finds the last step by name or reference', () => {

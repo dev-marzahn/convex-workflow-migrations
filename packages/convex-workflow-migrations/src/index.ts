@@ -3,7 +3,8 @@ import type { WorkpoolOptions } from '@convex-dev/workpool';
 import type { GenericActionCtx, GenericDataModel, GenericMutationCtx, GenericQueryCtx, RegisteredMutation } from 'convex/server';
 import type { PropertyValidators, Validator } from 'convex/values';
 
-import { HistoryView, type StepRef } from './history.ts';
+import { FORMAT } from './component/schema.ts';
+import { HistoryView, type OverlayOp, type StepRef } from './history.ts';
 import {
   checkMigrations,
   type Migration,
@@ -117,7 +118,7 @@ export type WorkflowManagerOptions = {
  * ```
  */
 export class WorkflowManager extends UpstreamWorkflowManager {
-  public readonly migrationsComponent: MigrationsComponent;
+  private readonly migrationsComponent: MigrationsComponent;
   private readonly onPause: WorkflowMigrations['onPause'];
 
   public constructor(component: WorkflowComponent, options: WorkflowManagerOptions) {
@@ -196,19 +197,20 @@ export class WorkflowManager extends UpstreamWorkflowManager {
   }
 
   /**
-   * Completes a paused run as failed, with why it paused as the error.
-   * `onComplete` runs. Throws if the run isn't paused. From an action,
-   * ending the pause and failing the run are two transactions.
+   * Completes a paused run as failed, with why it paused as the error, then
+   * ends the pause. `onComplete` runs. Throws if the run isn't paused. From
+   * an action, those are two transactions; if the second doesn't happen, the
+   * run's next retry ends the pause.
    */
   public async fail(ctx: MutationCtx | ActionCtx, workflowId: WorkflowId): Promise<void> {
     const paused = await this.expectPaused(ctx, workflowId, 'fail');
-    await ctx.runMutation(this.migrationsComponent.runs.unpause, { workflowId });
     const { workflow } = await ctx.runQuery(this.component.workflow.getStatus, { workflowId });
     await ctx.runMutation(this.component.workflow.complete, {
       workflowId,
       generationNumber: workflow.generationNumber,
       runResult: { kind: 'failed', error: `Paused (${paused.reason}): ${paused.detail}` },
     });
+    await ctx.runMutation(this.migrationsComponent.runs.unpause, { workflowId });
   }
 
   /**
@@ -222,12 +224,15 @@ export class WorkflowManager extends UpstreamWorkflowManager {
 
   /**
    * Upstream's `restart` of a finished run, with `from` in the run's history
-   * as its migrations left it: a position (from 0), a step name or a step
-   * reference, which means its last occurrence, as upstream's does. Steps
-   * from there on run again, including steps migrations inserted, and the
-   * steps before it replay as they did. Throws if the run is still running;
-   * for a paused one, use `restartFrom`. From an action, the run's record is
-   * updated in a transaction before the restart.
+   * as its last handler run left it: a position (from 0), a step name or a
+   * step reference, which means its last occurrence, as upstream's does.
+   * Steps from there on run again, including steps migrations inserted, and
+   * the steps before it replay as they did. Like `restartFrom`, it stores the
+   * step on the run's record, and the restarted run's first handler run
+   * applies any pending migrations, then removes the history from that step
+   * on. Upstream's journal keeps every entry. Throws if the run is still
+   * running; for a paused one, use `restartFrom`. From an action, the record
+   * is updated in a transaction before the restart.
    */
   public override async restart(
     ctx: MutationCtx | ActionCtx,
@@ -235,30 +240,21 @@ export class WorkflowManager extends UpstreamWorkflowManager {
     options?: { from?: number | string | StepRef; startAsync?: boolean },
   ): Promise<void> {
     const startAsync = options?.startAsync === undefined ? {} : { startAsync: options.startAsync };
-    const { workflow, journalEntries } = await ctx.runQuery(this.component.journal.load, { workflowId });
+    const { workflow, journalEntries, ok } = await ctx.runQuery(this.component.journal.load, { workflowId });
     const record = await ctx.runQuery(this.migrationsComponent.runs.load, { workflowId });
     if (!workflow.runResult) {
       throw new Error(`restart: workflow ${workflowId} is still running.${record?.paused ? ' It is paused: use restartFrom.' : ''}`);
     }
-    const from = options?.from;
-    if (from === undefined) return await super.restart(ctx, workflowId, startAsync);
-    const entries = journalEntries as JournalEntry[];
-    const history = new HistoryView(entries.map(recordedStep), record?.overlay ?? [], workflow.args);
-    let position: number;
-    if (typeof from === 'number') {
-      if (!Number.isInteger(from) || from < 0) throw new Error(`restart: from must be a position in the history, got ${from}.`);
-      position = from;
-    } else {
-      position = history.lastPosition(from);
-      if (position < 0)
-        throw new Error(`restart: workflow ${workflowId}'s history has no step ${typeof from === 'string' ? `"${from}"` : 'that matches from'}.`);
+    const from = options?.from === undefined ? undefined : this.restartStep(workflowId, options.from, { journalEntries, ok, args: workflow.args }, record);
+    // Without `from`, this clears a step a restart from an action stored but didn't get to.
+    if (record || from !== undefined) {
+      await ctx.runMutation(this.migrationsComponent.runs.restart, {
+        workflowId,
+        workflow: record?.workflow ?? workflow.name ?? '',
+        ...(from === undefined ? {} : { from }),
+      });
     }
-    const cut = history.cut(position);
-    if (record) {
-      await ctx.runMutation(this.migrationsComponent.runs.save, { workflowId, workflow: record.workflow, applied: record.applied, overlay: cut.overlay });
-    }
-    const stepNumber = cut.from === undefined ? undefined : entries.find((entry) => entry._id === cut.from)!.stepNumber;
-    await super.restart(ctx, workflowId, { ...startAsync, ...(stepNumber === undefined ? {} : { from: stepNumber }) });
+    await super.restart(ctx, workflowId, startAsync);
   }
 
   /**
@@ -269,6 +265,33 @@ export class WorkflowManager extends UpstreamWorkflowManager {
     const removed = await super.cleanup(ctx, workflowId);
     if (removed) await ctx.runMutation(this.migrationsComponent.runs.cleanup, { workflowId });
     return removed;
+  }
+
+  /** The id of the step `restart` restarts from, or undefined past the end of the history. Throws if it can't restart from there. */
+  private restartStep(
+    workflowId: WorkflowId,
+    from: number | string | StepRef,
+    run: { journalEntries: unknown[]; ok: boolean; args: unknown },
+    record: { overlay: OverlayOp[]; format: number } | null,
+  ): string | undefined {
+    if (!run.ok) throw new Error(`restart: workflow ${workflowId}'s journal is too big to load whole, so its history can't be read.`);
+    if (record && record.format > FORMAT) {
+      throw new Error(`restart: workflow ${workflowId}'s record has format ${record.format}, from a newer version of this package; this one reads ${FORMAT}.`);
+    }
+    const history = new HistoryView((run.journalEntries as JournalEntry[]).map(recordedStep), record?.overlay ?? [], run.args);
+    let position: number;
+    if (typeof from === 'number') {
+      if (!Number.isInteger(from) || from < 0) throw new Error(`restart: from must be a position in the history, got ${from}.`);
+      position = from;
+    } else {
+      position = history.lastPosition(from);
+      if (position < 0)
+        throw new Error(`restart: workflow ${workflowId}'s history has no step ${typeof from === 'string' ? `"${from}"` : 'that matches from'}.`);
+    }
+    const id = history.idAt(position);
+    // Throws now, rather than in the restarted run, if a step from there on is still running.
+    history.truncate(position);
+    return id;
   }
 
   private async expectPaused(ctx: MutationCtx | ActionCtx, workflowId: WorkflowId, action: string) {
