@@ -174,6 +174,10 @@ test("expectReplays passes a failed run's rethrow after its history, and reports
   await expectReplays(t, ref('rethrows'), [failed, { ...failed, outcome: undefined }]);
   const message = await failure(expectReplays(t, ref('rethrows'), [{ ...failed, outcome: 'success' }]));
   expect(message).toContain('(threw): The run succeeded, but the handler now throws after replaying its history: grab failed');
+  // The migrations edit this history (a stand-in after grab), so a running run would pause on the throw; this one failed with it.
+  await expectReplays(t, ref('current'), [failed]);
+  const running = await failure(expectReplays(t, ref('current'), [{ ...failed, outcome: undefined }]));
+  expect(running).toContain('(threw): The handler threw after migrations "notify-after-grab" changed its history: grab failed');
 });
 
 test('expectReplays fails a truncated history', async () => {
