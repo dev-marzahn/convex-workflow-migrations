@@ -84,7 +84,7 @@ async function run(
 /**
  * Replays each history, with the workflow's migrations, against its current
  * handler, in convex-test. Runs no steps: replay stops where the history
- * ends, at a running step, or at a step a migration inserted with `runLate`.
+ * ends or at a running step.
  * Throws if a history doesn't replay, with the history, the position, and the
  * call the code made and the step the history has there.
  */

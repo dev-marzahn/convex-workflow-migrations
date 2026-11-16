@@ -64,16 +64,6 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
                 result: any;
                 where: "after" | "before";
               }
-            | {
-                anchor: string;
-                args: any;
-                executedAs?: string;
-                id: string;
-                kind: "function" | "workflow" | "event" | "sleep";
-                name: string;
-                op: "insertLate";
-                where: "after" | "before";
-              }
             | { op: "remove"; target: string }
             | { args?: any; name?: string; op: "rewrite"; target: string }
           >;
@@ -100,33 +90,6 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           generationNumber: number;
           handle: string;
           reason: "mismatch" | "migration" | "migrations" | "error";
-          record?: {
-            applied: Array<string>;
-            overlay: Array<
-              | {
-                  anchor: string;
-                  args?: any;
-                  id: string;
-                  kind: "function" | "workflow" | "event" | "sleep";
-                  name: string;
-                  op: "insert";
-                  result: any;
-                  where: "after" | "before";
-                }
-              | {
-                  anchor: string;
-                  args: any;
-                  executedAs?: string;
-                  id: string;
-                  kind: "function" | "workflow" | "event" | "sleep";
-                  name: string;
-                  op: "insertLate";
-                  where: "after" | "before";
-                }
-              | { op: "remove"; target: string }
-              | { args?: any; name?: string; op: "rewrite"; target: string }
-            >;
-          };
           step?: number;
           workflow: string;
           workflowId: string;
@@ -155,16 +118,6 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
                 name: string;
                 op: "insert";
                 result: any;
-                where: "after" | "before";
-              }
-            | {
-                anchor: string;
-                args: any;
-                executedAs?: string;
-                id: string;
-                kind: "function" | "workflow" | "event" | "sleep";
-                name: string;
-                op: "insertLate";
                 where: "after" | "before";
               }
             | { op: "remove"; target: string }

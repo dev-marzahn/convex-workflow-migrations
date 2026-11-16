@@ -26,7 +26,6 @@ const functions = {
   notify: noop,
   prepare: noop,
   transcode: noop,
-  audit: noop,
   current: manager.define({ args: {}, migrations: [notifyAfterGrab, prepareBecomesTranscode], handler: pipeline({ notify: true, transcode: true }) }),
   unguarded: manager.define({ args: {}, handler: pipeline({ notify: true, transcode: false }) }),
   // A stand-in whose result the handler can't use.
@@ -34,15 +33,6 @@ const functions = {
     args: {},
     migrations: [migration('notify-after-grab', (h) => h.insertAfter(flows.grab, flows.notify, { result: null }))],
     handler: pipeline({ notify: true, transcode: false }),
-  }),
-  late: manager.define({
-    args: {},
-    migrations: [migration('audit', (h) => h.insertAfter(flows.grab, flows.audit, { runLate: true, args: {} }))],
-    handler: async (step) => {
-      await step.runMutation(flows.grab, {});
-      await step.runMutation(flows.audit, {});
-      await step.awaitEvent({ name: 'downloadDone' });
-    },
   }),
 };
 
@@ -103,10 +93,6 @@ test('expectReplays reports the history, the position, and both calls when one d
 
 test('expectReplays reports a handler that throws on a stand-in result', async () => {
   await expect(expectReplays(setup(), ref('badStandIn'), [release0Waiting])).rejects.toThrow('The handler threw');
-});
-
-test('expectReplays stops at a step a migration inserted with runLate', async () => {
-  await expectReplays(setup(), ref('late'), [release0Waiting, release0Done]);
 });
 
 test('expectReplays reports a migration that edits a running step', async () => {

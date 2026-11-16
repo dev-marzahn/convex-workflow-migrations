@@ -118,18 +118,6 @@ export class StepExecutor {
         this.checkMessage(message, entry);
         return { type: "executorBlocked" };
       }
-      // PATCHES: a step a migration inserted with runLate runs now, for real,
-      // and its journal entry takes this position from now on.
-      if (entry?.late) {
-        this.checkMessage(message, entry);
-        const [started] = await this.startSteps([message]);
-        entry.late(started._id);
-        if (!started.step.runResult) {
-          return { type: "executorBlocked" };
-        }
-        message.resolve(started.step.runResult);
-        continue;
-      }
       if (entry) {
         this.completeMessage(message, entry);
         continue;

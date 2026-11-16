@@ -64,22 +64,6 @@ test('a stand-in without args is matched on its name and kind only, and sees the
   expect(replay[2]!.step.runResult).toEqual({ kind: 'success', returnValue: 1 });
 });
 
-test('a runLate step is pending until replay issues it, then takes its journal entry', () => {
-  const h = new HistoryView(journal());
-  h.insertAfter(fn.grab, fn.audit, { runLate: true, args: { why: 'backfill' } });
-  expect(names(h)).toEqual(['grab', 'audit (pending)', 'downloadDone', 'importFiles']);
-  const entry = h.replay(500)[1]!;
-  expect(entry.step).toMatchObject({ name: 'flows:audit', args: { why: 'backfill' }, inProgress: false, startedAt: 500 });
-  entry.late!('j3');
-  expect(h.lateStepRan).toBe(true);
-
-  // The next handler run: the entry was appended to the journal, and sits where the step was inserted.
-  const again = new HistoryView([...journal(), done('j3', 'audit', 'audited', { why: 'backfill' })], h.overlay());
-  expect(names(again)).toEqual(['grab', 'audit', 'downloadDone', 'importFiles']);
-  expect(again.result(fn.audit)).toBe('audited');
-  expect(again.replay(0)[1]!.late).toBeUndefined();
-});
-
 test('remove, rename and updateArgs', () => {
   const h = new HistoryView(journal());
   h.rename(fn.importFiles, fn.ingest);
@@ -142,10 +126,9 @@ test('rename keeps the kind of step', () => {
   expect(h.has({ event: 'filesReady' })).toBe(true);
 });
 
-test('insert needs a result or runLate with args', () => {
+test('insert needs a result', () => {
   const h = new HistoryView(journal());
-  expect(() => h.insertAfter(fn.grab, fn.notify, {} as never)).toThrow('pass { result } for a stand-in, or { runLate: true, args }');
-  expect(() => h.insertAfter(fn.grab, fn.notify, { runLate: true } as never)).toThrow('needs its args');
+  expect(() => h.insertAfter(fn.grab, fn.notify, {} as never)).toThrow('insertAfter(flows:grab, flows:notify): pass { result } for the stand-in.');
 });
 
 test('later edits see earlier ones, and edit steps that earlier ones inserted', () => {
@@ -174,15 +157,6 @@ test('operations on steps a restart deleted are dropped', () => {
   const restarted = new HistoryView(journal().slice(0, 1), h.overlay());
   expect(names(restarted)).toEqual(['grab', 'notify']);
   expect(restarted.overlay().map((op) => op.op)).toEqual(['insert']);
-});
-
-test('a late step whose entry a restart deleted runs again', () => {
-  const overlay = [
-    { op: 'insertLate' as const, id: '+1', where: 'after' as const, anchor: 'j0', name: 'flows:audit', kind: 'function' as const, args: {}, executedAs: 'j9' },
-  ];
-  const h = new HistoryView(journal(), overlay);
-  expect(names(h)).toEqual(['grab', 'audit (pending)', 'downloadDone', 'importFiles']);
-  expect(h.overlay()[0]).not.toHaveProperty('executedAs');
 });
 
 test('truncate removes every step from a position on', () => {

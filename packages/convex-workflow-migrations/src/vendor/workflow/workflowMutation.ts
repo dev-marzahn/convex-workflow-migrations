@@ -322,8 +322,7 @@ export function workflowMutation<
         };
         // PATCHES: a replay that doesn't match the history pauses the run.
         // Calls are matched in order and new steps start only after the last
-        // recorded one, so the pause commits no partial work. The exception
-        // is a step a migration inserted with runLate, which the pause keeps.
+        // step of the history, so a pause commits nothing.
         let result: WorkerResult;
         try {
           result = await Promise.race([handlerWorker(), executorWorker()]);

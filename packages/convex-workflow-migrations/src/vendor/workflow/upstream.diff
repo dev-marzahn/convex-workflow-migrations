@@ -71,7 +71,7 @@
    }
    async run(): Promise<WorkerResult> {
      while (true) {
-@@ -87,6 +111,25 @@
+@@ -87,6 +111,13 @@
        // In the future we can correlate the calls to entries by handle, args,
        // etc. instead of just ordering. As is, the fn order can't change.
        const entry = this.journalEntries.shift();
@@ -82,22 +82,10 @@
 +        this.checkMessage(message, entry);
 +        return { type: "executorBlocked" };
 +      }
-+      // PATCHES: a step a migration inserted with runLate runs now, for real,
-+      // and its journal entry takes this position from now on.
-+      if (entry?.late) {
-+        this.checkMessage(message, entry);
-+        const [started] = await this.startSteps([message]);
-+        entry.late(started._id);
-+        if (!started.step.runResult) {
-+          return { type: "executorBlocked" };
-+        }
-+        message.resolve(started.step.runResult);
-+        continue;
-+      }
        if (entry) {
          this.completeMessage(message, entry);
          continue;
-@@ -125,36 +168,48 @@
+@@ -125,36 +156,48 @@
      };
    }
  
@@ -279,10 +267,11 @@
        let workflowId: WorkflowId, generationNumber: number;
  
        // Direct call { args: {...}, onComplete?, context?, startAsync? }
-@@ -224,6 +242,19 @@
+@@ -223,6 +241,19 @@
+           !journalEntry.step.inProgress,
            `Assertion failed: not blocked but have in-progress journal entry`,
          );
-       }
++      }
 +      // PATCHES: load the run's record and apply its pending migrations, in
 +      // memory. A run they can't be applied to pauses, and returns normally
 +      // so the workpool doesn't fail it.
@@ -295,10 +284,9 @@
 +      if (run.blocked) {
 +        await run.pause(ctx, generationNumber, run.blocked, console);
 +        return workflowId;
-+      }
+       }
        const channel = new BaseChannel<StepRequest>(
          workpoolOptions.maxParallelism ?? 10,
-       );
 @@ -237,11 +268,15 @@
          channel,
          Date.now(),
@@ -315,15 +303,14 @@
        try {
          const handlerWorker = async (): Promise<WorkerResult> => {
            let runResult: RunResult;
-@@ -285,7 +320,20 @@
+@@ -285,7 +320,19 @@
          const executorWorker = async (): Promise<WorkerResult> => {
            return await executor.run();
          };
 -        const result = await Promise.race([handlerWorker(), executorWorker()]);
 +        // PATCHES: a replay that doesn't match the history pauses the run.
 +        // Calls are matched in order and new steps start only after the last
-+        // recorded one, so the pause commits no partial work. The exception
-+        // is a step a migration inserted with runLate, which the pause keeps.
++        // step of the history, so a pause commits nothing.
 +        let result: WorkerResult;
 +        try {
 +          result = await Promise.race([handlerWorker(), executorWorker()]);
@@ -337,7 +324,7 @@
          switch (result.type) {
            case "handlerDone": {
              await ctx.runMutation(component.workflow.complete, {
-@@ -305,6 +353,11 @@
+@@ -305,6 +352,11 @@
          }
        } finally {
          restoreEnvironment();

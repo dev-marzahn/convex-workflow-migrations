@@ -49,17 +49,14 @@ const m2 = migration('import-gets-notified-at', (h) =>
   h.updateArgs(flows.importFiles, (args) => ({ ...args, notifiedAt: (h.result(flows.notify) as { at: number | null } | undefined)?.at ?? null })),
 );
 const m3 = migration('prepare-becomes-transcode', (h) => h.rename(flows.prepare, flows.transcode));
-const audit = migration('audit-after-grab', (h) => h.insertAfter(flows.grab, flows.audit, { runLate: true, args: {} }));
-const auditInline = migration('audit-after-grab', (h) => h.insertAfter(flows.grab, flows.audit, { runLate: true, args: {} }));
 
-type Shape = { notify?: boolean; notifiedAt?: boolean; transcode?: boolean; audit?: 'late' | 'inline' };
+type Shape = { notify?: boolean; notifiedAt?: boolean; transcode?: boolean };
 function release(shape: Shape, migrations: Migration[]) {
   return manager.define({
     args: {},
     migrations,
     handler: async (step: WorkflowCtx): Promise<void> => {
       await step.runMutation(flows.grab, {});
-      if (shape.audit) await step.runMutation(flows.audit, {}, shape.audit === 'inline' ? { inline: true } : {});
       const notified = shape.notify ? ((await step.runMutation(flows.notify, {})) as { at: number | null }) : undefined;
       await step.awaitEvent({ name: 'downloadDone' });
       await step.runMutation(flows.importFiles, shape.notifiedAt ? { notifiedAt: notified!.at } : {});
@@ -76,9 +73,6 @@ const releases = {
   r3: release({ notify: true, notifiedAt: true, transcode: true }, [m1, m2, m3]),
   // Release 1's change without its migration.
   unguarded: release({ notify: true }, []),
-  // Release 0 plus a step after grab that runs late on older runs.
-  late: release({ audit: 'late' }, [audit]),
-  lateInline: release({ audit: 'inline' }, [auditInline]),
   // A migration that throws.
   broken: release({ notify: true }, [
     migration('broken', () => {
@@ -94,7 +88,6 @@ const functions: Record<string, unknown> = {
   prepare: stepFn('prepare'),
   transcode: stepFn('transcode'),
   publish: stepFn('publish'),
-  audit: stepFn('audit'),
   onComplete: internalMutationGeneric({
     args: { workflowId: v.string(), result: v.any(), context: v.any() },
     handler: async (_ctx, { workflowId, result }) => void completions.push({ workflowId, result }),
@@ -188,34 +181,14 @@ test('a new run starts with every migration applied and never migrates', async (
   expect((await record(t, id))?.overlay).toEqual([]);
 });
 
-test('a stand-in resolves the call without running it; a runLate step runs when replay reaches it', async () => {
-  const t = setup();
-  const standIn = await start(t);
-  const late = await start(t);
-  deploy('r1');
-  await downloadDone(t, standIn);
-  expect(ran).toEqual(['grab', 'grab', 'import', 'prepare', 'publish']);
-
-  ran.length = 0;
-  deploy('late');
-  await downloadDone(t, late);
-  expect(await status(t, late)).toEqual(completed);
-  expect(ran).toEqual(['audit', 'import', 'prepare', 'publish']);
-  // Its journal entry was appended after the wait, and takes the inserted position.
-  expect(await steps(t, late)).toEqual(['grab', 'downloadDone', 'audit', 'importFiles', 'prepare', 'publish']);
-  const op = (await record(t, late))?.overlay[0];
-  expect(op).toMatchObject({ op: 'insertLate', name: 'flows:audit' });
-  const ids = await t.run(async (ctx) => (await manager.listSteps(ctx, late)).page.map((s) => s.stepId));
-  expect(op?.op === 'insertLate' && op.executedAs).toBe(ids[2]);
-});
-
-test('an inline runLate step runs in the handler run that reaches it, and replay goes on', async () => {
+test('a stand-in resolves the call without running it or adding a journal entry', async () => {
   const t = setup();
   const id = await start(t);
-  deploy('lateInline');
+  deploy('r1');
   await downloadDone(t, id);
   expect(await status(t, id)).toEqual(completed);
-  expect(ran).toEqual(['grab', 'audit', 'import', 'prepare', 'publish']);
+  expect(ran).toEqual(['grab', 'import', 'prepare', 'publish']);
+  expect(await steps(t, id)).toEqual(['grab', 'downloadDone', 'importFiles', 'prepare', 'publish']);
 });
 
 test('a replay that does not match pauses the run instead of failing it, and alerts once', async () => {

@@ -119,7 +119,7 @@ migration('notify-after-grab', (h) => h.insertAfter(internal.pipeline.grab, inte
 
 Reading:
 
-- `h.steps`: the steps in order, each `{ id, name, kind, args, status, result?, error? }`. `kind` is `function`, `workflow`, `event` or `sleep`. `status` is `done`, `running`, or `pending` for a step inserted with `runLate` that hasn't run.
+- `h.steps`: the steps in order, each `{ id, name, kind, args, status, result?, error? }`. `kind` is `function`, `workflow`, `event` or `sleep`. `status` is `done` or `running`.
 - `h.has(step)`: whether some step is `step`.
 - `h.result(step)`: the result of the only step that is `step`, or `undefined` if there's none or it didn't succeed. Typed from the function reference.
 
@@ -128,14 +128,11 @@ A step is named by a function reference (`internal.pipeline.grab`, matching `run
 Editing:
 
 - `h.insertAfter(step, ref, { result })` and `h.insertBefore(...)`: insert a finished stand-in. Replay resolves the call with `result` and runs nothing. `result` is required and typed: it has to be a value the function could return, so declare the function's return type to include it (`at: number | null` above). `args`, if given, are matched against the call; without them only the name and kind are.
-- `h.insertAfter(step, ref, { runLate: true, args })`: insert a step that runs, for real, when replay reaches it, and gives the call its real result.
 - `h.remove(step)`: drop a step the code no longer calls.
 - `h.rename(step, ref)`: the step now counts as a call to `ref`. The kind must stay the same.
 - `h.updateArgs(step, (args) => newArgs)`: the args the current code passes. This is for matching only: the step ran with its old args.
 
 A step called with a custom `name` option is matched by that name: pass `{ name }` in the insert options, and select it from `h.steps`.
-
-**Stand-in or `runLate`?** A stand-in records what the run would have got, and runs nothing. Use it when the step's effect doesn't matter for a run that's past that point, or when you can say what it would have returned. `runLate` is opt-in. It suits a step whose real result later code needs, or one that just has to happen eventually, like a backfill or an audit record. It doesn't suit a step whose order matters: it runs when the run next replays, after everything the run already did past that point.
 
 **Running steps.** A step a run is waiting at can't be removed, renamed or given other args: a result will still arrive into it. Inserting before or after it is fine. An edit that breaks this throws, and the run pauses. The workflow mutation doesn't replay while a step runs, so in practice a migration sees a running step only in a test history; see [Limits](#limits).
 
@@ -147,7 +144,7 @@ A run pauses instead of failing when:
 - a migration throws, including an edit to a running step (reason `migration`);
 - the ids applied to it aren't the start of the code's list: a migration was removed, renamed or reordered, or the code is older than the code the run ran on, after a rollback (reason `migrations`).
 
-A paused run stays `inProgress` in upstream, with no step running, and `onComplete` doesn't run. Nothing partial is saved: a mismatch is found before the handler run starts any new step, and the migrations it applied in memory are dropped, so the next attempt migrates again, possibly with fixed code. (The one exception is a `runLate` step that ran in that handler run, which is kept with the migrations that inserted it.)
+A paused run stays `inProgress` in upstream, with no step running, and `onComplete` doesn't run. Nothing partial is saved: a mismatch is found before the handler run starts any new step, and the migrations it applied in memory are dropped, so the next attempt migrates again, possibly with fixed code.
 
 - **Retries.** A paused run is retried after 1 minute, 10 minutes, 1 hour, then every 6 hours, until it gets past the pause. It never gives up on its own; `fail` is explicit. A retry whose workflow mutation throws counts as another failed attempt (reason `error`).
 - **Alerting.** `onPause(ctx, { workflowId, workflow, reason, detail })` is called once when a run pauses, in the transaction that pauses it, and not again on retries until the run has got past the pause. An error it throws is logged; the run stays paused. Pausing must not be quieter than failing, so set it.
@@ -195,7 +192,7 @@ test('runs from every older release replay on the current code', async () => {
 });
 ```
 
-- **`expectReplays(t, workflow, histories)`** replays each history, with the workflow's migrations, against its current handler. It runs no steps: replay stops where the history ends, at a running step, or at a step inserted with `runLate`. If a history doesn't replay, it throws with the history, the position, the call the code made and the step the history has there, and the migrated history.
+- **`expectReplays(t, workflow, histories)`** replays each history, with the workflow's migrations, against its current handler. It runs no steps: replay stops where the history ends or at a running step. If a history doesn't replay, it throws with the history, the position, the call the code made and the step the history has there, and the migrated history.
 - **`history(steps, { args, applied })`** builds a history by hand: `{ step: ref, args, result }` (or `error`) for a function call, `{ workflow: ref, ... }`, `{ event: name }` and `{ sleep: name }`, each with `status: 'running'` if the run is waiting there. `args` are the workflow's. Without `applied`, every migration applies, as for a run from before the first one.
 - **`migrate(t, workflow, history)`** returns the history after the workflow's migrations, to test a single migration.
 - **`npx convex-workflow-migrations histories <workflow> [-- <convex options>]`** exports the histories of a workflow's running runs, and of its 10 most recent finished ones, from a deployment, as JSON that `expectReplays` takes. Run it from your app's directory, for example `npx convex-workflow-migrations histories pipeline:run --out convex/histories.json -- --prod`, and commit the file next to the test. Runs that have a record include the migrations applied to them. `--recent <n>` changes how many finished runs it adds, `--max-runs <n>` how many runs it looks through (1000), and `--max-steps <n>` how many steps of a run it exports (1000; a longer run is marked `truncated`). It reads through upstream's `listSteps`, one `convex run` per run, so it's slow for many runs.
@@ -223,11 +220,10 @@ To see a release replace another on a real backend, deploy the previous release 
 Each run has a row in the migrations component: the ids of the migrations applied to it, an **overlay** of edits, and its pause, if any. Upstream's journal is append-only and its component is unchanged, so the edits live there, anchored to journal entry ids:
 
 - `insert`, a stand-in, after or before a step, with its name, kind, args and result;
-- `insertLate`, a `runLate` step, with `executedAs` set to its journal entry once it has run;
 - `remove`, a step;
 - `rewrite`, a step's name or args.
 
-The run's **history** is its journal with those edits applied in order. At the start of a handler run, the vendored workflow mutation reads the row. If the code lists ids beyond those applied, it builds the history and runs the missing migrations on it, in memory. Then the handler replays against the history instead of the raw journal: a stand-in resolves its call without sending anything to upstream; a `runLate` step that hasn't run is started for real when replay reaches it, and upstream appends its entry, which takes the step's place from then on; removed steps are skipped; rewritten steps are compared by their new name and args. The deterministic `Date.now()` during replay reads the history too: a stand-in sees the time of the step before it.
+The run's **history** is its journal with those edits applied in order. At the start of a handler run, the vendored workflow mutation reads the row. If the code lists ids beyond those applied, it builds the history and runs the missing migrations on it, in memory. Then the handler replays against the history instead of the raw journal: a stand-in resolves its call without sending anything to upstream; removed steps are skipped; rewritten steps are compared by their new name and args. The deterministic `Date.now()` during replay reads the history too: a stand-in sees the time of the step before it.
 
 If replay matches, the new ids and overlay are saved in the same transaction as the handler run's other writes. If it doesn't, nothing but the pause is saved. A new run starts with every current id applied, so it never migrates; it writes its row once, on its first handler run. Each handler run reads one row and writes it only when something changed.
 
@@ -278,7 +274,7 @@ Records of child workflows that upstream cleans up with their parent are left be
 - **Pinned upstream version.** See [versions](#convex-devworkflow-versions).
 - **Migrations are checked by tests, not by the deploy.** Nothing refuses a release whose migrations are missing or wrong: its runs pause and wait for a fix. `expectReplays` with exported histories is what catches it before the deploy.
 - **Running steps in test histories.** At runtime the workflow mutation doesn't replay while a step runs, so a migration only ever sees finished steps. A history exported while a run waits at a step has that step as running, and a migration that removes, renames or changes the args of it throws there, though it would apply once the step finished. Test such a migration with the step finished.
-- **`runLate` steps run out of order**, after the steps the run already did past their position. If a later step of the same handler run then doesn't match, the run pauses but keeps the step and the migrations that inserted it, so a fix needs a new migration rather than a corrected one.
+- **Inserted steps are stand-ins.** A migration can insert a finished step with the result it would have had, but not one that runs for real.
 - **The overlay is one document** in the migrations component, under Convex's 1 MiB document limit. Keep stand-in results small.
 - **Matching is by position, name and args.** A migration that's wrong but leaves a call with the same name and args at the same position replays silently. So does removing a step followed by an identical call, without a migration.
 - **Workflow function renames** aren't supported: each run stores a handle to its function.

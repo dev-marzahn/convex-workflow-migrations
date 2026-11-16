@@ -79,9 +79,9 @@ export const save = mutation({
 });
 
 /**
- * Pauses a run and schedules a retry. `record` is saved too when given: the
- * handler run executed a step a migration inserted, so its migrations stand.
- * Returns whether the run wasn't paused before, so the caller alerts once.
+ * Pauses a run and schedules a retry. Nothing else of the handler run is
+ * saved. Returns whether the run wasn't paused before, so the caller alerts
+ * once.
  */
 export const pause = mutation({
   args: {
@@ -92,17 +92,15 @@ export const pause = mutation({
     step: v.optional(v.number()),
     handle: v.string(),
     generationNumber: v.number(),
-    record: v.optional(v.object({ applied: v.array(v.string()), overlay: v.array(vOverlayOp) })),
   },
   returns: v.object({ first: v.boolean() }),
-  handler: async (ctx, { workflowId, workflow, record, ...pause }) => {
+  handler: async (ctx, { workflowId, workflow, ...pause }) => {
     let current = await row(ctx, workflowId);
     if (!current) {
       // A run from before the app adopted this package: nothing applied yet.
       const id = await ctx.db.insert('runs', { workflowId, workflow, applied: [], overlay: [] });
       current = (await ctx.db.get('runs', id))!;
     }
-    if (record) await ctx.db.patch('runs', current._id, record);
     const first = current.paused === undefined;
     await setPaused(ctx, workflowId, current, pause);
     return { first };

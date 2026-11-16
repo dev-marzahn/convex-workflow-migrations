@@ -11,7 +11,6 @@ import type { WorkflowReturnType } from './vendor/workflow/types.ts';
 export type StepKind = Infer<typeof vStepKind>;
 export type OverlayOp = Infer<typeof vOverlayOp>;
 type InsertOp = Extract<OverlayOp, { op: 'insert' }>;
-type LateOp = Extract<OverlayOp, { op: 'insertLate' }>;
 
 export type RunResult = { kind: 'success'; returnValue: unknown } | { kind: 'failed'; error: string } | { kind: 'canceled' };
 
@@ -52,8 +51,7 @@ export type HistoryStep = {
   readonly name: string;
   readonly kind: StepKind;
   readonly args: any;
-  /** `pending`: inserted with `runLate` and not run yet. */
-  readonly status: 'done' | 'running' | 'pending';
+  readonly status: 'done' | 'running';
   /** What the step returned, if it succeeded; for a stand-in, the result it was given. */
   readonly result?: unknown;
   /** Why it didn't succeed, if it failed or was canceled. */
@@ -89,15 +87,11 @@ export type StepArgs<R> = R extends { workflow: infer W extends WorkflowFunction
     : Record<string, never>;
 
 /**
- * How to insert a step:
- * - `{ result }`: a finished stand-in. Replay resolves the call with `result`
- *   and runs nothing. `args`, if given, must match the call's.
- * - `{ runLate: true, args }`: the step runs, for real, when replay reaches
- *   it, and the call gets its real result. Matched on `args`.
- *
- * `name` matches a call made with a custom `name` option.
+ * How to insert a finished stand-in: replay resolves the call with `result`
+ * and runs nothing. `args`, if given, must match the call's. `name` matches a
+ * call made with a custom `name` option.
  */
-export type InsertOptions<R> = { name?: string } & ({ result: StepResult<R>; args?: StepArgs<R>; runLate?: false } | { runLate: true; args: StepArgs<R> });
+export type InsertOptions<R> = { result: StepResult<R>; args?: StepArgs<R>; name?: string };
 
 /** A run's history, as the previous migration left it. See the README's "Writing migrations". */
 export interface History {
@@ -127,8 +121,6 @@ export type ReplayEntry = {
   position: number;
   /** False for a stand-in inserted without args: only its name and kind are matched. */
   argsKnown: boolean;
-  /** For a step inserted with `runLate` that hasn't run: record the journal entry it got when issued. */
-  late?: (entryId: string) => void;
 };
 
 type Node = {
@@ -137,12 +129,10 @@ type Node = {
   kind: StepKind;
   args: unknown;
   argsKnown: boolean;
-  /** Journal-backed: a recorded entry, or a late step that has run. */
+  /** A journal entry. */
   recorded?: RecordedStep;
   /** A stand-in's result. */
   standIn?: { result: unknown };
-  /** A late step's operation. */
-  late?: LateOp;
 };
 
 const clone = <T>(value: T): T => (value === undefined ? value : (jsonToConvex(convexToJson(value as Value)) as T));
@@ -173,11 +163,8 @@ function outcome(runResult: RunResult | undefined) {
 }
 
 export class HistoryView implements History {
-  /** Whether replay issued a step inserted with `runLate`. */
-  public lateStepRan = false;
   private nodes: Node[];
   private readonly ops: OverlayOp[] = [];
-  private readonly journal: ReadonlyMap<string, RecordedStep>;
   private nextId = 1;
 
   /**
@@ -185,10 +172,7 @@ export class HistoryView implements History {
    * gone from the journal (`restart({ from })` deleted it) are dropped.
    */
   public constructor(journal: readonly RecordedStep[], overlay: readonly OverlayOp[] = []) {
-    this.journal = new Map(journal.map((step) => [step.id, step]));
-    // A late step's journal entry was appended when it ran; it belongs where the step was inserted.
-    const claimed = new Set(overlay.flatMap((op) => (op.op === 'insertLate' && op.executedAs ? [op.executedAs] : [])));
-    this.nodes = journal.filter((step) => !claimed.has(step.id)).map((step) => this.recordedNode(step));
+    this.nodes = journal.map((step) => this.recordedNode(step));
     for (const op of overlay) {
       if ('id' in op) this.nextId = Math.max(this.nextId, Number(op.id.slice(1)) + 1 || 0);
       this.apply(clone(op));
@@ -258,32 +242,22 @@ export class HistoryView implements History {
   }
 
   /**
-   * The steps for the executor to replay against. `now` is when this handler
-   * run started: the time a late step that hasn't run sees. A stand-in sees
-   * the time of the step before it.
+   * The steps for the executor to replay against. A stand-in sees the time of
+   * the step before it; `now`, when this handler run started, if it's first
+   * and the history has no recorded step.
    */
   public replay(now: number): ReplayEntry[] {
     let previous: number | undefined;
     const firstRecorded = this.nodes.find((node) => node.recorded)?.recorded?.startedAt ?? now;
     return this.nodes.map((node, position) => {
       const recorded = node.recorded;
-      const startedAt = recorded ? recorded.startedAt : node.late ? now : (previous ?? firstRecorded);
+      const startedAt = recorded ? recorded.startedAt : (previous ?? firstRecorded);
       previous = startedAt;
-      const runResult = recorded ? recorded.runResult : node.standIn ? { kind: 'success' as const, returnValue: node.standIn.result } : undefined;
-      const late = node.late;
+      const runResult = recorded ? recorded.runResult : { kind: 'success' as const, returnValue: node.standIn!.result };
       return {
         step: { name: node.name, kind: node.kind, args: node.args, inProgress: recorded ? !recorded.runResult : false, runResult, startedAt },
         position,
         argsKnown: node.argsKnown,
-        ...(late && !recorded
-          ? {
-              late: (entryId: string) => {
-                // The node's operation is the one in `ops`.
-                late.executedAs = entryId;
-                this.lateStepRan = true;
-              },
-            }
-          : {}),
       };
     });
   }
@@ -298,12 +272,7 @@ export class HistoryView implements History {
     const name = options.name ?? refName;
     const kind = refKind === 'function or workflow' ? 'function' : refKind;
     const id = `+${this.nextId++}`;
-    if (options.runLate === true) {
-      if (options.args === undefined) throw new Error(`${action}(${describe(anchor)}, ${name}): a step inserted with runLate needs its args.`);
-      this.push({ op: 'insertLate', id, where, anchor: at.id, name, kind, args: clone(options.args) });
-      return;
-    }
-    if (!('result' in options)) throw new Error(`${action}(${describe(anchor)}, ${name}): pass { result } for a stand-in, or { runLate: true, args }.`);
+    if (!('result' in options)) throw new Error(`${action}(${describe(anchor)}, ${name}): pass { result } for the stand-in.`);
     const op: InsertOp = { op: 'insert', id, where, anchor: at.id, name, kind, result: clone(options.result ?? null) };
     if (options.args !== undefined) op.args = clone(options.args);
     this.push(op);
@@ -344,7 +313,7 @@ export class HistoryView implements History {
 
   /** Applies one operation; false (and not kept) if its step isn't in the history. */
   private apply(op: OverlayOp): boolean {
-    const index = this.nodes.findIndex((node) => node.id === (op.op === 'insert' || op.op === 'insertLate' ? op.anchor : op.target));
+    const index = this.nodes.findIndex((node) => node.id === (op.op === 'insert' ? op.anchor : op.target));
     if (index < 0) return false;
     switch (op.op) {
       case 'insert':
@@ -357,21 +326,6 @@ export class HistoryView implements History {
           standIn: { result: op.result },
         });
         break;
-      case 'insertLate': {
-        const recorded = op.executedAs === undefined ? undefined : this.journal.get(op.executedAs);
-        // Its entry was deleted by a restart: the step runs again.
-        if (!recorded) delete op.executedAs;
-        this.nodes.splice(op.where === 'after' ? index + 1 : index, 0, {
-          id: op.id,
-          name: op.name,
-          kind: op.kind,
-          args: op.args,
-          argsKnown: true,
-          late: op,
-          ...(recorded ? { recorded } : {}),
-        });
-        break;
-      }
       case 'remove':
         this.nodes.splice(index, 1);
         break;
@@ -396,8 +350,7 @@ export class HistoryView implements History {
   private toStep(node: Node): HistoryStep {
     const base = { id: node.id, name: node.name, kind: node.kind, args: node.args };
     if (node.recorded) return { ...base, ...outcome(node.recorded.runResult) };
-    if (node.standIn) return { ...base, status: 'done', result: node.standIn.result };
-    return { ...base, status: 'pending' };
+    return { ...base, status: 'done', result: node.standIn!.result };
   }
 }
 

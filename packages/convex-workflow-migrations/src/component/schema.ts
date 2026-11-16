@@ -10,8 +10,8 @@ export const vStepKind = v.union(v.literal('function'), v.literal('workflow'), v
 
 /**
  * One edit to a run's history. Steps are named by id: a journal entry's id, or
- * the `id` of a step an earlier `insert` or `insertLate` added. The history is
- * the journal with these applied in order.
+ * the `id` of a step an earlier `insert` added. The history is the journal
+ * with these applied in order.
  */
 export const vOverlayOp = v.union(
   // A finished stand-in: replay resolves the matching call with `result` and runs nothing.
@@ -25,17 +25,6 @@ export const vOverlayOp = v.union(
     // Without args, only the name and kind are matched.
     args: v.optional(v.any()),
     result: v.any(),
-  }),
-  // A step that runs when replay reaches it. `executedAs` is the journal entry it got.
-  v.object({
-    op: v.literal('insertLate'),
-    id: v.string(),
-    where: vWhere,
-    anchor: v.string(),
-    name: v.string(),
-    kind: vStepKind,
-    args: v.any(),
-    executedAs: v.optional(v.string()),
   }),
   v.object({ op: v.literal('remove'), target: v.string() }),
   // What the current code calls instead: the step ran with its recorded name and args.

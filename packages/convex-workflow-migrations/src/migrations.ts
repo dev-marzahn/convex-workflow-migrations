@@ -172,22 +172,18 @@ export class RunRecord {
   /**
    * Pauses the run: records why, schedules a retry through this workflow
    * mutation's function handle, and calls `onPause` if the run wasn't paused
-   * already. Saves nothing else, so the next attempt migrates again, unless
-   * replay issued a step a migration inserted: that step has run, so the
-   * migrations stand.
+   * already. Saves nothing else, so the next attempt migrates again.
    */
   public async pause(ctx: MutationCtx, generationNumber: number, cause: Blocked | ReplayMismatch, console: Logger): Promise<void> {
     const pause =
       'position' in cause ? { reason: 'mismatch' as const, detail: cause.message, step: cause.position } : { reason: cause.reason, detail: cause.detail };
     const handle = await createFunctionHandle(makeFunctionReference<'mutation'>(this.workflow));
-    const { history, applied } = this.prepared;
     const { first } = await ctx.runMutation(this.migrations.component.runs.pause, {
       workflowId: this.workflowId,
       workflow: this.workflow,
       ...pause,
       handle,
       generationNumber,
-      ...(history.lateStepRan ? { record: { applied, overlay: history.overlay() } } : {}),
     });
     console.warn(`Workflow ${this.workflow} (${this.workflowId}) paused (${pause.reason}): ${pause.detail}`);
     if (!first || !this.migrations.onPause) return;
