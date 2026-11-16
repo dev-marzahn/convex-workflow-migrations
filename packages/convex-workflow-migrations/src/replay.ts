@@ -87,8 +87,8 @@ export function argsValid(definition: { args?: unknown }, args: unknown, db?: Ge
  * Throws a `ReplayError` for args that don't pass the `args` validator, for a
  * handler that throws after migrations applied in this handler run (`ran`),
  * unless the history's last step failed or was canceled, and the executor's
- * `ReplayMismatch`. Call it
- * inside the replay's environment (`setupEnvironment`).
+ * `ReplayMismatch`. Call it inside the replay's environment
+ * (`setupEnvironment`).
  */
 export async function replayHandler(
   registered: ReplayDefinition,
