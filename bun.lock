@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "convex-workflow-patches-monorepo",
+      "name": "convex-workflow-migrations-monorepo",
       "devDependencies": {
         "@types/node": "catalog:",
         "typescript": "catalog:",
