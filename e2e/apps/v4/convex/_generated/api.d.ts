@@ -9,6 +9,7 @@
  */
 
 import type * as pipeline from "../pipeline.js";
+import type * as queued from "../queued.js";
 import type * as workflow from "../workflow.js";
 
 import type {
@@ -19,6 +20,7 @@ import type {
 
 declare const fullApi: ApiFromModules<{
   pipeline: typeof pipeline;
+  queued: typeof queued;
   workflow: typeof workflow;
 }>;
 

@@ -129,3 +129,19 @@ export const restart = mutation({
     return null;
   },
 });
+
+export const fail = mutation({
+  args: { workflowId: vWorkflowId },
+  returns: v.null(),
+  handler: async (ctx, { workflowId }) => {
+    await workflow.fail(ctx, workflowId);
+    return null;
+  },
+});
+
+/** Deletes a finished run, its journal and its records. */
+export const cleanup = mutation({
+  args: { workflowId: vWorkflowId },
+  returns: v.boolean(),
+  handler: async (ctx, { workflowId }) => await workflow.cleanup(ctx, workflowId),
+});
