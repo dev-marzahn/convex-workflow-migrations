@@ -1,4 +1,4 @@
-import { migration, vWorkflowId, type WorkflowId } from '@dev-marzahn/convex-workflow-migrations';
+import { migration, type PausedRun, vWorkflowId, type WorkflowId } from '@dev-marzahn/convex-workflow-migrations';
 import { makeFunctionReference } from 'convex/server';
 import { v } from 'convex/values';
 
@@ -90,6 +90,34 @@ export const downloadDone = mutation({
   handler: async (ctx, { workflowId }) => {
     await workflow.sendEvent(ctx, { workflowId, name: 'downloadDone' });
     return null;
+  },
+});
+
+// For an admin, after deploying a fix: retries a paused run now, and says whether it got past its pause.
+export const resume = internalMutation({
+  args: { workflowId: vWorkflowId },
+  returns: v.boolean(),
+  handler: (ctx, { workflowId }) => workflow.resume(ctx, workflowId),
+});
+
+// For the UI: whether a run is paused, and the alerts onPause recorded for it.
+export const pauses = query({
+  args: { workflowId: vWorkflowId },
+  returns: v.object({ paused: v.union(v.object({ reason: v.string(), attempts: v.number() }), v.null()), alerts: v.array(v.string()) }),
+  handler: async (ctx, { workflowId }) => {
+    // paused returns a page of runs: look through this workflow's pages for this run.
+    let run: PausedRun | undefined;
+    let cursor: string | null = null;
+    do {
+      const { page, isDone, continueCursor } = await workflow.paused(ctx, { workflow: 'pipeline:run', cursor });
+      run = page.find((paused) => paused.workflowId === workflowId);
+      cursor = isDone ? null : continueCursor;
+    } while (!run && cursor !== null);
+    const alerts = await ctx.db
+      .query('alerts')
+      .withIndex('workflowId', (q) => q.eq('workflowId', workflowId))
+      .collect();
+    return { paused: run ? { reason: run.reason, attempts: run.attempts } : null, alerts: alerts.map((alert) => alert.reason) };
   },
 });
 

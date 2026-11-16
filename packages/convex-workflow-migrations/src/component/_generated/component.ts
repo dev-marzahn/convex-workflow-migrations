@@ -24,11 +24,72 @@ import type { FunctionReference } from "convex/server";
 export type ComponentApi<Name extends string | undefined = string | undefined> =
   {
     runs: {
+      attempt: FunctionReference<
+        "mutation",
+        "internal",
+        { attempts: number; workflowId: string },
+        null,
+        Name
+      >;
       cleanup: FunctionReference<
         "mutation",
         "internal",
         { workflowId: string },
         boolean,
+        Name
+      >;
+      end: FunctionReference<
+        "mutation",
+        "internal",
+        { workflowId: string },
+        {
+          detail: string;
+          generationNumber: number;
+          reason:
+            | "mismatch"
+            | "args"
+            | "threw"
+            | "migration"
+            | "migrations"
+            | "record";
+        } | null,
+        Name
+      >;
+      list: FunctionReference<
+        "query",
+        "internal",
+        {
+          paginationOpts: {
+            cursor: string | null;
+            endCursor?: string | null;
+            id?: number;
+            maximumBytesRead?: number;
+            maximumRowsRead?: number;
+            numItems: number;
+          };
+          workflow?: string;
+        },
+        {
+          continueCursor: string;
+          isDone: boolean;
+          page: Array<{
+            at: number;
+            attempts: number;
+            detail: string;
+            lastError?: string;
+            nextAttemptAt: number;
+            reason:
+              | "mismatch"
+              | "args"
+              | "threw"
+              | "migration"
+              | "migrations"
+              | "record";
+            step?: number;
+            workflow: string;
+            workflowId: string;
+          }>;
+        },
         Name
       >;
       load: FunctionReference<
@@ -58,7 +119,43 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
               }
             | { args: any; op: "workflowArgs" }
           >;
+          paused?: true;
         } | null,
+        Name
+      >;
+      pause: FunctionReference<
+        "mutation",
+        "internal",
+        {
+          detail: string;
+          generationNumber: number;
+          handle: string;
+          reason:
+            | "mismatch"
+            | "args"
+            | "threw"
+            | "migration"
+            | "migrations"
+            | "record";
+          step?: number;
+          workflow: string;
+          workflowId: string;
+        },
+        { attempts: number; notify: boolean },
+        Name
+      >;
+      resume: FunctionReference<
+        "mutation",
+        "internal",
+        { workflowId: string },
+        boolean,
+        Name
+      >;
+      retry: FunctionReference<
+        "mutation",
+        "internal",
+        { workflowId: string },
+        null,
         Name
       >;
       save: FunctionReference<

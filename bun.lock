@@ -41,6 +41,7 @@
       },
       "devDependencies": {
         "@edge-runtime/vm": "catalog:",
+        "@types/node": "catalog:",
         "convex-test": "catalog:",
         "vite-plus": "catalog:",
       },
@@ -48,6 +49,9 @@
     "packages/convex-workflow-migrations": {
       "name": "@dev-marzahn/convex-workflow-migrations",
       "version": "100.0.0",
+      "bin": {
+        "convex-workflow-migrations": "./dist/cli.js",
+      },
       "dependencies": {
         "async-channel": "catalog:",
       },

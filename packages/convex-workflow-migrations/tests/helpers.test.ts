@@ -1,14 +1,14 @@
 // The /replay helpers replay histories without Convex: they take the workflow
 // mutation `define` returned, and no convex-test instance.
 import { anyApi, componentsGeneric } from 'convex/server';
-import { v } from 'convex/values';
+import { convexToJson, v, type Value } from 'convex/values';
 import { expect, test } from 'vite-plus/test';
 
-import { expectReplays, history, migrate } from '../src/helpers.ts';
+import { expectReplays, history, migrate, type RecordedHistory } from '../src/helpers.ts';
 import { type EventId, migration, type MigrationsComponent, type WorkflowComponent, type WorkflowCtx, WorkflowManager } from '../src/index.ts';
 
 const components = componentsGeneric() as unknown as { workflow: WorkflowComponent; workflowMigrations: MigrationsComponent };
-const manager = new WorkflowManager(components.workflow, { migrationsComponent: components.workflowMigrations });
+const manager = new WorkflowManager(components.workflow, { migrationsComponent: components.workflowMigrations, onPause: null });
 const flows = anyApi.flows!;
 
 const notifyAfterGrab = migration('notify-after-grab', (h) => h.insertAfter(flows.grab, flows.notify, { result: { at: null } }));
@@ -131,17 +131,56 @@ test('expectReplays reports the history, the position, both calls and the migrat
   expect(message).toContain('migrated history: 0: flows:grab, 1: downloadDone (running)');
 });
 
-test("expectReplays reports a handler that throws while replaying, but not one passing on the last step's failure", async () => {
+test('expectReplays reports a handler that throws while replaying, as the reason the run would pause or fail, but not one passing on a failure it got', async () => {
+  // As at runtime: a recorded step is left that the handler didn't replay (throw rule 2).
   const message = await failure(expectReplays(workflows.badStandIn, [release0Waiting]));
-  // As at runtime, where the run fails without saving the migrations as applied.
   expect(message).toContain(
-    `(migration): The handler threw replaying the history as migrations "notify-after-grab" leave it: TypeError: Cannot read properties of null (reading 'at')`,
+    `(threw): The handler threw before step 2 of its history (rule 2: a recorded step is left that the handler hasn't replayed): Cannot read properties of null (reading 'at')`,
   );
-  // No migration applies now: at runtime the run just fails, but the history doesn't replay.
-  const recorded = history([{ step: flows.grab }, { step: flows.notify }, { event: 'downloadDone', status: 'running' }], { applied: ['notify-after-grab'] });
-  expect(await failure(expectReplays(workflows.badStandIn, [recorded]))).toContain('(threw): The handler threw replaying the history: TypeError');
-  // The download failed, and the handler throws that: the run fails, as it did.
+  // Nothing a migration did: at runtime the run fails (rule 6), and the history doesn't replay.
+  const throwing = manager.define({
+    args: {},
+    handler: async (step: WorkflowCtx) => {
+      await step.runMutation(flows.grab, {});
+      throw new Error('broken handler');
+    },
+  });
+  expect(await failure(expectReplays(throwing, [history([{ step: flows.grab }])]))).toContain(
+    '(fails): The handler threw replaying the history, which fails the run (rule 6: no earlier rule applies): Error: broken handler',
+  );
+  // The download failed, and the handler throws that: the run fails, as it did (rule 4).
   await expectReplays(workflows.current, [history([{ step: flows.grab }, { event: 'downloadDone', error: 'the download failed' }])]);
+  // So does a prepare that failed, though a migration renamed it to transcode (rule 4, not 5).
+  await expectReplays(workflows.current, [history([{ step: flows.grab }, { event: 'downloadDone' }, { step: flows.prepare, error: 'it broke' }])]);
+});
+
+test('expectReplays reports a return value its returns validator rejects as (returns), also after a failure', async () => {
+  const givesUp = manager.define({
+    args: {},
+    returns: v.number(),
+    handler: async (step: WorkflowCtx): Promise<number> => {
+      await step.runMutation(flows.grab, {});
+      try {
+        await step.awaitEvent({ name: 'downloadDone' });
+      } catch {
+        return 'gave up' as unknown as number;
+      }
+      return 'done' as unknown as number;
+    },
+  });
+  const report =
+    "(returns): The handler's return value doesn't match its returns validator, which fails the run: Invalid return value: Validator error: Expected `number`, got `string`";
+  for (const download of [{}, { error: 'the download failed' }]) {
+    const message = await failure(expectReplays(givesUp, [history([{ step: flows.grab }, { event: 'downloadDone', ...download }])]));
+    expect(message).toContain(report);
+  }
+});
+
+test('expectReplays reports code that returns before the end of the history', async () => {
+  const short = manager.define({ args: {}, handler: async (step: WorkflowCtx) => void (await step.runMutation(flows.grab, {})) });
+  expect(await failure(expectReplays(short, [release0Waiting]))).toContain(
+    `(mismatch): Journal entry mismatch at step 1 of the run's history, as its migrations leave it: the code returned before it, the history has {"args":{},"kind":"event","name":"downloadDone"}`,
+  );
 });
 
 test('a migration may edit a running step, which at runtime it never sees', async () => {
@@ -193,4 +232,49 @@ test('migrate returns the history after the migrations', () => {
   const current = migrate(workflows.current, { ...release0Done, applied: ['notify-after-grab', 'prepare-becomes-transcode'] });
   expect(current.steps.map((s) => s.name)).toEqual(['flows:grab', 'downloadDone', 'flows:prepare']);
   expect(() => migrate(workflows.unguarded, { ...release0Done, applied: ['gone'] })).toThrow('The run has migrations "gone" applied');
+});
+
+test('an exported history cut short, or read while its record changed, fails: it cannot be checked', async () => {
+  expect(await failure(expectReplays(workflows.current, [{ ...release0Waiting, truncated: true }]))).toContain('(truncated): The export stopped at 2 steps');
+  expect(await failure(expectReplays(workflows.current, [{ ...release0Waiting, unstable: true }]))).toContain("(unstable): The run's record changed");
+  expect(() => migrate(workflows.current, { ...release0Waiting, truncated: true })).toThrow('(truncated)');
+});
+
+test("an exported history's values are decoded from convex run's JSON: the handler sees an int64 arg, a step's bigint result and a stand-in's", async () => {
+  const seen: unknown[] = [];
+  const counts = manager.define({
+    args: { n: v.int64() },
+    migrations: [notifyAfterGrab],
+    handler: async (step: WorkflowCtx, { n }: { n: bigint }) => {
+      const grabbed = await step.runMutation(flows.grab, { n });
+      const notified = (await step.runMutation(flows.notify, {})) as { at: bigint };
+      seen.push(n, grabbed, notified.at);
+      await step.awaitEvent({ name: 'downloadDone' });
+    },
+  });
+  const live = history(
+    [
+      { step: flows.grab, args: { n: 5n }, result: 7n },
+      { event: 'downloadDone', status: 'running' },
+    ],
+    {
+      args: { n: 5n },
+      applied: ['notify-after-grab'],
+    },
+  );
+  const overlay = [{ op: 'insert', id: '+1', where: 'after', anchor: 'h0', name: 'flows:notify', kind: 'function', result: { at: 9n } }] as const;
+  // As the CLI exports it: everything `convex run` printed, through JSON.
+  const exported = { ...(JSON.parse(JSON.stringify(convexToJson({ ...live, overlay } as unknown as Value))) as RecordedHistory), encoding: 'json' as const };
+  expect(exported.args).toEqual({ n: { $integer: expect.any(String) } });
+  await expectReplays(counts, [exported]);
+  expect(seen).toEqual([5n, 7n, 9n]);
+  expect(migrate(counts, exported).steps.map((s) => s.result)).toEqual([7n, { at: 9n }, undefined]);
+  // A hand-built history's values are Convex values already.
+  seen.length = 0;
+  await expectReplays(counts, [{ ...live, overlay: [...overlay] }]);
+  expect(seen).toEqual([5n, 7n, 9n]);
+});
+
+test('expectReplays throws for no histories: an empty export checks nothing', async () => {
+  expect(await failure(expectReplays(workflows.current, []))).toBe('expectReplays got no histories to check.');
 });

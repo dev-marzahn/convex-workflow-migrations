@@ -18,9 +18,28 @@ export type RecordedStep = { id: string; name: string; kind: StepKind; args: unk
 /**
  * A run's recorded history: its journal and, if its record says, the
  * migrations applied to it and their edits. `history()` in `/replay` builds
- * one. Without `applied`, it's a run without a record (README, "Testing").
+ * one, and the `histories` CLI exports them. Without `applied`, it's a run
+ * without a record (README, "Testing").
  */
-export type RecordedHistory = { workflowId?: string; args?: unknown; steps: RecordedStep[]; applied?: string[]; overlay?: OverlayOp[] };
+export type RecordedHistory = {
+  workflowId?: string;
+  args?: unknown;
+  steps: RecordedStep[];
+  applied?: string[];
+  overlay?: OverlayOp[];
+  /** The export stopped at its step limit: the run has more steps than these. */
+  truncated?: boolean;
+  /** The run's record changed every time the export read its journal, so the two may not match. */
+  unstable?: boolean;
+  /**
+   * `json`: the args, the steps' args and results, and the overlay's values
+   * are as `convexToJson` encodes them (an int64 as `{ $integer }`), as
+   * `convex run` prints them; the `histories` CLI marks its exports so, and
+   * `/replay` decodes them. Without it, they're Convex values, as `history()`
+   * builds them.
+   */
+  encoding?: 'json';
+};
 
 /** A step of a history, as a migration reads it. */
 export type HistoryStep = {
@@ -137,6 +156,8 @@ export class HistoryView implements History {
   private ops: OverlayOp[] = [];
   private args: unknown;
   private nextId = 1;
+  /** How many edits migrations made to this view, after it loaded its overlay. */
+  public edits = 0;
 
   /**
    * The journal with `overlay` applied in order, and `args` as the run
@@ -146,7 +167,7 @@ export class HistoryView implements History {
    * changes it.
    */
   public constructor(
-    journal: readonly RecordedStep[],
+    private readonly journal: readonly RecordedStep[],
     overlay: readonly OverlayOp[] = [],
     args: unknown = {},
     private readonly options: { strict?: boolean } = {},
@@ -157,6 +178,7 @@ export class HistoryView implements History {
       if (op.op === 'insert') this.nextId = Math.max(this.nextId, Number(op.id.slice(1)) + 1 || 0);
       this.apply(clone(op));
     }
+    this.edits = 0;
   }
 
   public get steps(): readonly HistoryStep[] {
@@ -241,6 +263,37 @@ export class HistoryView implements History {
     return this.ops.map(clone);
   }
 
+  // For the throw rules in src/replay.ts (README, "Pausing and recovery").
+
+  /** How many steps the history has. */
+  public get length(): number {
+    return this.nodes.length;
+  }
+
+  /** Whether the step at `position` or a later one is a journal entry. */
+  public recordedFrom(position: number): boolean {
+    return this.nodes.slice(position).some((node) => node.recorded);
+  }
+
+  /** Whether the step at `position` is a stand-in, or has a result a migration changed. */
+  public fromMigration(position: number): boolean {
+    return this.nodes[position]?.result !== undefined;
+  }
+
+  /**
+   * Whether the newest recorded steps (the journal entries with its latest
+   * start time: those the last handler run that started steps started)
+   * include one still in the history that failed or was canceled. Read from
+   * the journal, before migrations: if one removed those steps, the failure
+   * that's last now is an older one. A migration that renamed such a step or
+   * gave it new args doesn't change that it failed, and `updateResult` throws
+   * on it, so its failure is what replay gives the handler.
+   */
+  public endsInFailure(): boolean {
+    const newest = Math.max(...this.journal.map((step) => step.startedAt));
+    return this.nodes.some(({ recorded }) => recorded?.startedAt === newest && recorded.runResult !== undefined && recorded.runResult.kind !== 'success');
+  }
+
   /**
    * The steps for the executor to replay against. A stand-in sees the time of
    * the step before it; one before every recorded step, the first one's time,
@@ -320,6 +373,7 @@ export class HistoryView implements History {
       }
     }
     this.ops.push(op);
+    this.edits++;
   }
 
   /** A copy of the step, so that changing what a migration reads doesn't change the history. */

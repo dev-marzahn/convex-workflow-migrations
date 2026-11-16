@@ -1,11 +1,11 @@
 // @vitest-environment node
-// The history view, its edits, and applying a run's pending migrations.
+// The history view, its edits, applying a run's pending migrations, and the throw rules.
 import { anyApi } from 'convex/server';
 import { expect, test } from 'vite-plus/test';
 
 import { HistoryView, type RecordedStep } from '../src/history.ts';
 import { migration, prepareHistory, prepareRun, recordedStep } from '../src/migrations.ts';
-import { ReplayError } from '../src/replay.ts';
+import { ReplayError, threwEarly } from '../src/replay.ts';
 import type { JournalEntry } from '../src/vendor/workflow/types.ts';
 
 const fn = anyApi.flows!;
@@ -291,4 +291,89 @@ test('prepareRun: applied ids are used; without them, the journal or the args de
   // Args that don't pass: the list runs from the start, where only updateWorkflowArgs does anything.
   const old = prepareRun([], { overlay: [] }, list, { grabId: 'g' }, hasChannel);
   expect([old.applied, old.history.workflowArgs, old.history.steps]).toEqual([['notify', 'channel'], { grabId: 'g', channel: 'default' }, []]);
+});
+
+const failed = (step: RecordedStep): RecordedStep => ({ ...step, runResult: { kind: 'failed', error: 'it broke' } });
+const atEnd = (h: HistoryView) => h.insertAfter(fn.importFiles, fn.publish, { result: null, atEnd: true });
+test.each([
+  ['1: a step past the history started', journal(), () => {}, { started: true }, [], undefined],
+  [
+    '2: a recorded step is left',
+    journal(),
+    () => {},
+    { next: { position: 1 }, started: false },
+    [],
+    "The handler threw before step 1 of its history (rule 2: a recorded step is left that the handler hasn't replayed): oops",
+  ],
+  [
+    '3: the last step it got is a stand-in',
+    journal(),
+    atEnd,
+    { started: false },
+    ['m'],
+    'The handler threw after step 3 of its history (rule 3: the last step the handler got is a stand-in, or has a result a migration changed): oops',
+  ],
+  [
+    '3: the last step it got has a changed result',
+    journal(),
+    (h: HistoryView) => h.updateResult(fn.importFiles, () => 1),
+    { started: false },
+    [],
+    'after step 2 of its history (rule 3:',
+  ],
+  [
+    '4: the newest steps include a failure',
+    [...journal().slice(0, 2), failed(journal()[2]!)],
+    atEnd,
+    { next: { position: 3 }, started: false },
+    ['m'],
+    undefined,
+  ],
+  [
+    '4: a migration renamed the failure',
+    [...journal().slice(0, 2), failed(journal()[2]!)],
+    (h: HistoryView) => h.rename(fn.importFiles, fn.load),
+    { started: false },
+    ['m'],
+    undefined,
+  ],
+  [
+    '4: a migration gave the failure new args',
+    [...journal().slice(0, 2), failed(journal()[2]!)],
+    (h: HistoryView) => h.updateArgs(fn.importFiles, (args) => ({ ...args, notifiedAt: null })),
+    { started: false },
+    ['m'],
+    undefined,
+  ],
+  [
+    '5, not 4: a migration removed the failure',
+    [...journal().slice(0, 2), failed(journal()[2]!)],
+    (h: HistoryView) => h.remove(fn.importFiles),
+    { started: false },
+    ['m'],
+    'after migrations "m" changed its history (rule 5:',
+  ],
+  [
+    '5, not 4: the failure is last only because a migration removed the steps after it',
+    [journal()[0]!, failed(journal()[1]!), journal()[2]!],
+    (h: HistoryView) => h.remove(fn.importFiles),
+    { started: false },
+    ['m'],
+    'after migrations "m" changed its history (rule 5:',
+  ],
+  [
+    '5: migrations edited the history in this handler run',
+    journal(),
+    () => {},
+    { started: false },
+    ['m'],
+    'The handler threw after migrations "m" changed its history (rule 5: migrations edited the history in this handler run): oops',
+  ],
+  ['6: otherwise', journal(), () => {}, { started: false }, [], undefined],
+] as const)('throw rule %s', (_, steps, edit, progress, edited, detail) => {
+  const h = new HistoryView(steps);
+  edit(h);
+  const pause = threwEarly(h, progress, new Error('oops'), edited);
+  if (detail === undefined) expect(pause).toBeUndefined();
+  else expect(pause).toMatchObject({ reason: 'threw', message: expect.stringContaining(detail) });
 });

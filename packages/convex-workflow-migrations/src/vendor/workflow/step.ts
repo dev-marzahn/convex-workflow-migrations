@@ -72,6 +72,11 @@ export class StepExecutor {
   // PATCHES: replay matches calls against the run's history, the journal
   // with its migrations' edits, instead of the raw journal.
   private journalEntries: ReplayEntry[];
+  // PATCHES: whether this handler run started a step past the history.
+  private started = false;
+  // PATCHES: set by `replayHandler` when the handler run pauses: no step
+  // starts after that, though the handler may still make calls.
+  halted = false;
 
   constructor(
     private workflowId: string,
@@ -120,6 +125,12 @@ export class StepExecutor {
         const message = await this.receiver.get();
         messages.push(message);
       }
+      // PATCHES: a paused handler run starts no step. Nothing reads this
+      // result any more, and the calls stay unresolved.
+      if (this.halted) {
+        return { type: "executorBlocked" };
+      }
+      this.started = true;
       const entries = await this.startSteps(messages);
       if (entries.every((entry) => entry.step.runResult)) {
         for (let i = 0; i < entries.length; i++) {
@@ -148,6 +159,18 @@ export class StepExecutor {
     };
   }
 
+  // PATCHES: how far replay got, for a handler that threw or returned: the
+  // first history step it hasn't called (calls the executor hasn't taken yet
+  // count as called), and whether it started, or is about to start, a step
+  // past the history.
+  progress(): { next?: ReplayEntry; started: boolean } {
+    const queued = this.receiver.bufferSize;
+    return {
+      next: this.journalEntries[queued],
+      started: this.started || queued > this.journalEntries.length,
+    };
+  }
+
   // PATCHES: takes a step of the history. With checkOnly, for a running
   // step, it compares the call and resolves nothing.
   completeMessage(message: StepRequest, entry: ReplayStep, checkOnly = false) {
@@ -172,7 +195,7 @@ export class StepExecutor {
     const stepJson = JSON.stringify(convexToJson(stepFields));
     const messageJson = JSON.stringify(convexToJson(messageFields));
     if (stepJson !== messageJson) {
-      // PATCHES: a mismatch with the history says where in it.
+      // PATCHES: a mismatch with the history pauses the run.
       if (entry.position !== undefined) {
         throw new ReplayMismatch(entry.position, messageJson, stepJson);
       }

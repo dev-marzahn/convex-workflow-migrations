@@ -1,46 +1,46 @@
 // One handler run's replay of the handler against a run's history: upstream's
 // handler and executor workers, with the workflow args as the migrations left
-// them. The vendored workflow mutation and the /replay helpers both call
-// `replayHandler`, so the two can't drift apart. A run that can't replay
-// fails, as upstream's does on a journal mismatch; `ReplayError` says why.
-// Inline, the error throws to the caller instead.
+// them, and the rules for when the run pauses instead of completing
+// (`returnedEarly` and `threwEarly`; README, "Pausing and recovery"). The
+// vendored workflow mutation and the /replay helpers both call
+// `replayHandler`, so the two can't drift apart.
 import type { WorkpoolOptions } from '@convex-dev/workpool';
 import { validate, ValidationError } from 'convex-helpers/validators';
 import type { GenericDatabaseReader } from 'convex/server';
-import { asObjectValidator, type PropertyValidators, type Validator } from 'convex/values';
+import { asObjectValidator, convexToJson, type Infer, type PropertyValidators, type Validator, type Value } from 'convex/values';
 
-import type { StepKind } from './history.ts';
+import { capDetail, type vPauseReason } from './component/schema.ts';
+import type { HistoryView, StepKind } from './history.ts';
 import type { Migration, Prepared } from './migrations.ts';
 import { formatErrorWithStack } from './vendor/workflow/shared.ts';
 import type { StepExecutor, WorkerResult } from './vendor/workflow/step.ts';
 import type { RunResult } from './vendor/workflow/types.ts';
 import type { WorkflowCtx } from './vendor/workflow/workflowContext.ts';
 
-/** Why a run can't replay on the current code. */
-export type ReplayReason = 'mismatch' | 'args' | 'migration' | 'migrations' | 'record';
+/** Why a run can't replay on the current code, so it pauses. */
+export type ReplayReason = Infer<typeof vPauseReason>;
 
 /**
- * The run can't replay on the current code: the workflow mutation throws it,
- * and upstream's workpool fails the run with its message. Inline (`restart`
- * without `startAsync`), it throws to the caller instead of failing the run.
+ * The run can't replay on the current code: it pauses. `position` is where in
+ * the history, if somewhere. The pause cuts the message (`loadRecord`).
  */
 export class ReplayError extends Error {
   public constructor(
     public readonly reason: ReplayReason,
     message: string,
+    public readonly position?: number,
   ) {
     super(message);
     this.name = 'ReplayError';
   }
 }
 
-/** The code made a different call at `position` of the history than the step there. */
+const MISMATCH = (position: number) => `Journal entry mismatch at step ${position} of the run's history, as its migrations leave it`;
+
+/** The code made a different call at `position` of the history than the step there. Each is cut to `DETAIL_LIMIT`. */
 export class ReplayMismatch extends ReplayError {
   public constructor(position: number, call: string, step: string) {
-    super(
-      'mismatch',
-      `Journal entry mismatch at step ${position} of the run's history, as its migrations leave it: the code calls ${call}, the history has ${step}`,
-    );
+    super('mismatch', `${MISMATCH(position)}: the code calls ${capDetail(call)}, the history has ${capDetail(step)}`, position);
   }
 }
 
@@ -81,24 +81,65 @@ export function argsValid(definition: { args?: unknown }, args: unknown, db?: Ge
   return !definition.args || validate(asObjectValidator(definition.args as ObjectValidator), args, { throw: throws, ...(db ? { db } : {}) });
 }
 
+/** Where replay got to (the executor's `progress()`): the first step of the history the handler hasn't called, and whether a step past the history started. */
+export type ReplayProgress = { next?: { position: number }; started: boolean };
+
+/** A handler that returned before calling every step of its history: a mismatch, with no call to show. */
+export function returnedEarly(history: HistoryView, { next }: ReplayProgress): ReplayError | undefined {
+  if (!next) return undefined;
+  const { args, kind, name } = history.steps[next.position]!;
+  const step = capDetail(JSON.stringify(convexToJson({ args, kind, name } as Value)));
+  return new ReplayError('mismatch', `${MISMATCH(next.position)}: the code returned before it, the history has ${step}`, next.position);
+}
+
+/** The throw rules a pause's `detail` and `expectReplays` name, by their numbers in the README's "Pausing and recovery". */
+export const RULE = {
+  2: "rule 2: a recorded step is left that the handler hasn't replayed",
+  3: 'rule 3: the last step the handler got is a stand-in, or has a result a migration changed',
+  5: 'rule 5: migrations edited the history in this handler run',
+  6: 'rule 6: no earlier rule applies',
+} as const;
+
+/**
+ * Whether a handler that threw pauses the run instead of failing it, by the
+ * throw rules in the README's "Pausing and recovery", in their order. A
+ * pause's message names its rule (`RULE`).
+ */
+export function threwEarly(history: HistoryView, progress: ReplayProgress, error: unknown, edited: readonly string[]): ReplayError | undefined {
+  if (error instanceof ReplayError) return error;
+  if (progress.started) return undefined; // rule 1
+  const next = progress.next?.position ?? history.length;
+  if (history.recordedFrom(next)) return new ReplayError('threw', `The handler threw before step ${next} of its history (${RULE[2]}): ${message(error)}`, next);
+  if (next > 0 && history.fromMigration(next - 1)) {
+    return new ReplayError('threw', `The handler threw after step ${next - 1} of its history (${RULE[3]}): ${message(error)}`, next - 1);
+  }
+  if (history.endsInFailure()) return undefined; // rule 4
+  if (edited.length > 0) {
+    const ids = edited.map((id) => `"${id}"`).join(', ');
+    return new ReplayError('threw', `The handler threw after migrations ${ids} changed its history (${RULE[5]}): ${message(error)}`);
+  }
+  return undefined; // rule 6
+}
+
+/** What upstream's race returns; `invalidReturn` marks a failure from the `returns` validator, not a throw. */
+export type ReplayResult = WorkerResult & { invalidReturn?: true };
+
 /**
  * Runs the handler on the history's args, racing it against the executor as
- * upstream's workflow mutation does, and returns what upstream's race returns.
- * Throws a `ReplayError` for args that don't pass the `args` validator, for a
- * handler that throws after migrations applied in this handler run (`ran`),
- * unless the history's last step failed or was canceled, and the executor's
- * `ReplayMismatch`. Call it inside the replay's environment
+ * upstream's workflow mutation does. Returns what upstream's race returns, or
+ * the `ReplayError` the run pauses with, after halting the executor so that
+ * it starts no step. Call it inside the replay's environment
  * (`setupEnvironment`).
  */
 export async function replayHandler(
   registered: ReplayDefinition,
-  { history, ran }: Pick<Prepared, 'history' | 'ran'>,
+  { history, edited }: Pick<Prepared, 'history' | 'edited'>,
   executor: StepExecutor,
   options: { step: WorkflowCtx; console: { error: (...args: unknown[]) => void }; db?: GenericDatabaseReader<any> },
-): Promise<WorkerResult> {
+): Promise<ReplayResult | ReplayError> {
   const { console } = options;
   const args = history.workflowArgs as unknown;
-  const handlerWorker = async (): Promise<WorkerResult> => {
+  const handlerWorker = async (): Promise<ReplayResult> => {
     try {
       argsValid(registered, args, options.db, true);
     } catch (error) {
@@ -107,6 +148,8 @@ export async function replayHandler(
     let runResult: RunResult;
     try {
       const returnValue = (await registered.handler(options.step, args)) ?? null;
+      const early = returnedEarly(history, executor.progress());
+      if (early) throw early;
       runResult = { kind: 'success', returnValue };
       if (registered.returns) {
         try {
@@ -114,20 +157,27 @@ export async function replayHandler(
         } catch (error) {
           const message = error instanceof ValidationError ? error.message : formatErrorWithStack(error);
           console.error('Workflow handler returned invalid return value: ', message);
-          runResult = { kind: 'failed', error: `Invalid return value: ${message}` };
+          return { type: 'handlerDone', runResult: { kind: 'failed', error: `Invalid return value: ${message}` }, invalidReturn: true };
         }
       }
     } catch (error) {
+      const pause = threwEarly(history, executor.progress(), error, edited);
+      if (pause) {
+        // Before anything else runs: another branch of the handler, as in a Promise.all, may still call a step.
+        executor.halted = true;
+        throw pause;
+      }
       const message = formatErrorWithStack(error);
       console.error(message);
-      // Likely a wrong migration: the run fails without saving it as applied, so restart applies the fixed one.
-      if (ran.length > 0 && history.steps.at(-1)?.error === undefined) {
-        const ids = ran.map((id) => `"${id}"`).join(', ');
-        throw new ReplayError('migration', `The handler threw replaying the history as migrations ${ids} leave it: ${message.split('\n')[0]}`);
-      }
       runResult = { kind: 'failed', error: message };
     }
     return { type: 'handlerDone', runResult };
   };
-  return await Promise.race([handlerWorker(), executor.run()]);
+  try {
+    return await Promise.race([handlerWorker(), executor.run()]);
+  } catch (error) {
+    if (!(error instanceof ReplayError)) throw error;
+    executor.halted = true;
+    return error;
+  }
 }
