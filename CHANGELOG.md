@@ -4,15 +4,4 @@ This project follows [Epoch Semantic Versioning](https://antfu.me/posts/epoch-se
 
 ## Unreleased
 
-The first release, for `@convex-dev/workflow` 0.4.10.
-
-- `step.patched(id)` and `step.deprecatePatch(id)` in workflows defined with this package's `WorkflowManager`. Patch ids are declared per workflow in `convex/patches.ts` and passed as `declared`; `patched()` throws for an undeclared id.
-- A recorded patch counts wherever its `patched()` call sits in the run's history, so a released call can move.
-- The `workflowPatches` component, which records per run which patches it took and skipped, and which patch ids its code declared: `runs.load`, `runs.save`, `runs.lookup`, `runs.deployed` and `runs.cleanup`.
-- A predeploy check for [convex-release](https://github.com/dev-marzahn/convex-release) 100.1.0 or later (protocol 1; tested with 100.1.0-next.0): convex-release's deploys and images refuse a release that removes a patch's old branch while running workflows may still need it.
-- `convex-workflow-patches check`: the same check from a checkout, for deploys without convex-release.
-- An optional `componentPaths` export in `convex/patches.ts`, for components mounted under other names.
-- A run that skipped a patch whose old branch was removed fails with an error naming the patch.
-- `WorkflowManager.cleanup` deletes a run's patch records with the run.
-- convex-test helpers in `@dev-marzahn/convex-workflow-patches/test`: `register` and `simulateDeploy`.
-- Upstream's exports are re-exported, except `defineWorkflow` and the standalone `cleanup`, which bypass patching.
+- The first release, as `@dev-marzahn/convex-workflow-migrations`, for `@convex-dev/workflow` 0.4.10: per-workflow migrations. `migration(id, fn)`, listed in `workflow.define({ migrations })`, rewrites a run's recorded history into the shape the current handler expects. Each run's record in the `workflowMigrations` component, written when the run is created, says which migrations it has had; the pending ones apply at its next replay, so a run from any older release replays on the newest code. A run that can't replay fails with a message that says why. `restart({ from })` refuses a run whose migrations edited its history. `/replay` has `history()`, `expectReplays` and `migrate`, without Convex; `/test` adds `register(t)` for convex-test. This replaces the earlier, unreleased `step.patched()` design and its predeploy check.

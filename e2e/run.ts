@@ -1,14 +1,13 @@
-// End-to-end tests on a real self-hosted backend: fixture app v1 starts a run
-// that waits on `awaitEvent`, a second fixture app is deployed over it as the
-// next release, and the run finishes on the new code.
+// End-to-end tests on a real self-hosted backend: a fixture app starts a run
+// that waits on `awaitEvent`, a later release (another fixture, or
+// examples/basic) is deployed over it, and the run finishes on the new code,
+// or fails.
 //
 //   bun run e2e                 all scenarios
-//   bun run e2e patched         only these
+//   bun run e2e skip            only these
 //
 // Needs Docker. Builds the package first.
 import { spawnSync, type SpawnSyncOptions } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
@@ -17,19 +16,21 @@ import { isDeepStrictEqual } from 'node:util';
 import { type Backend, startBackend } from './backend.ts';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
-const PREFIX = 'convex-workflow-patches-e2e';
+const PREFIX = 'convex-workflow-migrations-e2e';
 
 function sh(cmd: string, args: string[], options: SpawnSyncOptions = {}): string {
-  const result = spawnSync(cmd, args, { encoding: 'utf8', ...options });
-  if (result.status !== 0)
-    throw new Error(`${cmd} ${args.join(' ')} failed:\n${`${String(result.stdout ?? '')}\n${String(result.stderr ?? '')}`.trim().slice(-3000)}`);
-  return String(result.stdout ?? '');
+  const result = spawnSync(cmd, args, { encoding: 'utf8', maxBuffer: 64 << 20, ...options });
+  const [stdout, stderr] = [String(result.stdout ?? ''), String(result.stderr ?? '')];
+  if (result.status !== 0) throw new Error(`${cmd} ${args.join(' ')} failed:\n${`${stdout}\n${stderr}`.trim().slice(-3000)}`);
+  return stdout;
 }
 const log = (message: string) => console.log(message);
 
 // ------------------------------------------------------------------ apps ---
 
-const appDir = (app: string) => join(ROOT, 'e2e/apps', app);
+// Release 3 is the example app; the other releases are fixtures in e2e/apps.
+const release3 = 'examples/basic';
+const appDir = (app: string) => join(ROOT, app === release3 ? app : `e2e/apps/${app}`);
 const convex = (app: string, backend: Backend, args: string[]) =>
   sh(join(appDir(app), 'node_modules/.bin/convex'), args, { cwd: appDir(app), env: backend.env });
 
@@ -38,211 +39,98 @@ function deploy(app: string, backend: Backend): void {
   convex(app, backend, ['deploy', '-y', '--codegen', 'disable', '--typecheck', 'disable']);
 }
 
-function call<T>(app: string, backend: Backend, fn: string, args: Record<string, unknown>): T {
+function call<T>(app: string, backend: Backend, fn: string, args: Record<string, unknown>, component?: string): T {
   // `convex run` prints nothing for a null result.
-  const out = convex(app, backend, ['run', fn, JSON.stringify(args)]).trim();
-  return (out ? JSON.parse(out) : undefined) as T;
+  const out = convex(app, backend, ['run', ...(component ? ['--component', component] : []), fn, JSON.stringify(args)]).trim();
+  return (out ? JSON.parse(out) : null) as T;
 }
 
 type Ids = { grabId: string; workflowId: string };
 type Grab = { log: string[]; status: string; error?: string };
 
-async function until(app: string, backend: Backend, grabId: string, done: (grab: Grab) => boolean, timeoutMs = 60_000): Promise<Grab> {
+async function until<T>(read: () => T, done: (value: T) => boolean, what: string, timeoutMs = 60_000): Promise<T> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
-    const grab = call<Grab>(app, backend, 'pipeline:grab', { grabId });
-    if (done(grab)) return grab;
-    if (Date.now() > deadline) throw new Error(`Timed out waiting on grab ${grabId}: ${JSON.stringify(grab)}`);
+    const value = read();
+    if (done(value)) return value;
+    if (Date.now() > deadline) throw new Error(`Timed out waiting for ${what}: ${JSON.stringify(value)}`);
     await sleep(500);
   }
 }
+const grab = (app: string, backend: Backend, { grabId }: Ids) => call<Grab>(app, backend, 'pipeline:status', { grabId });
+const record = (app: string, backend: Backend, { workflowId }: Ids) =>
+  call<{ applied: string[]; overlay: unknown[] } | null>(app, backend, 'runs:load', { workflowId }, 'workflowMigrations');
+const finished = (app: string, backend: Backend, ids: Ids, what: string) =>
+  until(
+    () => grab(app, backend, ids),
+    (g) => g.status !== 'inProgress',
+    what,
+  );
 
 function expectEqual(actual: unknown, expected: unknown, what: string): void {
   if (!isDeepStrictEqual(actual, expected)) throw new Error(`${what}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
 }
 
-/**
- * Runs the package's `bin` from an app's dependency on it, as a deploy step
- * would. Resolved through package.json rather than node_modules/.bin, which a
- * fresh install doesn't link before the first build. Doesn't throw on a
- * non-zero exit.
- */
-function runCheck(app: string, backend: Backend): { status: number | null; output: string } {
-  const pkg = join(appDir(app), 'node_modules/@dev-marzahn/convex-workflow-patches');
-  const bin = (JSON.parse(readFileSync(join(pkg, 'package.json'), 'utf8')) as { bin: Record<string, string> }).bin['convex-workflow-patches']!;
-  const result = spawnSync(process.execPath, [join(pkg, bin), 'check'], { cwd: appDir(app), env: backend.env, encoding: 'utf8' });
-  return { status: result.status, output: `${result.stdout}\n${result.stderr}` };
-}
+const ALL = ['notify-after-grab', 'import-gets-notified-at', 'prepare-becomes-transcode'];
 
-type Expected = { lists?: string[]; omits?: string[] };
-
-/** Throws unless the command exited with `status` and its output has every `lists` text and no `omits` text. */
-function expectRun(label: string, result: { status: number | null; output: string }, status: number, { lists = [], omits = [] }: Expected = {}) {
-  if (result.status !== status) throw new Error(`${label}: expected exit ${status}, got ${result.status}:\n${result.output}`);
-  for (const text of lists) if (!result.output.includes(text)) throw new Error(`${label} didn't print ${text}:\n${result.output}`);
-  for (const text of omits) if (result.output.includes(text)) throw new Error(`${label} printed ${text}:\n${result.output}`);
-}
-
-const expectCheck = (app: string, backend: Backend, status: number, what: string, expected?: Expected) =>
-  expectRun(`check from ${app} ${what}`, runCheck(app, backend), status, expected);
-
-// --------------------------------------------------------- convex-release ---
-
-const PACKAGE = '@dev-marzahn/convex-workflow-patches';
-const REFUSED = 'A predeploy check refused this release; nothing was pushed.';
-
-/** `convex-release deploy` from an app's checkout. Doesn't throw on a non-zero exit. */
-function releaseDeploy(app: string, backend: Backend) {
-  log(`  convex-release deploy ${app}`);
-  const result = spawnSync(join(appDir(app), 'node_modules/.bin/convex-release'), ['deploy'], { cwd: appDir(app), env: backend.env, encoding: 'utf8' });
-  return { status: result.status, output: `${result.stdout}\n${result.stderr}` };
-}
-
-/**
- * Bundles an app as an image build would, then applies it with
- * convex-release's one-shot image, which runs the bundled predeploy checks
- * without the app's node_modules. Doesn't throw on a non-zero exit.
- */
-function releaseImage(app: string, backend: Backend) {
-  log(`  convex-release one-shot image ${app}`);
-  const bundle = mkdtempSync(join(tmpdir(), `${PREFIX}-bundle-`));
-  try {
-    sh(join(appDir(app), 'node_modules/.bin/convex-release'), ['bundle', bundle], { cwd: appDir(app) });
-    const { version } = JSON.parse(readFileSync(join(appDir(app), 'node_modules/@dev-marzahn/convex-release/package.json'), 'utf8')) as { version: string };
-    // The image's version must match the app's convex-release, as its build checks.
-    const image = `ghcr.io/dev-marzahn/convex-release-oneshot:${version}-runtime`;
-    const result = spawnSync(
-      'docker',
-      [
-        'run',
-        '--rm',
-        // The backend's network namespace, so 127.0.0.1:3210 is the backend.
-        '--network',
-        `container:${backend.container}`,
-        '-v',
-        `${bundle}:/convex/app`,
-        '-e',
-        'CONVEX_URL=http://127.0.0.1:3210',
-        '-e',
-        `INSTANCE_NAME=${backend.instance.name}`,
-        '-e',
-        `INSTANCE_SECRET=${backend.instance.secret}`,
-        image,
-      ],
-      { encoding: 'utf8' },
-    );
-    return { status: result.status, output: `${result.stdout}\n${result.stderr}` };
-  } finally {
-    rmSync(bundle, { recursive: true, force: true });
-  }
-}
-
-/** Release 1 starts a run and leaves it waiting for its download. */
-async function startWaitingRun(backend: Backend): Promise<Ids> {
-  deploy('v1', backend);
-  const ids = call<Ids>('v1', backend, 'pipeline:startGrab', { title: 'started on release 1' });
-  // The run is waiting once its first step has run and the workflow is still in progress.
-  await until('v1', backend, ids.grabId, (g) => g.log.length === 1 && g.status === 'inProgress');
+/** Starts a run on `app` and leaves it waiting for its download, after `steps` steps. */
+async function startWaitingRun(app: string, backend: Backend, steps: number): Promise<Ids> {
+  const ids = call<Ids>(app, backend, 'pipeline:startGrab', { title: `started on ${app}` });
+  await until(
+    () => grab(app, backend, ids),
+    (g) => g.log.length === steps && g.status === 'inProgress',
+    `the run started on ${app} to wait`,
+  );
   return ids;
 }
 
 // ------------------------------------------------------------- scenarios ---
 
 const scenarios: Record<string, (backend: Backend) => Promise<void>> = {
-  /** A run waiting across a patched release skips the patch before its wait and takes the one after. */
-  async patched(backend) {
-    const old = await startWaitingRun(backend);
-    deploy('v2', backend);
-    const fresh = call<Ids>('v2', backend, 'pipeline:startGrab', { title: 'started on release 2' });
-    await until('v2', backend, fresh.grabId, (g) => g.log.length === 2);
-    for (const { workflowId } of [old, fresh]) call('v2', backend, 'pipeline:downloadDone', { workflowId });
+  /**
+   * A run from release 0 (plain @convex-dev/workflow) waiting across a deploy
+   * of release 3, which lists the migrations of releases 1 to 3: it replays
+   * without releases 1 and 2 ever being deployed. A run started on release 3
+   * has every migration applied from the start.
+   */
+  async skip(backend) {
+    deploy('v1', backend);
+    const old = await startWaitingRun('v1', backend, 1);
+    deploy(release3, backend);
+    expectEqual(record(release3, backend, old), null, 'the release 0 run’s record before its next handler run');
+    const fresh = await startWaitingRun(release3, backend, 2);
+    expectEqual(record(release3, backend, fresh), { applied: ALL, overlay: [] }, 'the release 3 run’s record');
+    for (const ids of [old, fresh]) call(release3, backend, 'pipeline:downloadDone', { workflowId: ids.workflowId });
 
-    const oldGrab = await until('v2', backend, old.grabId, (g) => g.status !== 'inProgress');
-    expectEqual(oldGrab, { log: ['grab', 'import', 'prepare', 'publish'], status: 'completed' }, 'the run started on release 1');
-    const freshGrab = await until('v2', backend, fresh.grabId, (g) => g.status !== 'inProgress');
-    expectEqual(freshGrab, { log: ['grab', 'notify', 'import', 'prepare', 'publish'], status: 'completed' }, 'the run started on release 2');
+    // notify is a stand-in for the old run: it was past that point.
+    expectEqual(
+      await finished(release3, backend, old, 'the release 0 run to finish'),
+      { log: ['grab', 'import', 'transcode', 'publish'], status: 'completed' },
+      'the release 0 run',
+    );
+    expectEqual(record(release3, backend, old)?.applied, ALL, 'the release 0 run’s applied migrations');
+    const freshGrab = await finished(release3, backend, fresh, 'the release 3 run to finish');
+    expectEqual(freshGrab, { log: ['grab', 'notify', 'import', 'transcode', 'publish'], status: 'completed' }, 'the release 3 run');
+    expectEqual(record(release3, backend, fresh)?.overlay, [], 'the release 3 run’s overlay');
   },
 
   /**
-   * `convex-workflow-patches check` before each deploy: adopting the package
-   * and adding patches passes; removing a patch's old branch is refused while a
-   * run from before the patch is running, and passes once it has finished.
+   * Release 2's change without its migrations: the run release 0 left
+   * waiting fails at its next handler run, with the mismatch, as it would
+   * without this package.
    */
-  async check(backend) {
-    const old = await startWaitingRun(backend);
-    // Release 1 is plain @convex-dev/workflow, without the patches component.
-    expectCheck('v2', backend, 0, 'before adopting the package');
-    deploy('v2', backend);
-    const fresh = call<Ids>('v2', backend, 'pipeline:startGrab', { title: 'started on release 2' });
-    await until('v2', backend, fresh.grabId, (g) => g.log.length === 2);
-    expectCheck('v2', backend, 0, 'for a release that removes nothing');
-
-    // Release 3 removes notify-after-grab's old branch; the release 1 run may need it.
-    expectCheck('v3', backend, 1, 'while the release 1 run is waiting', { lists: [old.workflowId], omits: [fresh.workflowId] });
-    call('v2', backend, 'pipeline:downloadDone', { workflowId: old.workflowId });
-    expectEqual(
-      await until('v2', backend, old.grabId, (g) => g.status !== 'inProgress'),
-      { log: ['grab', 'import', 'prepare', 'publish'], status: 'completed' },
-      'the run started on release 1',
-    );
-    expectCheck('v3', backend, 0, 'once the release 1 run finished');
-
-    // The release 2 run took notify-after-grab, so it replays on release 3.
-    deploy('v3', backend);
-    call('v3', backend, 'pipeline:downloadDone', { workflowId: fresh.workflowId });
-    expectEqual(
-      await until('v3', backend, fresh.grabId, (g) => g.status !== 'inProgress'),
-      { log: ['grab', 'notify', 'import', 'prepare', 'publish'], status: 'completed' },
-      'the run started on release 2, finished on release 3',
-    );
-  },
-
-  /**
-   * convex-release runs the same check as its predeploy check, before it
-   * pushes anything: from a checkout with `convex-release deploy`, and in its
-   * one-shot image from the bundled module.
-   */
-  async release(backend) {
-    const old = await startWaitingRun(backend);
-    expectRun('convex-release deploy v2, adopting the package', releaseDeploy('v2', backend), 0, {
-      lists: ['The deployment has no workflowPatches component yet'],
-    });
-    const fresh = call<Ids>('v2', backend, 'pipeline:startGrab', { title: 'started on release 2' });
-    await until('v2', backend, fresh.grabId, (g) => g.log.length === 2);
-
-    // Release 3 removes notify-after-grab's old branch; the release 1 run may need it.
-    const refusal = { lists: [REFUSED, `${PACKAGE}: 1 running workflow still needs code this release removes`, old.workflowId], omits: [fresh.workflowId] };
-    expectRun('convex-release deploy v3 while the release 1 run is waiting', releaseDeploy('v3', backend), 1, refusal);
-    expectRun('the one-shot image of v3 while the release 1 run is waiting', releaseImage('v3', backend), 1, refusal);
-
-    // Nothing was pushed: on release 3's code, the run would fail on the removed patch.
-    call('v2', backend, 'pipeline:downloadDone', { workflowId: old.workflowId });
-    expectEqual(
-      await until('v2', backend, old.grabId, (g) => g.status !== 'inProgress'),
-      { log: ['grab', 'import', 'prepare', 'publish'], status: 'completed' },
-      'the run started on release 1',
-    );
-
-    expectRun('the one-shot image of v3 once the release 1 run finished', releaseImage('v3', backend), 0, {
-      lists: [`[${PACKAGE}] pipeline:run removes "notify-after-grab".`],
-      omits: [REFUSED],
-    });
-    call('v3', backend, 'pipeline:downloadDone', { workflowId: fresh.workflowId });
-    expectEqual(
-      await until('v3', backend, fresh.grabId, (g) => g.status !== 'inProgress'),
-      { log: ['grab', 'notify', 'import', 'prepare', 'publish'], status: 'completed' },
-      'the run started on release 2, finished on release 3',
-    );
-  },
-
-  /** The same change without patched() fails the waiting run: what the package exists to prevent. */
-  async unguarded(backend) {
-    const old = await startWaitingRun(backend);
+  async 'failed-mismatch'(backend) {
+    deploy('v1', backend);
+    const old = await startWaitingRun('v1', backend, 1);
     deploy('v2-unguarded', backend);
     call('v2-unguarded', backend, 'pipeline:downloadDone', { workflowId: old.workflowId });
-    const grab = await until('v2-unguarded', backend, old.grabId, (g) => g.status !== 'inProgress');
-    expectEqual(grab.status, 'failed', 'the run started on release 1');
-    if (!grab.error?.includes('Journal entry mismatch')) throw new Error(`Expected a journal mismatch, got: ${grab.error}`);
+    const failed = await finished('v2-unguarded', backend, old, 'the run to fail');
+    expectEqual({ log: failed.log, status: failed.status }, { log: ['grab'], status: 'failed' }, 'the release 0 run');
+    const mismatch =
+      'Journal entry mismatch at step 1 of the run\'s history, as its migrations leave it: the code calls {"args":{"grabId":"' +
+      `${old.grabId}"},"kind":"function","name":"pipeline:notify"}, the history has {"args":{},"kind":"event","name":"downloadDone"}`;
+    if (!failed.error?.includes(mismatch)) throw new Error(`Expected the mismatch "${mismatch}", got: ${failed.error}`);
+    expectEqual(record('v2-unguarded', backend, old), null, 'the failed run’s record');
   },
 };
 

@@ -1,50 +1,51 @@
-/// <reference types="vite/client" />
-import patchesTest, { simulateDeploy } from '@dev-marzahn/convex-workflow-patches/test';
-import { convexTest } from 'convex-test';
-import { afterEach, beforeEach, expect, test, vi } from 'vite-plus/test';
+// @vitest-environment node
+// Histories the older releases recorded, replayed against the current code
+// with the helpers from /replay: no Convex backend, no convex-test, and no
+// Vitest configuration needed.
+import { expectReplays, history, migrate } from '@dev-marzahn/convex-workflow-migrations/replay';
+import { makeFunctionReference } from 'convex/server';
+import { expect, test } from 'vite-plus/test';
 
-import { api } from './_generated/api';
-import schema from './schema';
+import { internal } from './_generated/api';
+import type { Id } from './_generated/dataModel';
+import { run } from './pipeline';
 
-const modules = import.meta.glob('./**/*.ts');
-const release1 = { without: ['notify-after-grab', 'prepare-before-publish'] };
+// Built by hand, as the older releases recorded them.
+const grabId = 'k57' as Id<'grabs'>;
+const prepare = makeFunctionReference<'mutation'>('pipeline:prepare');
+const release0 = {
+  waiting: history(
+    [
+      { step: internal.pipeline.grab, args: { grabId } },
+      { event: 'downloadDone', status: 'running' },
+    ],
+    { args: { grabId } },
+  ),
+  preparing: history(
+    [
+      { step: internal.pipeline.grab, args: { grabId } },
+      { event: 'downloadDone' },
+      { step: internal.pipeline.importFiles, args: { grabId } },
+      { step: prepare, args: { grabId } },
+    ],
+    { args: { grabId } },
+  ),
+};
+const release2Waiting = history(
+  [
+    { step: internal.pipeline.grab, args: { grabId } },
+    { step: internal.pipeline.notify, args: { grabId }, result: { at: 1700000000000 } },
+    { event: 'downloadDone', status: 'running' },
+  ],
+  { args: { grabId }, applied: ['notify-after-grab', 'import-gets-notified-at'] },
+);
 
-function setup() {
-  const t = convexTest(schema, modules);
-  patchesTest.register(t);
-  return t;
-}
-type T = ReturnType<typeof setup>;
-const settle = (t: T) => t.finishAllScheduledFunctions(vi.runAllTimers);
-const log = (t: T, grabId: Awaited<ReturnType<typeof startGrab>>['grabId']) => t.run(async (ctx) => (await ctx.db.get('grabs', grabId))?.log);
-async function startGrab(t: T) {
-  const ids = await t.mutation(api.pipeline.startGrab, { title: 'Some Show S01E01' });
-  await settle(t);
-  return ids;
-}
-
-beforeEach(() => {
-  vi.useFakeTimers();
-  simulateDeploy();
+test('runs from every older release replay on the current code', async () => {
+  await expectReplays(run, [release0.waiting, release0.preparing, release2Waiting]);
 });
-afterEach(() => vi.useRealTimers());
 
-test('a grab waiting for its download when release 2 ships gets prepare but not notify', async () => {
-  const t = setup();
-  simulateDeploy(release1);
-  const { grabId, workflowId } = await startGrab(t);
-  expect(await log(t, grabId)).toEqual(['grab']);
-
-  simulateDeploy(); // release 2
-  await t.mutation(api.pipeline.downloadDone, { workflowId });
-  await settle(t);
-  expect(await log(t, grabId)).toEqual(['grab', 'import', 'prepare', 'publish']);
-});
-
-test('a grab started on release 2 runs every step', async () => {
-  const t = setup();
-  const { grabId, workflowId } = await startGrab(t);
-  await t.mutation(api.pipeline.downloadDone, { workflowId });
-  await settle(t);
-  expect(await log(t, grabId)).toEqual(['grab', 'notify', 'import', 'prepare', 'publish']);
+test('a run from release 0 gets a stand-in notify and imports without a time', () => {
+  const migrated = migrate(run, release0.preparing);
+  expect(migrated.steps.map((step) => step.name)).toEqual(['pipeline:grab', 'pipeline:notify', 'downloadDone', 'pipeline:importFiles', 'pipeline:transcode']);
+  expect(migrated.steps[3]?.args).toEqual({ grabId, notifiedAt: null });
 });

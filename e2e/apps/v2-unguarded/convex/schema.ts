@@ -1,4 +1,4 @@
-import { vWorkflowId } from '@dev-marzahn/convex-workflow-patches';
+import { vWorkflowId } from '@dev-marzahn/convex-workflow-migrations';
 import { defineSchema, defineTable } from 'convex/server';
 import { v } from 'convex/values';
 

@@ -20,36 +20,12 @@
         "convex-helpers": "catalog:",
       },
     },
-    "e2e/apps/v2": {
-      "name": "e2e-app-v2",
-      "dependencies": {
-        "@convex-dev/migrations": "catalog:",
-        "@convex-dev/workflow": "catalog:",
-        "@convex-dev/workpool": "catalog:",
-        "@dev-marzahn/convex-release": "catalog:",
-        "@dev-marzahn/convex-workflow-patches": "workspace:*",
-        "convex": "catalog:",
-        "convex-helpers": "catalog:",
-      },
-    },
     "e2e/apps/v2-unguarded": {
       "name": "e2e-app-v2-unguarded",
       "dependencies": {
         "@convex-dev/workflow": "catalog:",
         "@convex-dev/workpool": "catalog:",
-        "@dev-marzahn/convex-workflow-patches": "workspace:*",
-        "convex": "catalog:",
-        "convex-helpers": "catalog:",
-      },
-    },
-    "e2e/apps/v3": {
-      "name": "e2e-app-v3",
-      "dependencies": {
-        "@convex-dev/migrations": "catalog:",
-        "@convex-dev/workflow": "catalog:",
-        "@convex-dev/workpool": "catalog:",
-        "@dev-marzahn/convex-release": "catalog:",
-        "@dev-marzahn/convex-workflow-patches": "workspace:*",
+        "@dev-marzahn/convex-workflow-migrations": "workspace:*",
         "convex": "catalog:",
         "convex-helpers": "catalog:",
       },
@@ -59,7 +35,7 @@
       "dependencies": {
         "@convex-dev/workflow": "catalog:",
         "@convex-dev/workpool": "catalog:",
-        "@dev-marzahn/convex-workflow-patches": "workspace:*",
+        "@dev-marzahn/convex-workflow-migrations": "workspace:*",
         "convex": "catalog:",
         "convex-helpers": "catalog:",
       },
@@ -69,18 +45,16 @@
         "vite-plus": "catalog:",
       },
     },
-    "packages/convex-workflow-patches": {
-      "name": "@dev-marzahn/convex-workflow-patches",
+    "packages/convex-workflow-migrations": {
+      "name": "@dev-marzahn/convex-workflow-migrations",
       "version": "100.0.0",
-      "bin": {
-        "convex-workflow-patches": "./dist/cli.js",
-      },
       "dependencies": {
         "async-channel": "catalog:",
       },
       "devDependencies": {
         "@convex-dev/workflow": "catalog:",
         "@convex-dev/workpool": "catalog:",
+        "@dev-marzahn/convex-release": "catalog:",
         "@edge-runtime/vm": "catalog:",
         "@types/node": "catalog:",
         "convex": "catalog:",
@@ -105,10 +79,9 @@
     "vite": "catalog:",
   },
   "catalog": {
-    "@convex-dev/migrations": "^0.3.8",
     "@convex-dev/workflow": "0.4.10",
     "@convex-dev/workpool": "0.4.16",
-    "@dev-marzahn/convex-release": "100.1.0-next.0",
+    "@dev-marzahn/convex-release": "100.1.0",
     "@edge-runtime/vm": "5.0.0",
     "@types/node": "^26.6.6",
     "async-channel": "^0.2.0",
@@ -140,9 +113,9 @@
 
     "@convex-dev/workpool": ["@convex-dev/workpool@0.4.16", "", { "dependencies": { "@convex-dev/batch-worker": "^0.3.6" }, "peerDependencies": { "convex": "^1.43.0", "convex-helpers": "^0.1.94" } }, "sha512-QtR9lEidys0yGtjlbtJzhcC6RGxs4uICnewWZmiolDnUlX4Y8z5v4hGwDzON3TRDIzL3Pd/WPY/jXRKZnQW4Bg=="],
 
-    "@dev-marzahn/convex-release": ["@dev-marzahn/convex-release@100.1.0-next.0", "", { "dependencies": { "@clack/prompts": "^1.9.0", "@faker-js/faker": "^10.6.0", "commander": "^15.1.0" }, "peerDependencies": { "@convex-dev/migrations": "^0.3.8", "convex": "^1.50.0" }, "bin": { "convex-release": "dist/cli.mjs" } }, "sha512-tz+lcCcrEqUPcx6heQng6YVJGeyix+DSHecaG/e5ld2uI7QrqNQ4Nmy/6TIRr7RGNfNrt/+SftSTn6zgIYB37w=="],
+    "@dev-marzahn/convex-release": ["@dev-marzahn/convex-release@100.1.0", "", { "dependencies": { "@clack/prompts": "^1.9.0", "@faker-js/faker": "^10.6.0", "commander": "^15.1.0" }, "peerDependencies": { "@convex-dev/migrations": "^0.3.8", "convex": "^1.50.0" }, "bin": { "convex-release": "dist/cli.mjs" } }, "sha512-Dk1W/DtS6r/MrqURFbl73Q6sh+TEcWNntBQZjG0ShN2xS4QBK5rGggWzcf7r/lczBh0TFJrjWniF8qLF0rvx8Q=="],
 
-    "@dev-marzahn/convex-workflow-patches": ["@dev-marzahn/convex-workflow-patches@workspace:packages/convex-workflow-patches"],
+    "@dev-marzahn/convex-workflow-migrations": ["@dev-marzahn/convex-workflow-migrations@workspace:packages/convex-workflow-migrations"],
 
     "@edge-runtime/primitives": ["@edge-runtime/primitives@6.0.0", "", {}, "sha512-FqoxaBT+prPBHBwE1WXS1ocnu/VLTQyZ6NMUBAdbP7N2hsFTTxMC/jMu2D/8GAlMQfxeuppcPuCUk/HO3fpIvA=="],
 
@@ -446,11 +419,7 @@
 
     "e2e-app-v1": ["e2e-app-v1@workspace:e2e/apps/v1"],
 
-    "e2e-app-v2": ["e2e-app-v2@workspace:e2e/apps/v2"],
-
     "e2e-app-v2-unguarded": ["e2e-app-v2-unguarded@workspace:e2e/apps/v2-unguarded"],
-
-    "e2e-app-v3": ["e2e-app-v3@workspace:e2e/apps/v3"],
 
     "es-module-lexer": ["es-module-lexer@2.3.2", "", {}, "sha512-poHGpORABojJJucnV9KbOavETW8lBVnphkW77ER5/BQ5Fz7oXSoCNek7IH3vR5nRjdsEz926ibFYX8KtLQmdyw=="],
 

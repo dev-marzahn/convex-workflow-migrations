@@ -10,4 +10,4 @@ Don't open a public issue. Report it through [GitHub's private vulnerability rep
 
 ## Scope
 
-This covers the `@dev-marzahn/convex-workflow-patches` package, including its copy of `@convex-dev/workflow`'s client code. Report issues in `@convex-dev/workflow` itself to [Convex](https://github.com/convex/workflow/security), and issues in the Convex backend to [Convex](https://github.com/get-convex/convex-backend/security).
+This covers the `@dev-marzahn/convex-workflow-migrations` package, including its copy of `@convex-dev/workflow`'s client code. Report issues in `@convex-dev/workflow` itself to [Convex](https://github.com/convex/workflow/security), and issues in the Convex backend to [Convex](https://github.com/get-convex/convex-backend/security).

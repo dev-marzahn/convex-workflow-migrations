@@ -41,9 +41,9 @@ jobs:
         env:
           TAG: ${{ inputs.tag || github.ref_name }}
         run: |
-          version=$(node -p "require('./packages/convex-workflow-patches/package.json').version")
+          version=$(node -p "require('./packages/convex-workflow-migrations/package.json').version")
           if [ "v$version" != "$TAG" ]; then
-            echo "::error::Tag $TAG doesn't match packages/convex-workflow-patches/package.json version $version"
+            echo "::error::Tag $TAG doesn't match packages/convex-workflow-migrations/package.json version $version"
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
@@ -77,7 +77,7 @@ jobs:
       - run: bun run build
       # bun pm pack replaces the catalog: ranges with real ones; npm publish wouldn't.
       - name: Pack
-        working-directory: packages/convex-workflow-patches
+        working-directory: packages/convex-workflow-migrations
         run: bun pm pack --destination "$RUNNER_TEMP" --quiet
       # Outside the repo: its devEngines names Bun, and npm refuses to run under it.
       # npm only accepts provenance from public repos.

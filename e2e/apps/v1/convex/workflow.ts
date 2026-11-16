@@ -1,4 +1,4 @@
-// Release 1 runs on plain @convex-dev/workflow; release 2 adopts this package.
+// Release 0 runs on plain @convex-dev/workflow; later releases adopt this package.
 import { WorkflowManager } from '@convex-dev/workflow';
 
 import { components } from './_generated/api';
