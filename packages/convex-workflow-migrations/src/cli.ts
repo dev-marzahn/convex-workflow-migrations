@@ -9,6 +9,7 @@ import { dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 
+import { FORMAT } from './component/schema.ts';
 import type { OverlayOp, RecordedHistory, RecordedStep, StepKind } from './history.ts';
 import { type Redact, redactHistory } from './redact.ts';
 import type { RunResult } from './vendor/workflow/types.ts';
@@ -20,28 +21,37 @@ finished ones, as JSON: the input for expectReplays() from
 @dev-marzahn/convex-workflow-migrations/test. <workflow> is the workflow's
 function name, like pipeline:run. Run it from your app's directory.
 
-The export holds production data: every run's args, and every step's args,
-result and error. Check it, or scrub it with --redact, before you commit it.
+The export holds production data: every run's args, every step's args,
+result and error, and each record's overlay (stand-ins' args and results,
+rewritten args and results, migrated workflow args). Check it, or scrub it
+with --redact, before you commit it.
 
   --recent <n>                     Finished runs to export too, newest first. Default: 10
-  --max-runs <n>                   Runs to look through, newest first. Default: 1000
+  --max-runs <n>                   Runs to look through, newest first, at least 1.
+                                   If there are more, it exports nothing and
+                                   exits with 1. Default: 1000
+  --allow-partial                  Export anyway when there are more runs than
+                                   --max-runs: older running runs are missing.
   --max-steps <n>                  Steps to export per run, at least 1. A longer
                                    run is exported up to there, with
                                    "truncated": true. Default: 1000
-  --redact <module>                A module whose default export takes each step
-                                   and each run's args, { kind, name, args,
-                                   result?, error? }, and returns them scrubbed.
-                                   kind is "run" for a run's args.
+  --redact <module>                A module whose default export takes each step,
+                                   each run's args and the overlay's data,
+                                   { kind, name, args, result?, error? }, and
+                                   returns them scrubbed. kind is "run" for a
+                                   run's args. It's loaded with import(), so a
+                                   .ts module works on Node's type stripping
+                                   (erasable syntax only).
   --out <file>                     Write the JSON to <file> instead of stdout.
   --workflow-component <name>      Where @convex-dev/workflow is mounted. Default: workflow
   --migrations-component <name>    Where this package's component is mounted. Default: workflowMigrations
 
 Options after -- go to every \`convex\` command it runs, e.g. -- --prod. It
 runs two \`convex run\` commands per exported run, so it's slow for many runs.
-Exit codes: 0 exported, 2 usage or deployment error.`;
+Exit codes: 0 exported, 1 more runs than --max-runs, 2 usage or deployment error.`;
 
 const WARNING =
-  "The export holds production data: every run's args, and every step's args, result and error. Check it before you commit it, or scrub it with --redact.";
+  "The export holds production data: every run's args, every step's args, result and error, and each record's overlay (stand-ins, rewritten args and results, migrated workflow args). Check it before you commit it, or scrub it with --redact.";
 
 class UsageError extends Error {}
 
@@ -85,7 +95,7 @@ function isDeployed(component: string, convexArgs: string[]): boolean {
 type Page<T> = { page: T[]; isDone: boolean; continueCursor: string };
 type PublicWorkflow = { workflowId: string; name?: string; args: unknown; runResult?: RunResult };
 type WorkflowStep = { stepId: string; name: string; kind: StepKind; args: unknown; runResult?: RunResult; startedAt: number };
-type RunRecord = { applied: string[]; overlay: OverlayOp[] } | null;
+type RunRecord = { applied: string[]; overlay: OverlayOp[]; format: number } | null;
 
 const count = (value: string, option: string) => {
   const n = Number(value);
@@ -107,6 +117,7 @@ async function histories(argv: string[]): Promise<number> {
     options: {
       recent: { type: 'string', default: '10' },
       'max-runs': { type: 'string', default: '1000' },
+      'allow-partial': { type: 'boolean', default: false },
       'max-steps': { type: 'string', default: '1000' },
       redact: { type: 'string' },
       out: { type: 'string' },
@@ -123,6 +134,7 @@ async function histories(argv: string[]): Promise<number> {
   if (name === undefined || extra.length > 0) throw new UsageError('Pass one workflow function name, like pipeline:run.');
   const recent = count(values.recent, 'recent');
   const maxRuns = count(values['max-runs'], 'max-runs');
+  if (maxRuns < 1) throw new UsageError('--max-runs must be at least 1.');
   const maxSteps = Math.max(1, count(values['max-steps'], 'max-steps'));
   const redact = values.redact === undefined ? undefined : await loadRedact(values.redact);
   const convexArgs = split < 0 ? [] : argv.slice(split + 1);
@@ -134,11 +146,14 @@ async function histories(argv: string[]): Promise<number> {
   const runs: PublicWorkflow[] = [];
   let finished = 0;
   let scanned = 0;
+  let oldest: string | undefined;
+  let complete = false;
   let cursor: string | null = null;
   while (scanned < maxRuns) {
     const numItems = Math.min(100, maxRuns - scanned);
     const result: Page<PublicWorkflow> = query(workflowComponent, 'workflow:listByName', { name, order: 'desc', paginationOpts: { numItems, cursor } });
     scanned += result.page.length;
+    oldest = result.page.at(-1)?.workflowId ?? oldest;
     for (const run of result.page) {
       if (run.runResult === undefined) runs.push(run);
       else if (finished < recent) {
@@ -146,8 +161,22 @@ async function histories(argv: string[]): Promise<number> {
         runs.push(run);
       }
     }
-    if (result.isDone) break;
+    complete = result.isDone;
+    if (complete) break;
     cursor = result.continueCursor;
+  }
+  if (!complete) {
+    // The runs it didn't look at are the oldest: running ones there are on the oldest shapes.
+    const created =
+      oldest && query<{ workflow: { _creationTime: number } }>(workflowComponent, 'workflow:getStatus', { workflowId: oldest }).workflow._creationTime;
+    const since = created ? `, back to one created ${new Date(created).toISOString()}` : '';
+    console.error(
+      `${name} has more runs than --max-runs ${maxRuns}. The export looked at the newest ${scanned}${since}, so running runs older than that may be missing.`,
+    );
+    if (!values['allow-partial']) {
+      console.error('Nothing was exported. Raise --max-runs, or pass --allow-partial to export these anyway.');
+      return 1;
+    }
   }
 
   const records = isDeployed(migrationsComponent, convexArgs);
@@ -160,6 +189,11 @@ async function histories(argv: string[]): Promise<number> {
       paginationOpts: { numItems: maxSteps, cursor: null },
     });
     const record: RunRecord = records ? query(migrationsComponent, 'runs:load', { workflowId: run.workflowId }) : null;
+    if (record && record.format > FORMAT) {
+      throw new Error(
+        `Run ${run.workflowId}'s record has format ${record.format}, from a newer version of @dev-marzahn/convex-workflow-migrations than this one, which reads format ${FORMAT}. Install the version the deployment runs.`,
+      );
+    }
     const history: RecordedHistory = {
       workflowId: run.workflowId,
       workflow: name,

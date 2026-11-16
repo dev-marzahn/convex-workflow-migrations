@@ -3,7 +3,8 @@ import { anyApi, componentsGeneric, defineSchema, type FunctionReference, intern
 import { v } from 'convex/values';
 import { expect, test } from 'vite-plus/test';
 
-import { migration, type MigrationsComponent, type WorkflowComponent, type WorkflowCtx, WorkflowManager } from '../src/index.ts';
+import { migration, type MigrationsComponent, type Redactable, type WorkflowComponent, type WorkflowCtx, WorkflowManager } from '../src/index.ts';
+import { redactHistory } from '../src/redact.ts';
 import migrationsTest, { expectEdits, expectReplays, history, migrate } from '../src/test.ts';
 
 const components = componentsGeneric() as unknown as { workflow: WorkflowComponent; workflowMigrations: MigrationsComponent };
@@ -50,6 +51,18 @@ const functions = {
     args: { quality: v.string() },
     handler: async (step) => {
       await step.runMutation(flows.grab, {});
+      await step.awaitEvent({ name: 'downloadDone' });
+    },
+  }),
+  // Release 0 took only an email; release 1 adds a quality, which grab gets too.
+  personal: manager.define({
+    args: { email: v.string(), quality: v.string() },
+    migrations: [
+      migration('quality-arg', (h) => h.updateWorkflowArgs((args) => ({ ...args, quality: 'hd' }))),
+      migration('grab-gets-quality', (h) => h.updateArgs(flows.grab, (args) => ({ ...args, quality: h.workflowArgs.quality }))),
+    ],
+    handler: async (step, { email, quality }) => {
+      await step.runMutation(flows.grab, { email, quality });
       await step.awaitEvent({ name: 'downloadDone' });
     },
   }),
@@ -196,6 +209,32 @@ test('expectReplays fails, not pauses, a run whose newest step failed, though mi
   // A migration that renamed the failed step may be why it fails: that pauses.
   const renamed = await failure(expectReplays(t, ref('renamesGrab'), [history([{ step: flows.fetch, error: 'fetch failed' }])]));
   expect(renamed).toContain('(threw): The handler threw after migrations "fetch-becomes-grab" changed its history');
+});
+
+test('a redacted export replays: the overlay is scrubbed with the steps and the run args', async () => {
+  const t = setup();
+  const email = 'a@b.c';
+  const waiting = history(
+    [
+      { step: flows.grab, args: { email } },
+      { event: 'downloadDone', status: 'running' },
+    ],
+    { args: { email } },
+  );
+  // As exported: one run with both migrations saved, one with only the first, the second still to apply.
+  const workflowArgs = { op: 'workflowArgs' as const, args: { email, quality: 'hd' } };
+  const both = {
+    ...waiting,
+    applied: ['quality-arg', 'grab-gets-quality'],
+    overlay: [workflowArgs, { op: 'rewrite' as const, target: 'h0', args: { email, quality: 'hd' } }],
+  };
+  const first = { ...waiting, applied: ['quality-arg'], overlay: [workflowArgs] };
+  await expectReplays(t, ref('personal'), [both, first]);
+
+  const redact = (value: Redactable): Redactable => ({ ...value, args: JSON.parse(JSON.stringify(value.args).replaceAll(email, 'x')) });
+  const redacted = await Promise.all([both, first].map((h) => redactHistory(h, redact)));
+  expect(JSON.stringify(redacted)).not.toContain(email);
+  await expectReplays(t, ref('personal'), redacted);
 });
 
 test('expectReplays fails a truncated history', async () => {

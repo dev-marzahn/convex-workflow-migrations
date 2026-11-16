@@ -3,7 +3,7 @@ import { anyApi } from 'convex/server';
 import { expect, test } from 'vite-plus/test';
 
 import { DETAIL_LIMIT } from '../src/component/schema.ts';
-import { HistoryView, type RecordedStep, ReplayMismatch, ReplayPause, returnedEarly, threwEarly } from '../src/history.ts';
+import { HistoryView, type OverlayOp, type RecordedStep, ReplayMismatch, ReplayPause, returnedEarly, threwEarly } from '../src/history.ts';
 import { migration, OVERLAY_LIMIT, prepareHistory, recordedStep } from '../src/migrations.ts';
 import { redactHistory } from '../src/redact.ts';
 import type { JournalEntry } from '../src/vendor/workflow/types.ts';
@@ -375,4 +375,50 @@ test('redactHistory passes every step and the run args through redact', async ()
   expect(scrubbed.steps[1]!.runResult).toEqual({ kind: 'failed', error: 'e' });
   expect(scrubbed.steps[2]).not.toHaveProperty('runResult');
   expect(recorded.args).toEqual({ email: 'a@b.c' });
+});
+
+test('redactHistory passes the overlay’s stand-ins, rewrites and workflow args through redact', async () => {
+  const overlay: OverlayOp[] = [
+    { op: 'insert', id: '+1', where: 'after', anchor: 'j0', name: 'flows:notify', kind: 'function', result: { to: 'a@b.c' } },
+    { op: 'insert', id: '+2', where: 'after', anchor: '+1', name: 'flows:log', kind: 'function', args: { email: 'a@b.c' }, result: null },
+    { op: 'rewrite', target: 'j0', name: 'flows:fetch' },
+    { op: 'rewrite', target: 'j0', args: { email: 'a@b.c', quality: 'hd' } },
+    { op: 'rewrite', target: '+1', result: { to: 'a@b.c', at: 1 } },
+    { op: 'workflowArgs', args: { email: 'a@b.c', quality: 'hd' } },
+    { op: 'remove', target: 'j1' },
+  ];
+  const recorded = {
+    workflow: 'flows:pipeline',
+    args: { email: 'a@b.c' },
+    steps: [done('j0', 'grab', null, { email: 'a@b.c' }), event('j1', 'downloadDone')],
+    overlay,
+  };
+  const seen: string[] = [];
+  const scrub = (value: unknown): unknown => JSON.parse(JSON.stringify(value ?? null).replaceAll('a@b.c', 'x'));
+  const scrubbed = await redactHistory(recorded, (value) => {
+    seen.push(`${value.kind} ${value.name}${'result' in value ? ' with result' : ''}`);
+    return { ...value, args: scrub(value.args), ...('result' in value ? { result: scrub(value.result) } : {}) };
+  });
+  expect(seen).toEqual([
+    'function flows:grab with result',
+    'event downloadDone with result',
+    'run flows:pipeline',
+    'function flows:notify with result',
+    'function flows:log with result',
+    'function flows:fetch', // renamed by the rewrite before it
+    'function flows:notify with result',
+    'run flows:pipeline',
+  ]);
+  expect(JSON.stringify(scrubbed)).not.toContain('a@b.c');
+  // Only the data changes: a stand-in without args stays without them, and a rename-only rewrite stays as it was.
+  expect(scrubbed.overlay).toEqual([
+    { ...overlay[0], result: { to: 'x' } },
+    { ...overlay[1], args: { email: 'x' } },
+    overlay[2],
+    { ...overlay[3], args: { email: 'x', quality: 'hd' } },
+    { ...overlay[4], result: { to: 'x', at: 1 } },
+    { op: 'workflowArgs', args: { email: 'x', quality: 'hd' } },
+    overlay[6],
+  ]);
+  expect(JSON.stringify(recorded)).toContain('a@b.c');
 });
