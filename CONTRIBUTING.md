@@ -75,7 +75,7 @@ Each run has a record in the migrations component's `runs` table: its workflow f
 
 Upstream's journal is append-only and its component is unchanged, so the edits live in the record, anchored to journal entry ids. The overlay's operations (`vOverlayOp` in `src/component/schema.ts`):
 
-- `insert`, a stand-in, after or before a step, with its name, kind, args and result. Its id is a counter, `+1`, `+2`, …;
+- `insert`, a stand-in, after or before a step, or at the start of the history (an empty anchor, which `restart` writes for a stand-in whose anchor it deletes and that has no step around it left), with its name, kind, args and result. Its id is a counter, `+1`, `+2`, …;
 - `remove`, a step;
 - `truncate`, a range of journal entries, which `restartFrom` hides in one edit, with a `remove` for each stand-in in the part it cuts (`restart` adds only those `remove`s, since upstream deletes the entries);
 - `rewrite`, a step's name, args or result. A rewrite of a step that has one merges into it, the latest value of each field winning;

@@ -248,7 +248,33 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
       restart: FunctionReference<
         "mutation",
         "internal",
-        { from?: string; workflow: string; workflowId: string },
+        {
+          from?: string;
+          overlay?: Array<
+            | {
+                anchor: string;
+                args?: any;
+                id: string;
+                kind: "function" | "workflow" | "event" | "sleep";
+                name: string;
+                op: "insert";
+                result: any;
+                where: "after" | "before";
+              }
+            | { op: "remove"; target: string }
+            | { from: string; op: "truncate"; through: string }
+            | {
+                args?: any;
+                name?: string;
+                op: "rewrite";
+                result?: any;
+                target: string;
+              }
+            | { args: any; op: "workflowArgs" }
+          >;
+          workflow: string;
+          workflowId: string;
+        },
         null,
         Name
       >;

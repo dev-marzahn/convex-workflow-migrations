@@ -334,6 +334,7 @@ export class WorkflowManager extends UpstreamWorkflowManager {
       workflowId,
       workflow: record?.workflow ?? workflow.name ?? '',
       ...(point.id === undefined ? {} : { from: point.id }),
+      ...(point.overlay === undefined ? {} : { overlay: point.overlay }),
     });
     await super.restart(ctx, workflowId, { ...startAsync, ...(point.deleteFrom === undefined ? {} : { from: point.deleteFrom }) });
   }
@@ -375,14 +376,16 @@ export class WorkflowManager extends UpstreamWorkflowManager {
    * first journal entry at or after the step, or of an entry still marked
    * running, as a canceled run's wait is, if it comes first, since the run
    * would block on it otherwise (a workaround: upstream's restart keeps such
-   * an entry). Throws if it can't restart from there.
+   * an entry); and, if a stand-in before that point is anchored to an entry
+   * upstream deletes, the overlay with it anchored again
+   * (`HistoryView.reanchored`). Throws if it can't restart from there.
    */
   private restartPoint(
     workflowId: WorkflowId,
     from: number | string | StepRef | undefined,
     run: { entries: JournalEntry[]; args: unknown },
     record: { overlay: OverlayOp[] } | null,
-  ): { id?: string; deleteFrom?: number } {
+  ): { id?: string; deleteFrom?: number; overlay?: OverlayOp[] } {
     const history = new HistoryView(run.entries.map(recordedStep), record?.overlay ?? [], run.args);
     let position: number | undefined;
     if (typeof from === 'number') {
@@ -403,6 +406,10 @@ export class WorkflowManager extends UpstreamWorkflowManager {
       ...run.entries.filter((entry) => entry.step.inProgress).map((entry) => entry.stepNumber),
       ...(recorded === undefined ? [] : [stepNumbers.get(recorded)!]),
     ];
-    return { ...(id === undefined ? {} : { id }), ...(cuts.length === 0 ? {} : { deleteFrom: Math.min(...cuts) }) };
+    if (cuts.length === 0) return id === undefined ? {} : { id };
+    const deleteFrom = Math.min(...cuts);
+    // The stand-ins before the restart point anchored to an entry upstream deletes keep their place.
+    const overlay = history.reanchored((step) => (stepNumbers.get(step) ?? -1) >= deleteFrom, position ?? history.length);
+    return { ...(id === undefined ? {} : { id }), deleteFrom, ...(overlay ? { overlay } : {}) };
   }
 }

@@ -342,6 +342,58 @@ export class HistoryView implements History {
     return this.nodes.findLastIndex((node) => (typeof step === 'string' ? node.name === step : this.matches(node, step)));
   }
 
+  /**
+   * For `restart`, which has upstream delete the journal entries `deleted`
+   * names: the overlay to store, with each stand-in before `end` (the restart's
+   * position) and before the first deleted entry whose anchor, directly or
+   * through other stand-ins, is a deleted entry anchored again, so it isn't
+   * dropped with it: after the nearest step before it that stays, else before
+   * the nearest one after it, else at the start. Undefined if there's none.
+   * Stand-ins from there on are left to be dropped: they run again.
+   */
+  public reanchored(deleted: (id: string) => boolean, end: number): OverlayOp[] | undefined {
+    const cut = this.nodes.findIndex((node) => node.recorded && deleted(node.id));
+    const early = new Set(this.nodes.slice(0, cut < 0 ? end : Math.min(end, cut)).map((node) => node.id));
+    const lost = new Set<string>();
+    for (const op of this.ops) if (op.op === 'insert' && (deleted(op.anchor) || lost.has(op.anchor))) lost.add(op.id);
+    const moved = new Set([...lost].filter((id) => early.has(id)));
+    if (moved.size === 0) return undefined;
+    // The overlay applied again, to ids: `list` is the history so far, `left` the steps in it that are left after the restart. A
+    // moved stand-in's new anchor is its nearest neighbour in `left` when it's inserted, so the overlay builds the same order on what's
+    // left: steps never move, and whatever lies between it and that neighbour is gone after the restart.
+    let list = this.journal.map((step) => step.id);
+    const left = new Set(list.filter((id) => !deleted(id)));
+    return this.ops.map((op) => {
+      if (op.op === 'remove') {
+        list = list.filter((id) => id !== op.target);
+        left.delete(op.target);
+      } else if (op.op === 'truncate') {
+        const [from, through] = [this.order.get(op.from)!, this.order.get(op.through)!];
+        const hidden = (id: string) => this.order.has(id) && this.order.get(id)! >= from && this.order.get(id)! <= through;
+        for (const id of list.filter(hidden)) left.delete(id);
+        list = list.filter((id) => !hidden(id));
+      } else if (op.op === 'insert') {
+        const at = op.anchor === '' ? 0 : list.indexOf(op.anchor) + (op.where === 'after' ? 1 : 0);
+        list.splice(at, 0, op.id);
+        if (!moved.has(op.id)) {
+          if (op.anchor === '' || left.has(op.anchor)) left.add(op.id);
+          return clone(op);
+        }
+        left.add(op.id);
+        const before = list.slice(0, at).findLast((id) => left.has(id));
+        const after = list.slice(at + 1).find((id) => left.has(id));
+        const where =
+          before !== undefined
+            ? { where: 'after' as const, anchor: before }
+            : after !== undefined
+              ? { where: 'before' as const, anchor: after }
+              : { where: 'after' as const, anchor: '' };
+        return { ...clone(op), ...where };
+      }
+      return clone(op);
+    });
+  }
+
   // ---------------------------------------------- for migrations and replay ---
 
   /** Runs a migration's `migrate` on this view. Returns how many edits it made. */
@@ -532,9 +584,10 @@ export class HistoryView implements History {
         break;
       }
       case 'insert': {
-        const index = this.nodes.findIndex((node) => node.id === op.anchor);
-        if (index < 0) return false;
-        this.nodes.splice(op.where === 'after' ? index + 1 : index, 0, {
+        // An empty anchor is the start of the history, where `reanchored` puts a stand-in with no step before it left.
+        const index = op.anchor === '' ? -1 : this.nodes.findIndex((node) => node.id === op.anchor);
+        if (index < 0 && op.anchor !== '') return false;
+        this.nodes.splice(op.anchor === '' ? 0 : op.where === 'after' ? index + 1 : index, 0, {
           id: op.id,
           name: op.name,
           kind: op.kind,

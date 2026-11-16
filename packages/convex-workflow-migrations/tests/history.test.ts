@@ -197,6 +197,50 @@ test('operations on steps a restart deleted are dropped', () => {
   expect(restarted.overlay().map((op) => op.op)).toEqual(['insert']);
 });
 
+test('reanchored: stand-ins before a restart point anchored, directly or through others, to an entry upstream deletes keep their place', () => {
+  const deletedFrom = (n: number) => (id: string) => id.startsWith('j') && Number(id.slice(1)) >= n;
+  const h = new HistoryView(journal());
+  h.insertBefore(fn.importFiles, fn.validate, { result: 'valid' });
+  h.insertBefore(fn.validate, fn.scan, { result: 'clean' }); // through validate
+  h.insertAfter(fn.grab, fn.notify, { result: null }); // after grab, which stays: unchanged
+  h.insertAfter(fn.importFiles, fn.prepare, { result: null, atEnd: true }); // after the restart point: dropped, as before
+  expect(names(h)).toEqual(['grab', 'notify', 'downloadDone', 'scan', 'validate', 'importFiles', 'prepare']);
+  // restart({ from: importFiles }): upstream deletes j2 on.
+  const overlay = h.reanchored(deletedFrom(2), 5)!;
+  expect(overlay.filter((op) => op.op === 'insert').map((op) => [op.id, op.where, op.anchor])).toEqual([
+    ['+1', 'after', 'j1'],
+    ['+2', 'after', 'j1'],
+    ['+3', 'after', 'j0'],
+    ['+4', 'after', 'j2'],
+  ]);
+  expect(names(new HistoryView(journal().slice(0, 2), overlay))).toEqual(['grab', 'notify', 'downloadDone', 'scan', 'validate']);
+  // From a stand-in's own position on, stand-ins are dropped: restart({ from: validate }) keeps scan.
+  expect(names(new HistoryView(journal().slice(0, 2), h.reanchored(deletedFrom(2), 4)))).toEqual(['grab', 'notify', 'downloadDone', 'scan']);
+  // Nothing to anchor again: restart({ from: scan }), a history without stand-ins, or an entry upstream deletes before the
+  // restart point, as a canceled run's running wait is: the stand-ins after it run again.
+  expect(h.reanchored(deletedFrom(2), 3)).toBeUndefined();
+  expect(new HistoryView(journal()).reanchored(deletedFrom(2), 2)).toBeUndefined();
+  expect(h.reanchored(deletedFrom(1), 5)).toBeUndefined();
+
+  // The neighbour a stand-in had when it was inserted, so a stand-in inserted later between them stays where it was.
+  const later = new HistoryView(journal());
+  later.insertBefore({ event: 'downloadDone' }, fn.check, { result: null });
+  later.insertAfter(fn.grab, fn.notify, { result: null });
+  expect(names(later)).toEqual(['grab', 'notify', 'check', 'downloadDone', 'importFiles']);
+  expect(names(new HistoryView(journal().slice(0, 1), later.reanchored(deletedFrom(1), 3)))).toEqual(['grab', 'notify', 'check']);
+
+  // No step left before it: at the start of the history, which an empty anchor means.
+  const first = new HistoryView(journal());
+  first.remove(fn.grab);
+  first.insertBefore({ event: 'downloadDone' }, fn.check, { result: null });
+  const atStart = first.reanchored(deletedFrom(1), 1)!;
+  expect(atStart.find((op) => op.op === 'insert')).toMatchObject({ id: '+1', where: 'after', anchor: '' });
+  expect(names(new HistoryView(journal().slice(0, 1), atStart))).toEqual(['check']);
+  expect(names(new HistoryView([], [{ op: 'insert', id: '+1', where: 'after', anchor: '', name: 'flows:check', kind: 'function', result: null }]))).toEqual([
+    'check',
+  ]);
+});
+
 test('truncate removes every step from a position on, in one operation that spares steps recorded later', () => {
   const h = new HistoryView(journal());
   h.insertAfter({ event: 'downloadDone' }, fn.check, { result: null });

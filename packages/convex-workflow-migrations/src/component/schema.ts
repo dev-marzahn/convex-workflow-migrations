@@ -22,6 +22,7 @@ export const vOverlayOp = v.union(
     op: v.literal('insert'),
     id: v.string(),
     where: vWhere,
+    // '' is the start of the history: `restart` anchors a stand-in there when no step around it is left.
     anchor: v.string(),
     name: v.string(),
     kind: vStepKind,

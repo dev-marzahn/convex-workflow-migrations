@@ -351,15 +351,17 @@ export const resumeAll = mutation({
  * The run is live again. A run without a record, from before the app adopted
  * this package, gets one with nothing applied. A pause left over from before
  * the run finished, if upstream's component completed it past the manager,
- * ends. Throws, changing nothing, for a record a newer version wrote.
+ * ends. With `overlay`, the record's overlay with the stand-ins that would
+ * lose their anchors anchored again, it replaces the stored one. Throws,
+ * changing nothing, for a record a newer version wrote.
  */
 export const restart = mutation({
-  args: { workflowId: v.string(), workflow: v.string(), from: v.optional(v.string()) },
+  args: { workflowId: v.string(), workflow: v.string(), from: v.optional(v.string()), overlay: v.optional(v.array(vOverlayOp)) },
   returns: v.null(),
-  handler: async (ctx, { workflowId, workflow, from }) => {
+  handler: async (ctx, { workflowId, workflow, from, overlay }) => {
     const current = await row(ctx, workflowId);
     refuseNewer(current, 'restart', workflowId);
-    if (current) await ctx.db.patch('runs', current._id, { restart: from, live: true });
+    if (current) await ctx.db.patch('runs', current._id, { restart: from, live: true, ...(overlay === undefined ? {} : { overlay }) });
     else
       await ctx.db.insert('runs', {
         workflowId,

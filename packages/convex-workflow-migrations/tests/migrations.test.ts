@@ -37,9 +37,12 @@ const pipeline = flows.pipeline as Ref;
 // Every step records that it ran, with its args.
 const ran: string[] = [];
 const completions: { workflowId: string; result: { kind: string; error?: string } }[] = [];
-const stepFn = (name: string, returns: unknown = null) =>
+/** Set by a test: called when importFiles runs, before it records that it ran. */
+let onImport: (() => void) | undefined;
+const stepFn = (name: string, returns: unknown = null, before?: () => void) =>
   internalMutationGeneric({
     handler: async (_ctx, args: Record<string, unknown>) => {
+      before?.();
       ran.push(Object.keys(args).length > 0 ? `${name} ${JSON.stringify(args)}` : name);
       return returns;
     },
@@ -56,6 +59,11 @@ const badStandIn = migration('notify-after-grab', (h) => h.insertAfter(flows.gra
 const fixStandIn = migration('notify-result-has-at', (h) => h.updateResult(flows.notify, () => ({ at: null })));
 // Release 0 plus a required `channel` arg, which publish gets.
 const channelArg = migration('channel-arg', (h) => h.updateWorkflowArgs((args) => ({ ...args, channel: 'default' })));
+// A stand-in for validate before the import, and one for scan before that, anchored to validate's.
+const validates = migration('validate-before-import', (h) => {
+  h.insertBefore(flows.importFiles, flows.validate, { result: 'valid' });
+  h.insertBefore(flows.validate, flows.scan, { result: 'clean' });
+});
 
 type Shape = { notify?: boolean; notifiedAt?: boolean; transcode?: boolean };
 function release(shape: Shape, migrations: Migration[]) {
@@ -69,6 +77,22 @@ function release(shape: Shape, migrations: Migration[]) {
       await step.runMutation(flows.importFiles, shape.notifiedAt ? { notifiedAt: notified!.at } : {});
       await step.runMutation(shape.transcode ? flows.transcode : flows.prepare, {});
       await step.runMutation(flows.publish, {});
+    },
+  });
+}
+function importing(validate: boolean) {
+  return manager.define({
+    args: {},
+    migrations: validate ? [validates] : [],
+    handler: async (step: WorkflowCtx): Promise<void> => {
+      await step.runMutation(flows.grab, {});
+      await step.runMutation(flows.notify, {});
+      await step.awaitEvent({ name: 'downloadDone' });
+      if (validate) {
+        await step.runMutation(flows.scan, {});
+        await step.runMutation(flows.validate, {});
+      }
+      await step.runMutation(flows.importFiles, {});
     },
   });
 }
@@ -117,6 +141,8 @@ const releases = {
   fixedStandIn: release({ notify: true, notifiedAt: true }, [badStandIn, fixStandIn]),
   channelUnguarded: withChannel([]),
   channel: withChannel([channelArg]),
+  importing: importing(false),
+  validating: importing(true),
   // Code that stops after grab: shorter than the histories of runs past it.
   short: manager.define({
     args: {},
@@ -150,7 +176,9 @@ const releases = {
 const functions: Record<string, unknown> = {
   grab: stepFn('grab'),
   notify: stepFn('notify', { at: 1234 }),
-  importFiles: stepFn('import'),
+  importFiles: stepFn('import', null, () => onImport?.()),
+  scan: stepFn('scan'),
+  validate: stepFn('validate'),
   prepare: stepFn('prepare'),
   transcode: stepFn('transcode'),
   publish: stepFn('publish'),
@@ -223,6 +251,7 @@ beforeEach(() => {
   pauses.length = 0;
   completions.length = 0;
   onPauseThrows = false;
+  onImport = undefined;
 });
 afterEach(() => vi.useRealTimers());
 
@@ -1075,6 +1104,36 @@ test('restart stores the step on the record, and a pending migration that insert
   await settle(t);
   expect(ran).toEqual([]);
   expect((await record(t, id))?.restart).toBeUndefined();
+});
+
+test('restart keeps the stand-ins before its step anchored to an entry it deletes, chained ones too: they replay, and don’t run', async () => {
+  const t = setup();
+  deploy('importing');
+  const id = await start(t);
+  // The release that validates lands while the import runs, and the import fails: the handler run that fails the run inserts
+  // validate before the import, and scan before validate.
+  onImport = () => {
+    onImport = undefined;
+    deploy('validating');
+    throw new Error('the import failed');
+  };
+  await downloadDone(t, id);
+  const failed = await status(t, id);
+  expect(failed.type === 'failed' && failed.error).toContain('the import failed');
+  // grab, notify, downloadDone, scan (a stand-in), validate (a stand-in), importFiles (failed)
+  expect(await record(t, id)).toMatchObject({ applied: ['validate-before-import'], overlay: [{ name: 'flows:validate' }, { name: 'flows:scan' }] });
+
+  ran.length = 0;
+  await t.run((ctx) => manager.restart(ctx, id, { from: flows.importFiles }));
+  await settle(t);
+  expect(await status(t, id)).toEqual(completed);
+  expect(ran).toEqual(['import']);
+  expect(await steps(t, id)).toEqual(['grab', 'notify', 'downloadDone', 'importFiles']);
+  const [downloadDoneId] = (await t.run((ctx) => manager.listSteps(ctx, id))).page.filter((s) => s.name === 'downloadDone').map((s) => s.stepId);
+  expect((await record(t, id))?.overlay.map((op) => op.op === 'insert' && [op.name, op.where, op.anchor])).toEqual([
+    ['flows:validate', 'after', downloadDoneId],
+    ['flows:scan', 'after', downloadDoneId],
+  ]);
 });
 
 test('restart throws for a running run, and points a paused one to restartFrom', async () => {
