@@ -125,8 +125,9 @@ async function replayHistory(replay: ReplayTarget, recorded: RecordedHistory, pr
  * `workflow.define` returned), against its current handler, as a handler run
  * would, and throws for those that don't replay, with the reason (for a
  * handler that throws, the throw rule that applies) and the migrated
- * history. An `updateResult` that changes its own output when run
- * on it again fails too, and so does a handler that throws (README, "Testing").
+ * history. An `updateResult` or `updateWorkflowArgs` that changes its own
+ * output when run on it again fails too, and so does a handler that throws,
+ * unless it's passing on a failure (throw rule 4; README, "Testing").
  */
 export async function expectReplays(workflow: Workflow, histories: readonly RecordedHistory[]): Promise<void> {
   const replay = target(workflow, 'expectReplays');

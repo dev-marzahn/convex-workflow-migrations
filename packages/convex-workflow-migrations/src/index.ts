@@ -62,8 +62,8 @@ type Definition<ArgsValidator extends PropertyValidators, ReturnsValidator exten
 /**
  * A paused run, as `WorkflowManager.paused` lists it: its workflow's function
  * name, why it paused (`reason`, `detail`, and `step`, as in `PauseInfo`),
- * when it first paused (`at`), how many attempts it has had, when the next
- * retry is, and `lastError`, why the last attempt didn't complete, if it
+ * when it first paused (`at`, in ms), how many attempts it has had, when the
+ * next retry is (`nextAttemptAt`, in ms), and `lastError`, why the last attempt didn't complete, if it
  * didn't.
  */
 export type PausedRun = Omit<Infer<typeof vPausedRun>, 'workflowId'> & { workflowId: WorkflowId };
@@ -73,10 +73,12 @@ export type WorkflowManagerOptions = {
   migrationsComponent: MigrationsComponent;
   /**
    * Called when a run pauses instead of failing, in the transaction that
-   * pauses it, and again when a retry pauses it for another reason, at
-   * another step or with another detail. `ctx` is the workflow mutation's:
-   * cast it to your app's `MutationCtx` to use your tables. An error it
-   * throws is logged; the run stays paused. Required, since nothing else
+   * pauses it, and again when a retry or `resume` pauses it for another
+   * reason, at another step or with another detail. `ctx` is the workflow
+   * mutation's: cast it to your app's `MutationCtx` to use your tables. Its
+   * writes commit with the pause, even those made before an error it throws,
+   * which is logged while the run stays paused: make them in a
+   * `ctx.runMutation` to commit all or none. Required, since nothing else
    * reports a paused run: pass `null` to opt out.
    */
   onPause: ((ctx: GenericMutationCtx<GenericDataModel>, info: PauseInfo) => void | Promise<void>) | null;
@@ -178,8 +180,9 @@ export class WorkflowManager extends UpstreamWorkflowManager {
   }
 
   /**
-   * A page of paused runs (of one workflow, by its function name, like
-   * `pipeline:run`), the one that paused first first. `numItems` defaults to
+   * A page of paused runs (of one workflow, by its function name as Convex
+   * names it, like `pipeline:run`: a wrong name returns an empty page), the
+   * one that paused first first. Works from a query. `numItems` defaults to
    * 100. Pass `continueCursor` as `cursor` for the next page, until `isDone`.
    */
   public async paused(
@@ -196,11 +199,12 @@ export class WorkflowManager extends UpstreamWorkflowManager {
 
   /**
    * Retries a paused run now, in one transaction, for example after
-   * deploying a fix. Returns true if the run replayed past its pause.
-   * Otherwise false: either it paused again, and its attempts and next retry
-   * stay as they were, or its pause ended without a replay, because upstream
-   * finished or canceled it past the manager, it's at another generation, or
-   * it's gone. Throws if the run isn't paused, and so does an error from the
+   * deploying a fix, without counting an attempt or moving the next retry.
+   * Returns true only if the run replayed past its pause. Otherwise false:
+   * either it paused again, or its pause ended without a replay, because the
+   * run finished (canceled bypassing the manager: upstream's standalone
+   * `cancel`, or a parent's cancel), it's at another generation, or it's
+   * gone. Throws if the run isn't paused, and so does an error from the
    * workflow mutation.
    */
   public async resume(ctx: MutationCtx | ActionCtx, workflowId: WorkflowId): Promise<boolean> {
@@ -208,8 +212,8 @@ export class WorkflowManager extends UpstreamWorkflowManager {
   }
 
   /**
-   * Completes a paused run as failed, with `reason` as the error, or else why
-   * it paused, and ends the pause, in the caller's transaction: so it takes a
+   * Completes a paused run as failed, with `reason` as the error, or else
+   * `Paused (<reason>): <detail>`, and ends the pause, in the caller's transaction: so it takes a
    * mutation's ctx. `onComplete` runs. A paused run that upstream's component
    * already finished keeps its result: only its pause ends. Throws if the run
    * isn't paused.

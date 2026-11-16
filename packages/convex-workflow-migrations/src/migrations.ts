@@ -42,14 +42,15 @@ type MutationCtx = GenericMutationCtx<GenericDataModel>;
 export type PauseInfo = {
   workflowId: WorkflowId;
   reason: ReplayReason;
+  /** Why, naming the throw rule for `threw`: at most 24,576 characters (3 × `DETAIL_LIMIT`), and a mismatch's call and step 8,192 each. */
   detail: string;
   /**
-   * The position in the history (from 0): for a mismatch, where replay
-   * stopped matching; for the throw rule 2, the first step not replayed; for
-   * rule 3, the step the handler got last. Unset otherwise.
+   * The position in the migrated history (from 0): for a mismatch, where
+   * replay stopped matching; for the throw rule 2, the first step not
+   * replayed; for rule 3, the step the handler got last. Unset otherwise.
    */
   step?: number;
-  /** How many attempts the run has had: the first pause, and every scheduled retry, each counted when it starts. 1 the first time. */
+  /** How many attempts the run has had: 1 at the first pause, plus 1 per scheduled retry, counted when it starts. `resume` doesn't count. */
   attempts: number;
 };
 
