@@ -18,9 +18,24 @@ export type RecordedStep = { id: string; name: string; kind: StepKind; args: unk
 /**
  * A run's recorded history: its journal and, if its record says, the
  * migrations applied to it and their edits. `history()` in `/replay` builds
- * one. Without `applied`, it's a run without a record (README, "Testing").
+ * one, and the `histories` CLI exports them. Without `applied`, it's a run
+ * without a record (README, "Testing").
  */
-export type RecordedHistory = { workflowId?: string; args?: unknown; steps: RecordedStep[]; applied?: string[]; overlay?: OverlayOp[] };
+export type RecordedHistory = {
+  workflowId?: string;
+  /** The workflow's function name. */
+  workflow?: string;
+  args?: unknown;
+  steps: RecordedStep[];
+  applied?: string[];
+  overlay?: OverlayOp[];
+  /** How the run ended, if it has. */
+  outcome?: RunResult['kind'];
+  /** The export stopped at its step limit: the run has more steps than these. */
+  truncated?: boolean;
+  /** The run's record changed every time the export read its journal, so the two may not match. */
+  unstable?: boolean;
+};
 
 /** A step of a history, as a migration reads it. */
 export type HistoryStep = {

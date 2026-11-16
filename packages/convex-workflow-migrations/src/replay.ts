@@ -103,13 +103,22 @@ export const RULE = {
 /**
  * Whether a handler that threw pauses the run instead of failing it, by the
  * throw rules in the README's "Pausing and recovery", in their order. A
- * pause's message names its rule (`RULE`).
+ * pause's message names its rule (`RULE`). With `recordedOnly`, for the
+ * history of a run that failed or was canceled after its last step, only
+ * rules 1 and 2 apply.
  */
-export function threwEarly(history: HistoryView, progress: ReplayProgress, error: unknown, edited: readonly string[]): ReplayError | undefined {
+export function threwEarly(
+  history: HistoryView,
+  progress: ReplayProgress,
+  error: unknown,
+  edited: readonly string[],
+  recordedOnly = false,
+): ReplayError | undefined {
   if (error instanceof ReplayError) return error;
   if (progress.started) return undefined; // rule 1
   const next = progress.next?.position ?? history.length;
   if (history.recordedFrom(next)) return new ReplayError('threw', `The handler threw before step ${next} of its history (${RULE[2]}): ${message(error)}`, next);
+  if (recordedOnly) return undefined;
   if (next > 0 && history.fromMigration(next - 1)) {
     return new ReplayError('threw', `The handler threw after step ${next - 1} of its history (${RULE[3]}): ${message(error)}`, next - 1);
   }
@@ -133,7 +142,7 @@ export type ReplayResult = WorkerResult & { invalidReturn?: true };
  */
 export async function replayHandler(
   registered: ReplayDefinition,
-  { history, edited }: Pick<Prepared, 'history' | 'edited'>,
+  { history, edited, recordedOnly }: Pick<Prepared, 'history' | 'edited'> & { recordedOnly?: boolean },
   executor: StepExecutor,
   options: { step: WorkflowCtx; console: { error: (...args: unknown[]) => void }; db?: GenericDatabaseReader<any> },
 ): Promise<ReplayResult | ReplayError> {
@@ -161,7 +170,7 @@ export async function replayHandler(
         }
       }
     } catch (error) {
-      const pause = threwEarly(history, executor.progress(), error, edited);
+      const pause = threwEarly(history, executor.progress(), error, edited, recordedOnly);
       if (pause) {
         // Before anything else runs: another branch of the handler, as in a Promise.all, may still call a step.
         executor.halted = true;

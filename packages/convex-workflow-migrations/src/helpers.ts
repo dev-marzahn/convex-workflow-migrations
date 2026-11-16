@@ -95,10 +95,14 @@ class ReplayOnly extends StepExecutor {
  * doesn't: why the run would pause, by the same rules as at runtime, or that
  * the run would fail, because the handler throws, unless it's passing on a
  * failure among the newest recorded steps (throw rule 4), or because its
- * return value fails its `returns` validator. It starts no step: replay stops
- * where the history ends, or at a running step.
+ * return value fails its `returns` validator. For a run whose `outcome` is
+ * `success`, a handler that throws fails; for one that failed or was
+ * canceled, only a throw before its last recorded step does, since it ended
+ * after it. It starts no step: replay stops where the history ends, or at a
+ * running step.
  */
 async function replayHistory(replay: ReplayTarget, recorded: RecordedHistory, prepared: Prepared): Promise<string | undefined> {
+  const ended = recorded.outcome === 'failed' || recorded.outcome === 'canceled';
   const workflowId = (recorded.workflowId ?? 'history') as WorkflowId;
   const channel = new BaseChannel<StepRequest>(replay.workpoolOptions?.maxParallelism ?? 10);
   const now = Math.max(0, ...recorded.steps.map((s) => s.startedAt));
@@ -108,11 +112,12 @@ async function replayHistory(replay: ReplayTarget, recorded: RecordedHistory, pr
   const restoreEnvironment = setupEnvironment(executor.getGenerationState.bind(executor), workflowId);
   try {
     const options = { step: createWorkflowCtx(workflowId, channel), console: { error: () => {} } };
-    const result = await replayHandler(replay.definition, prepared, executor, options);
+    const result = await replayHandler(replay.definition, { ...prepared, recordedOnly: ended }, executor, options);
     if (result instanceof ReplayError) return `(${result.reason}): ${result.message}`;
-    if (result.type === 'handlerDone' && result.runResult.kind === 'failed') {
+    if (result.type === 'handlerDone' && result.runResult.kind === 'failed' && !ended) {
       const error = result.runResult.error.split('\n')[0];
       if (result.invalidReturn) return `(returns): The handler's return value doesn't match its returns validator, which fails the run: ${error}`;
+      if (recorded.outcome === 'success') return `(fails): The run succeeded, but the handler now fails replaying its history: ${error}`;
       if (!prepared.history.endsInFailure()) return `(fails): The handler threw replaying the history, which fails the run (${RULE[6]}): ${error}`;
     }
   } catch (error) {
@@ -120,6 +125,14 @@ async function replayHistory(replay: ReplayTarget, recorded: RecordedHistory, pr
   } finally {
     restoreEnvironment();
   }
+  return undefined;
+}
+
+/** Why an exported history can't be checked: the export cut it short, or its record and journal may not match. */
+function incomplete(recorded: RecordedHistory): string | undefined {
+  if (recorded.truncated)
+    return `(truncated): The export stopped at ${recorded.steps.length} steps, so the rest can't be checked. Export it with a larger --max-steps.`;
+  if (recorded.unstable) return "(unstable): The run's record changed every time the export read its journal, so the two may not match. Export it again.";
   return undefined;
 }
 
@@ -131,13 +144,19 @@ async function replayHistory(replay: ReplayTarget, recorded: RecordedHistory, pr
  * history. An `updateResult` or `updateWorkflowArgs` that changes its own
  * output when run on it again fails too, and so does a handler that throws,
  * unless it's passing on a failure (throw rule 4; README, "Testing"), or
- * returns a value its `returns` validator rejects.
+ * returns a value its `returns` validator rejects; a finished run's
+ * `outcome` adjusts that. A `truncated` or `unstable` history fails.
  */
 export async function expectReplays(workflow: Workflow, histories: readonly RecordedHistory[]): Promise<void> {
   const replay = target(workflow, 'expectReplays');
   const failures: string[] = [];
   for (const [i, recorded] of histories.entries()) {
     const label = `history ${i}${recorded.workflowId ? ` (${recorded.workflowId})` : ''}`;
+    const cut = incomplete(recorded);
+    if (cut) {
+      failures.push(`${label} ${cut}`);
+      continue;
+    }
     let prepared: Prepared;
     try {
       prepared = prepare(replay, recorded);
@@ -152,8 +171,10 @@ export async function expectReplays(workflow: Workflow, histories: readonly Reco
   if (failures.length > 0) throw new Error(`${failures.length} of ${histories.length} histories don't replay on the current handler:\n${failures.join('\n')}`);
 }
 
-/** The history after the workflow's migrations, for testing a migration. Throws if they can't be applied. */
+/** The history after the workflow's migrations, for testing a migration. Throws if they can't be applied, or the history is `truncated` or `unstable`. */
 export function migrate(workflow: Workflow, recorded: RecordedHistory): History {
+  const cut = incomplete(recorded);
+  if (cut) throw new Error(cut);
   return prepare(target(workflow, 'migrate'), recorded).history;
 }
 
