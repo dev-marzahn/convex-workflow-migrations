@@ -5,8 +5,11 @@ import { randomBytes } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 /**
- * The backend build the tests run against: the one convex-release pins in its
- * images/Dockerfile. Bump them together.
+ * The backend build the e2e tests and codegen run against: the one the
+ * installed @dev-marzahn/convex-release pins. This is the only place this
+ * repo names it; packages/convex-workflow-migrations/tests/backend.test.ts
+ * fails until it matches the pin in convex-release's README, so bump both
+ * together.
  */
 export const BACKEND_IMAGE = 'ghcr.io/convex/convex-backend:d1fcbeaf939502a23a0f4b7e9095a12e84866294';
 
