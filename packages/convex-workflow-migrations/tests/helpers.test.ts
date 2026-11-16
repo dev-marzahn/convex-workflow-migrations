@@ -5,7 +5,7 @@ import { v } from 'convex/values';
 import { expect, test } from 'vite-plus/test';
 
 import { expectReplays, history, migrate } from '../src/helpers.ts';
-import { migration, type MigrationsComponent, type WorkflowComponent, type WorkflowCtx, WorkflowManager } from '../src/index.ts';
+import { type EventId, migration, type MigrationsComponent, type WorkflowComponent, type WorkflowCtx, WorkflowManager } from '../src/index.ts';
 
 const components = componentsGeneric() as unknown as { workflow: WorkflowComponent; workflowMigrations: MigrationsComponent };
 const manager = new WorkflowManager(components.workflow, { migrationsComponent: components.workflowMigrations });
@@ -97,6 +97,19 @@ test('history() builds a recorded history', () => {
   });
 });
 
+test('an event step takes the args awaitEvent({ id }) records: { eventId }', async () => {
+  const waitsOnId = manager.define({
+    args: { eventId: v.string() },
+    handler: async (step, { eventId }) => {
+      await step.awaitEvent({ id: eventId as EventId<string> });
+      await step.runMutation(flows.grab, {});
+    },
+  });
+  const options = { args: { eventId: 'e1' } };
+  await expectReplays(waitsOnId, [history([{ event: 'e1', args: { eventId: 'e1' } }], options)]);
+  expect(await failure(expectReplays(waitsOnId, [history([{ event: 'e1' }], options)]))).toContain('(mismatch)');
+});
+
 test('expectReplays passes for histories the migrations bring into the current shape', async () => {
   await expectReplays(workflows.current, [release0Waiting, release0Done, release1Waiting]);
 });
@@ -127,7 +140,7 @@ test("expectReplays reports a handler that throws while replaying, but not one p
   // No migration applies now: at runtime the run just fails, but the history doesn't replay.
   const recorded = history([{ step: flows.grab }, { step: flows.notify }, { event: 'downloadDone', status: 'running' }], { applied: ['notify-after-grab'] });
   expect(await failure(expectReplays(workflows.badStandIn, [recorded]))).toContain('(threw): The handler threw replaying the history: TypeError');
-  // The download failed: the handler passes that on, and the run fails, as it did.
+  // The download failed, and the handler throws that: the run fails, as it did.
   await expectReplays(workflows.current, [history([{ step: flows.grab }, { event: 'downloadDone', error: 'the download failed' }])]);
 });
 

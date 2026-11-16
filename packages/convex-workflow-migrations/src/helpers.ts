@@ -17,11 +17,15 @@ import { createWorkflowCtx } from './vendor/workflow/workflowContext.ts';
 
 type Outcome = { result?: unknown; error?: string; canceled?: true; status?: 'done' | 'running'; startedAt?: number };
 
-/** One step of a hand-built history. Without `result`, `error`, `canceled` or `status: 'running'`, it succeeded with `null`. */
+/**
+ * One step of a hand-built history. Without `result`, `error`, `canceled` or
+ * `status: 'running'`, it succeeded with `null`. An event's `args` are
+ * `{ eventId }` for an `awaitEvent({ id })`, and `{}` (the default) by name.
+ */
 export type StepSpec =
   | ({ step: FunctionReference<any, any>; args?: unknown; name?: string } & Outcome)
   | ({ workflow: FunctionReference<'mutation', 'internal'>; args?: unknown; name?: string } & Outcome)
-  | ({ event: string } & Outcome)
+  | ({ event: string; args?: unknown } & Outcome)
   | { sleep: string; status?: 'done' | 'running'; startedAt?: number };
 
 /** Options of `history()`: the workflow's `args` (default `{}`), the migrations `applied` to the run, and its `workflowId` for messages. */
@@ -29,9 +33,10 @@ export type HistoryOptions = { args?: unknown; applied?: string[]; workflowId?: 
 
 /**
  * Builds a history by hand, as older code recorded it. Steps get ids `h0`,
- * `h1`, … and start times 0, 1, …. Without `applied`, it's a run without a
- * record: with steps, from before the first migration; with none, its args
- * pick (README, "Testing").
+ * `h1`, … and start times 0, 1, …, unless a spec gives `startedAt`. Pass
+ * `applied` for a run started on a release that used this package. Without
+ * it, it's a run without a record: with steps, every migration applies; with
+ * none, its args pick (README, "Testing").
  */
 export function history(steps: readonly StepSpec[], options: HistoryOptions = {}): RecordedHistory {
   return {
@@ -44,7 +49,7 @@ export function history(steps: readonly StepSpec[], options: HistoryOptions = {}
 
 function specToStep(spec: StepSpec, i: number): RecordedStep {
   let name: string, kind: StepKind, args: unknown;
-  if ('event' in spec) [name, kind, args] = [spec.event, 'event', {}];
+  if ('event' in spec) [name, kind, args] = [spec.event, 'event', spec.args ?? {}];
   else if ('sleep' in spec) [name, kind, args] = [spec.sleep, 'sleep', {}];
   else if ('workflow' in spec) [name, kind, args] = [spec.name ?? safeFunctionName(spec.workflow), 'workflow', spec.args ?? {}];
   else [name, kind, args] = [spec.name ?? safeFunctionName(spec.step), 'function', spec.args ?? {}];
