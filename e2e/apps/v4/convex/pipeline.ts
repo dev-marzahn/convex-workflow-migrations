@@ -129,3 +129,22 @@ export const resumeAll = mutation({
     return null;
   },
 });
+
+export const restartFrom = mutation({
+  args: { workflowId: vWorkflowId, step: v.number() },
+  returns: v.null(),
+  handler: async (ctx, { workflowId, step }) => {
+    await workflow.restartFrom(ctx, workflowId, step);
+    return null;
+  },
+});
+
+/** Restarts a finished run from a position, or from a step's last occurrence by name. */
+export const restart = mutation({
+  args: { workflowId: vWorkflowId, from: v.union(v.number(), v.string()) },
+  returns: v.null(),
+  handler: async (ctx, { workflowId, from }) => {
+    await workflow.restart(ctx, workflowId, { from });
+    return null;
+  },
+});

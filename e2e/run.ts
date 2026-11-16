@@ -44,6 +44,17 @@ function call<T>(app: string, backend: Backend, fn: string, args: Record<string,
   return (out ? JSON.parse(out) : null) as T;
 }
 
+/** Calls a function that should throw, and returns what `convex run` printed. */
+function callFails(app: string, backend: Backend, fn: string, args: Record<string, unknown>): string {
+  const result = spawnSync(join(appDir(app), 'node_modules/.bin/convex'), ['run', fn, JSON.stringify(args)], {
+    cwd: appDir(app),
+    env: backend.env,
+    encoding: 'utf8',
+  });
+  if (result.status === 0) throw new Error(`${fn} ${JSON.stringify(args)} was expected to throw, and returned ${result.stdout.trim()}`);
+  return `${result.stdout}\n${result.stderr}`;
+}
+
 type Ids = { grabId: string; workflowId: string };
 type Grab = { log: string[]; status: string; error?: string };
 type Pauses = { paused: { reason: string; attempts: number } | null; alerts: string[] };
@@ -293,6 +304,51 @@ const scenarios: Record<string, (backend: Backend) => Promise<void>> = {
       'the run to finish',
     );
     expectEqual(done, { log: ['grab', 'notify', 'import', 'transcode', 'publish'], status: 'completed' }, 'the resumed run');
+  },
+
+  /**
+   * restartFrom and restart on a real backend. A run started on release 3
+   * pauses when release 2 is deployed over it (a rollback, so every position
+   * would pause again): restartFrom throws and changes nothing. With release 3
+   * back, restartFrom from the wait runs it again; after the run finishes,
+   * restart from transcode, by name, runs transcode and publish again.
+   */
+  async restart(backend) {
+    deploy('v3', backend);
+    const ids = await startWaitingRun('v3', backend, 2);
+    deploy('v2', backend);
+    call('v2', backend, 'pipeline:downloadDone', { workflowId: ids.workflowId });
+    await until(
+      () => pauses('v2', backend, ids).paused,
+      (p) => p !== null,
+      'the run to pause',
+    );
+    const before = record('v2', backend, ids);
+    const refused = callFails('v2', backend, 'pipeline:restartFrom', { workflowId: ids.workflowId, step: 2 });
+    expectEqual(refused.includes('would pause it again (migrations)'), true, `restartFrom on code that would pause it again (${refused.trim().slice(-300)})`);
+    expectEqual(record('v2', backend, ids), before, 'the record after the refused restartFrom');
+    expectEqual(grab('v2', backend, ids), { log: ['grab', 'notify'], status: 'inProgress' }, 'the run after the refused restartFrom');
+
+    deploy('v3', backend);
+    // Step 2 is the wait, which the download already ended: the run waits again.
+    call('v3', backend, 'pipeline:restartFrom', { workflowId: ids.workflowId, step: 2 });
+    expectEqual(pauses('v3', backend, ids).paused, null, 'the pause after restartFrom');
+    call('v3', backend, 'pipeline:downloadDone', { workflowId: ids.workflowId });
+    const done = await until(
+      () => grab('v3', backend, ids),
+      (g) => g.status !== 'inProgress',
+      'the run to finish',
+    );
+    expectEqual(done, { log: ['grab', 'notify', 'import', 'transcode', 'publish'], status: 'completed' }, 'the run after restartFrom');
+
+    call('v3', backend, 'pipeline:restart', { workflowId: ids.workflowId, from: 'pipeline:transcode' });
+    const again = await until(
+      () => grab('v3', backend, ids),
+      (g) => g.status !== 'inProgress',
+      'the restarted run to finish',
+    );
+    expectEqual(again, { log: ['grab', 'notify', 'import', 'transcode', 'publish', 'transcode', 'publish'], status: 'completed' }, 'the restarted run');
+    expectEqual(record('v3', backend, ids)?.applied, ALL, 'the applied migrations');
   },
 
   /**
