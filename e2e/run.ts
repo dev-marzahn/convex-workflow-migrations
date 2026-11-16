@@ -78,6 +78,25 @@ const finished = (app: string, backend: Backend, ids: Ids, what: string, timeout
     timeoutMs,
   );
 
+type Exported = { workflowId: string; workflow: string; args: unknown; steps: { name: string; runResult?: unknown }[]; applied?: string[]; outcome?: string };
+
+/** Runs the `histories` CLI from `app`'s directory, as a user would: the installed bin, or the build for a fixture without the package. */
+function histories(app: string, backend: Backend, args: string[], status = 0): { exported: Exported[]; stderr: string } {
+  const cli =
+    app === release3 ? join(appDir(app), 'node_modules/.bin/convex-workflow-migrations') : join(ROOT, 'packages/convex-workflow-migrations/dist/cli.js');
+  const result = spawnSync(cli, ['histories', 'pipeline:run', ...args], { cwd: appDir(app), env: backend.env, encoding: 'utf8' });
+  if (result.status !== status) throw new Error(`histories exited with ${result.status}, not ${status}:\n${result.stderr}`);
+  return { exported: result.stdout ? (JSON.parse(result.stdout) as Exported[]) : [], stderr: result.stderr };
+}
+const shape = ({ workflowId, workflow, args, steps, applied, outcome }: Exported) => ({
+  workflowId,
+  workflow,
+  args,
+  steps: steps.map((s) => `${s.name}${s.runResult ? '' : ' (running)'}`),
+  ...(applied ? { applied } : {}),
+  ...(outcome ? { outcome } : {}),
+});
+
 function expectEqual(actual: unknown, expected: unknown, what: string): void {
   if (!isDeepStrictEqual(actual, expected)) throw new Error(`${what}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
 }
@@ -102,11 +121,21 @@ const scenarios: Record<string, (backend: Backend) => Promise<void>> = {
    * A run from release 0 (plain @convex-dev/workflow) waiting across a deploy
    * of release 3, which lists the migrations of releases 1 to 3: it replays
    * without releases 1 and 2 ever being deployed. A run started on release 3
-   * has every migration applied from the start.
+   * has every migration applied from the start. The `histories` CLI exports
+   * the release 0 run before the deploy, without the migrations component,
+   * and once it finished on release 3, with its record.
    */
   async skip(backend) {
     deploy('v1', backend);
     const old = await startWaitingRun('v1', backend, 1);
+    const before = histories('v1', backend, []);
+    const args = { grabId: old.grabId };
+    expectEqual(
+      before.exported.map(shape),
+      [{ workflowId: old.workflowId, workflow: 'pipeline:run', args, steps: ['pipeline:grab', 'downloadDone (running)'] }],
+      'the export before the deploy',
+    );
+    if (!before.stderr.includes("The workflowMigrations component isn't deployed")) throw new Error(`No note about the component:\n${before.stderr}`);
     deploy(release3, backend);
     expectEqual(record(release3, backend, old), null, 'the release 0 run’s record before its next handler run');
     const fresh = await startWaitingRun(release3, backend, 2);
@@ -123,6 +152,24 @@ const scenarios: Record<string, (backend: Backend) => Promise<void>> = {
     const freshGrab = await finished(release3, backend, fresh, 'the release 3 run to finish');
     expectEqual(freshGrab, { log: ['grab', 'notify', 'import', 'transcode', 'publish'], status: 'completed' }, 'the release 3 run');
     expectEqual(record(release3, backend, fresh)?.overlay, [], 'the release 3 run’s overlay');
+
+    const recent = histories(release3, backend, ['--recent', '1']).exported;
+    expectEqual(
+      recent.map((h) => h.workflowId),
+      [fresh.workflowId],
+      'the export with --recent 1: the newest finished run',
+    );
+    const exported = histories(release3, backend, []).exported.find((h) => h.workflowId === old.workflowId);
+    const steps = ['pipeline:grab', 'downloadDone', 'pipeline:importFiles', 'pipeline:transcode', 'pipeline:publish'];
+    expectEqual(
+      exported && shape(exported),
+      { workflowId: old.workflowId, workflow: 'pipeline:run', args, steps, applied: ALL, outcome: 'success' },
+      'the export after',
+    );
+    expectEqual((exported as { overlay?: unknown }).overlay, record(release3, backend, old)?.overlay, 'the exported overlay, which has notify’s stand-in');
+    // Two runs, and --max-scan 1: it stops, says where, and exports nothing.
+    const stopped = histories(release3, backend, ['--max-scan', '1'], 1);
+    if (!/read the newest 1, the oldest created \d{4}-/.test(stopped.stderr)) throw new Error(`The --max-scan stop doesn't say where:\n${stopped.stderr}`);
   },
 
   /**
