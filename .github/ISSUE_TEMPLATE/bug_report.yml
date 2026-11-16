@@ -1,5 +1,5 @@
 name: Bug report
-description: A patched workflow doesn't replay the way the README says.
+description: A workflow with migrations doesn't replay the way the README says.
 labels: [bug]
 body:
   - type: textarea
@@ -13,7 +13,7 @@ body:
     id: repro
     attributes:
       label: Steps to reproduce
-      description: The smallest workflow, before and after the change, that shows it. A convex-test case with `simulateDeploy` is ideal.
+      description: The smallest workflow, before and after the change, with its migrations, that shows it. A failing `expectReplays` test with a `history()` is ideal.
   - type: textarea
     id: logs
     attributes:
