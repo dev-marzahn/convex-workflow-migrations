@@ -66,6 +66,18 @@ export const vPaused = v.object({
 /** The format of the rows this version writes. A row with a higher one is from a newer version. */
 export const FORMAT = 1;
 
+/**
+ * The longest pause `detail`, in characters. A mismatch's two calls are each
+ * cut to this length before they're put together, so its detail can be
+ * about twice as long.
+ */
+export const DETAIL_LIMIT = 8192;
+
+/** `text`, cut to `limit` characters with an ellipsis. */
+export function capDetail(text: string, limit = DETAIL_LIMIT): string {
+  return text.length <= limit ? text : `${text.slice(0, limit - 1)}…`;
+}
+
 export default defineSchema({
   runs: defineTable({
     workflowId: v.string(),

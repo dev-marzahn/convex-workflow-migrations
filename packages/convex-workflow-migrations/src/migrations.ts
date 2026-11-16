@@ -1,22 +1,13 @@
 // Migrations, and what a handler run does with a run's record: apply the
 // pending migrations in memory, then save the result if replay succeeds or
-// pause the run if it doesn't. A pause commits nothing but the pause.
+// pause the run if it doesn't. A pause commits nothing of the handler run but
+// the pause.
 import { createFunctionHandle, type GenericDataModel, type GenericMutationCtx, makeFunctionReference } from 'convex/server';
 
 import type { ComponentApi } from './component/_generated/component.js';
 import { FORMAT } from './component/schema.ts';
-import {
-  type History,
-  HistoryView,
-  type OverlayOp,
-  type PauseReason,
-  type RecordedStep,
-  ReplayPause,
-  type ReplayProgress,
-  returnedEarly,
-  sameOverlay,
-  threwEarly,
-} from './history.ts';
+import { type History, HistoryView, type OverlayOp, type PauseReason, type RecordedStep, ReplayPause, RESTART, sameOverlay } from './history.ts';
+import type { Replay } from './replay.ts';
 import type { WorkflowId } from './vendor/workflow/publicTypes.ts';
 import type { JournalEntry } from './vendor/workflow/types.ts';
 
@@ -132,13 +123,20 @@ export function prepareHistory(
   }
   // The stored overlay fit; only what this handler run added can make it too big to save.
   if (ran.length > 0 || stored.restart !== undefined) {
-    const { bytes, largest } = history.size();
+    const { bytes, added, largest } = history.size();
     if (bytes > OVERLAY_LIMIT) {
-      const cause = largest ? `Migration "${largest.id}" added the most, ${kib(largest.bytes)}.` : 'Most of it was stored before.';
-      return blocked(new ReplayPause('overlay', `The run's overlay would be ${kib(bytes)}, over the ${kib(OVERLAY_LIMIT)} limit. ${cause}`));
+      const causes: string[] = [];
+      if (largest) causes.push(`${largest.id === RESTART ? 'The restart' : `Migration "${largest.id}"`} added the most, ${kib(largest.bytes)}.`);
+      if (bytes - added > added) causes.push(`Most of it was stored before, ${kib(bytes - added)}.`);
+      return blocked(new ReplayPause('overlay', `The run's overlay would be ${kib(bytes)}, over the ${kib(OVERLAY_LIMIT)} limit. ${causes.join(' ')}`));
     }
   }
   return { history, applied, ran };
+}
+
+/** The migrations that edited the history in this handler run. */
+export function editedNow(prepared: Prepared): string[] {
+  return prepared.ran.filter((m) => m.edits > 0).map((m) => m.id);
 }
 
 export function recordedStep(entry: JournalEntry): RecordedStep {
@@ -157,8 +155,12 @@ export function recordedStep(entry: JournalEntry): RecordedStep {
 type MutationCtx = GenericMutationCtx<GenericDataModel>;
 type Logger = { warn: (...args: unknown[]) => void; error: (...args: unknown[]) => void };
 
-/** A run's record during one handler run of the vendored workflow mutation. */
-export class RunRecord {
+/**
+ * A run's record during one handler run of the vendored workflow mutation,
+ * and what `replayHandler` replays: the history, the migrated args, and the
+ * migrations that edited the history now.
+ */
+export class RunRecord implements Replay {
   private constructor(
     private readonly migrations: WorkflowMigrations,
     private readonly workflowId: WorkflowId,
@@ -166,17 +168,18 @@ export class RunRecord {
     private readonly stored: { applied: readonly string[]; overlay: readonly OverlayOp[]; dirty: boolean },
     private readonly prepared: Prepared,
     /** Whether the run has journal entries: it isn't new. */
-    private readonly hasHistory: boolean,
+    public readonly hasHistory: boolean,
   ) {}
 
   /** Loads the run's record and applies pending migrations. Call once per handler run, before replay. */
   public static async load(
     ctx: MutationCtx,
     migrations: WorkflowMigrations,
-    workflowId: WorkflowId,
+    run: { _id: string; args: unknown },
     journal: readonly JournalEntry[],
-    args: unknown,
   ): Promise<RunRecord> {
+    const workflowId = run._id as WorkflowId;
+    const args = run.args;
     const workflow = (await ctx.meta.getFunctionMetadata()).name;
     const row = await ctx.runQuery(migrations.component.runs.load, { workflowId });
     // A run without a record is new, or from before the app adopted this
@@ -209,20 +212,9 @@ export class RunRecord {
     return this.prepared.blocked;
   }
 
-  /** For a handler that returned: throws the pause if it returned before the end of its history. */
-  public returned(progress: ReplayProgress): void {
-    const pause = returnedEarly(this.history, progress);
-    if (pause) throw pause;
-  }
-
-  /**
-   * For a handler that threw, or args that didn't validate: throws the pause
-   * if the run should pause instead of failing. Returns if it should fail.
-   */
-  public threw(error: unknown, validated: boolean, progress: ReplayProgress): void {
-    const editedNow = this.prepared.ran.filter((m) => m.edits > 0).map((m) => m.id);
-    const pause = threwEarly(this.history, progress, error, { validated, hasHistory: this.hasHistory, editedNow });
-    if (pause) throw pause;
+  /** The migrations that edited the history in this handler run. */
+  public get editedNow(): string[] {
+    return editedNow(this.prepared);
   }
 
   /** After a replay that matched: saves the applied ids and overlay, and ends a pause. Writes nothing if nothing changed. */

@@ -27,6 +27,7 @@ import {
   type HistoryView,
   type ReplayEntry,
   ReplayMismatch,
+  type ReplayStep,
 } from "../../history.js";
 
 export type WorkerResult =
@@ -64,16 +65,6 @@ export type StepRequest = {
   schedulerOptions: SchedulerOptions;
 
   resolve: (result: RunResult) => void;
-};
-
-// PATCHES: what completeMessage compares a call with: a step of the run's
-// history, or a journal entry this handler run just started. Only history
-// steps have a position, so only they throw ReplayMismatch.
-type Recorded = {
-  step: Pick<Step, "name" | "kind" | "args" | "inProgress" | "runResult">;
-  argsKnown?: boolean;
-  position?: number;
-  standIn?: boolean;
 };
 
 export class StepExecutor {
@@ -118,7 +109,7 @@ export class StepExecutor {
       // replay while a step runs, so only a history given to expectReplays()
       // has one here.
       if (entry?.step.inProgress) {
-        this.checkMessage(message, entry);
+        this.completeMessage(message, entry, true);
         return { type: "executorBlocked" };
       }
       if (entry) {
@@ -173,26 +164,15 @@ export class StepExecutor {
     };
   }
 
-  // PATCHES: takes a step of the history, and the comparison is in checkMessage.
-  completeMessage(message: StepRequest, entry: Recorded) {
-    if (entry.step.inProgress) {
+  // PATCHES: takes a step of the history. With checkOnly, for a running
+  // step, it compares the call and resolves nothing.
+  completeMessage(message: StepRequest, entry: ReplayStep, checkOnly = false) {
+    if (entry.step.inProgress && !checkOnly) {
       throw new Error(
         `Assertion failed: not blocked but have in-progress journal entry`,
       );
     }
-    this.checkMessage(message, entry);
-    if (entry.step.runResult === undefined) {
-      throw new Error(
-        `Assertion failed: no outcome for completed function call`,
-      );
-    }
-    message.resolve(entry.step.runResult);
-  }
-
-  // PATCHES: upstream's comparison, from completeMessage. A stand-in a
-  // migration inserted without args is matched on its name and kind. A
-  // mismatch throws ReplayMismatch, which pauses the run.
-  checkMessage(message: StepRequest, entry: Recorded) {
+    // PATCHES: a stand-in inserted without args matches on name and kind.
     const compareArgs = !message.unstableArgs && entry.argsKnown !== false;
     const stepFields = pick(
       entry.step,
@@ -205,9 +185,10 @@ export class StepExecutor {
           kind: message.target.kind,
           args: message.target.args as Value,
         };
-    const stepJson = JSON.stringify(convexToJson(stepFields as Value));
+    const stepJson = JSON.stringify(convexToJson(stepFields));
     const messageJson = JSON.stringify(convexToJson(messageFields));
     if (stepJson !== messageJson) {
+      // PATCHES: a mismatch with the history pauses the run.
       if (entry.position !== undefined) {
         throw new ReplayMismatch(
           entry.position,
@@ -220,6 +201,13 @@ export class StepExecutor {
         `Journal entry mismatch:\n\n${stepJson}\n\n!==\n\n${messageJson}`,
       );
     }
+    if (checkOnly) return;
+    if (entry.step.runResult === undefined) {
+      throw new Error(
+        `Assertion failed: no outcome for completed function call`,
+      );
+    }
+    message.resolve(entry.step.runResult);
   }
 
   async startSteps(messages: StepRequest[]): Promise<JournalEntry[]> {

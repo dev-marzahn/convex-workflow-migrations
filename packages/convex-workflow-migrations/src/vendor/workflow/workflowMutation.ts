@@ -35,6 +35,7 @@ import {
 import { createWorkflowCtx } from "./workflowContext.js";
 import { ReplayPause } from "../../history.js";
 import { RunRecord, type WorkflowMigrations } from "../../migrations.js";
+import { replayHandler } from "../../replay.js";
 import { replayRequest } from "../../testing.js";
 
 export type WorkflowArgs<V extends PropertyValidators, Context = unknown> = {
@@ -165,13 +166,10 @@ export function workflowMutation<
         assert(validate(vWorkflowArgs, args, { throw: true }));
       }
       // PATCHES: expectReplays() and migrate() from /test replay a given
-      // history here, in convex-test, without loading or starting anything.
-      const check =
-        typeof args.workflowId === "string"
-          ? replayRequest(args.workflowId)
-          : undefined;
-      if (check) {
-        await check(ctx, migrations, registered, workpoolOptions);
+      // history here, without loading or starting anything (src/testing.ts).
+      if (
+        await replayRequest(ctx, args, migrations, registered, workpoolOptions)
+      ) {
         return args.workflowId as WorkflowId;
       }
       let workflowId: WorkflowId, generationNumber: number;
@@ -223,7 +221,9 @@ export function workflowMutation<
         );
         return workflowId;
       }
-      if (workflow.runResult?.kind === "success") {
+      // PATCHES: any result, not only success, so a retry left over from a
+      // paused run that `fail` completed returns, and the pause ends.
+      if (workflow.runResult) {
         console.log(`Workflow ${workflowId} completed, returning.`);
         return workflowId;
       }
@@ -242,16 +242,9 @@ export function workflowMutation<
           `Assertion failed: not blocked but have in-progress journal entry`,
         );
       }
-      // PATCHES: load the run's record and apply its pending migrations, in
-      // memory. A run they can't be applied to pauses, and returns normally
-      // so the workpool doesn't fail it.
-      const run = await RunRecord.load(
-        ctx,
-        migrations,
-        workflowId,
-        journalEntries as JournalEntry[],
-        workflow.args,
-      );
+      // PATCHES: apply the run's pending migrations, in memory. A run they
+      // can't be applied to pauses, and returns so the workpool doesn't fail.
+      const run = await RunRecord.load(ctx, migrations, workflow, journalEntries);
       if (run.blocked) {
         await run.pause(ctx, generationNumber, run.blocked, console);
         return workflowId;
@@ -279,67 +272,13 @@ export function workflowMutation<
       // PATCHES:
       let paused: ReplayPause | undefined;
       try {
-        const handlerWorker = async (): Promise<WorkerResult> => {
-          let runResult: RunResult;
-          // PATCHES:
-          let validated = false;
-          try {
-            // PATCHES: the args as the migrations left them.
-            if (registered.args) {
-              validate(asObjectValidator(registered.args), run.args, {
-                throw: true,
-                db: ctx.db,
-              });
-            }
-            validated = true;
-            const returnValue =
-              (await registered.handler(step, run.args)) ?? null;
-            // PATCHES: returning before the end of the history pauses the run.
-            run.returned(executor.progress());
-            runResult = { kind: "success", returnValue };
-            if (registered.returns) {
-              try {
-                validate(asObjectValidator(registered.returns), returnValue, {
-                  throw: true,
-                });
-              } catch (error) {
-                const message =
-                  error instanceof ValidationError
-                    ? error.message
-                    : formatErrorWithStack(error);
-                console.error(
-                  "Workflow handler returned invalid return value: ",
-                  message,
-                );
-                runResult = {
-                  kind: "failed",
-                  error: "Invalid return value: " + message,
-                };
-              }
-            }
-          } catch (error) {
-            // PATCHES: rethrows to pause the run instead of failing it: on
-            // invalid args of a run with history, or a throw before the
-            // handler replayed its history (see threwEarly in history.ts).
-            run.threw(error, validated, executor.progress());
-            const message = formatErrorWithStack(error);
-            console.error(message);
-            runResult = { kind: "failed", error: message };
-          }
-          return { type: "handlerDone", runResult };
-        };
-        const executorWorker = async (): Promise<WorkerResult> => {
-          return await executor.run();
-        };
-        // PATCHES: a replay that doesn't match the history pauses the run.
-        // Calls are matched in order and new steps start only after the last
-        // step of the history, so a pause commits nothing.
-        let result: WorkerResult;
-        try {
-          result = await Promise.race([handlerWorker(), executorWorker()]);
-        } catch (error) {
-          if (!(error instanceof ReplayPause)) throw error;
-          paused = error;
+        // PATCHES: upstream's handler and executor workers, in replayHandler
+        // (src/replay.ts). A replay that can't go on pauses the run, which
+        // commits nothing of the handler run.
+        const options = { step, console, db: ctx.db };
+        const result = await replayHandler(registered, run, executor, options);
+        if (result instanceof ReplayPause) {
+          paused = result;
           return workflowId;
         }
         // PATCHES: save what this handler run applied, in its transaction.

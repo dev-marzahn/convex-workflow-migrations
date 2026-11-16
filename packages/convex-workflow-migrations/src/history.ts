@@ -4,7 +4,7 @@
 import type { FunctionArgs, FunctionReference, FunctionReturnType } from 'convex/server';
 import { convexToJson, getConvexSize, type Infer, jsonToConvex, type Value } from 'convex/values';
 
-import type { vOverlayOp, vStepKind } from './component/schema.ts';
+import { capDetail, type vOverlayOp, type vStepKind } from './component/schema.ts';
 import { safeFunctionName } from './vendor/workflow/safeFunctionName.ts';
 import type { RunResult, WorkflowReturnType } from './vendor/workflow/types.ts';
 
@@ -126,8 +126,20 @@ export interface History {
   updateWorkflowArgs(update: (args: any) => unknown): void;
 }
 
+/**
+ * What the vendored executor compares a call with: a step of the history, or
+ * a journal entry the handler run just started. Only history steps have a
+ * position, so only they throw `ReplayMismatch`.
+ */
+export type ReplayStep = {
+  step: { name: string; kind?: StepKind; args: any; inProgress: boolean; runResult?: RunResult };
+  argsKnown?: boolean;
+  position?: number;
+  standIn?: boolean;
+};
+
 /** One step of the history the handler replays against. */
-export type ReplayEntry = {
+export type ReplayEntry = ReplayStep & {
   /** Shaped like a journal entry's `step`, so the executor compares it unchanged. */
   step: { name: string; kind: StepKind; args: unknown; inProgress: boolean; runResult?: RunResult; startedAt: number };
   /** Its position in the history, for errors. */
@@ -150,7 +162,12 @@ type Node = {
   standIn?: { result: unknown };
   /** A recorded step's result, as `updateResult` changed it. */
   result?: { value: unknown };
+  /** A migration renamed it, or gave it other args or another result. */
+  rewritten?: boolean;
 };
+
+/** What the overlay-size message attributes `truncate`'s operations to. */
+export const RESTART = Symbol('restart');
 
 const clone = <T>(value: T): T => (value === undefined ? value : (jsonToConvex(convexToJson(value as Value)) as T));
 const json = (value: unknown) => JSON.stringify(convexToJson(value as Value));
@@ -189,8 +206,8 @@ export class HistoryView implements History {
   private argsChanged = false;
   private nextId = 1;
   /** The migration running now, and the operations each one added and the edits it made. */
-  private migrating: string | undefined;
-  private readonly origin = new Map<OverlayOp, string>();
+  private migrating: string | typeof RESTART | undefined;
+  private readonly origin = new Map<OverlayOp, string | typeof RESTART>();
   private readonly edits = new Map<string, number>();
 
   /**
@@ -291,8 +308,13 @@ export class HistoryView implements History {
     }
     const first = rest.find((node) => node.recorded);
     const last = [...this.order.keys()].at(-1);
-    if (first && last !== undefined) this.push({ op: 'truncate', from: first.id, through: last });
-    for (const node of rest) if (!node.recorded) this.push({ op: 'remove', target: node.id });
+    this.migrating = RESTART;
+    try {
+      if (first && last !== undefined) this.push({ op: 'truncate', from: first.id, through: last });
+      for (const node of rest) if (!node.recorded) this.push({ op: 'remove', target: node.id });
+    } finally {
+      this.migrating = undefined;
+    }
   }
 
   /**
@@ -369,18 +391,25 @@ export class HistoryView implements History {
     return this.ops.map(clone);
   }
 
-  /** The stored size of the overlay, in bytes, and the migration whose operations take the most of it. */
-  public size(): { bytes: number; largest?: { id: string; bytes: number } } {
-    const by = new Map<string, number>();
+  /**
+   * The stored size of the overlay, in bytes; how much of it this handler run
+   * added; and what added the most: a migration, by its id, or the restart
+   * (`RESTART`).
+   */
+  public size(): { bytes: number; added: number; largest?: { id: string | typeof RESTART; bytes: number } } {
+    const by = new Map<string | typeof RESTART, number>();
     let bytes = 0;
+    let added = 0;
     for (const op of this.ops) {
       const size = getConvexSize(op as Value);
       bytes += size;
       const id = this.origin.get(op);
-      if (id !== undefined) by.set(id, (by.get(id) ?? 0) + size);
+      if (id === undefined) continue;
+      added += size;
+      by.set(id, (by.get(id) ?? 0) + size);
     }
-    const [id, most] = [...by].reduce<[string | undefined, number]>((top, entry) => (entry[1] > top[1] ? entry : top), [undefined, 0]);
-    return { bytes, ...(id === undefined ? {} : { largest: { id, bytes: most } }) };
+    const [id, most] = [...by].reduce<[string | typeof RESTART | undefined, number]>((top, entry) => (entry[1] > top[1] ? entry : top), [undefined, 0]);
+    return { bytes, added, ...(id === undefined ? {} : { largest: { id, bytes: most } }) };
   }
 
   /** Whether the step at `position` is a stand-in or has a result a migration changed: the handler got it from a migration, not from the run. */
@@ -392,6 +421,32 @@ export class HistoryView implements History {
   /** Whether the step at `position` or a later one is a journal entry. */
   public recordedFrom(position: number): boolean {
     return this.nodes.slice(position).some((node) => node.recorded);
+  }
+
+  /**
+   * Whether the handler, having got the steps before `next` and no recorded
+   * step after them, got a failure to pass on: the step before `next` is a
+   * journal entry, and among the newest recorded steps (the ones started with
+   * it, in the same handler run) one failed or was canceled, and no
+   * migration renamed it or gave it other args or another result.
+   */
+  public endsInFailure(next: number): boolean {
+    const last = this.nodes[next - 1]?.recorded;
+    if (!last) return false;
+    return this.nodes.some(
+      (node) =>
+        node.recorded?.startedAt === last.startedAt && node.recorded.runResult !== undefined && node.recorded.runResult.kind !== 'success' && !node.rewritten,
+    );
+  }
+
+  /** The position of the step with id `id`, or -1 if the history doesn't have it. */
+  public position(id: string): number {
+    return this.nodes.findIndex((node) => node.id === id);
+  }
+
+  /** The id of the step at `position`, or undefined past the end. */
+  public idAt(position: number): string | undefined {
+    return this.nodes[position]?.id;
   }
 
   /** How many steps the history has. */
@@ -471,10 +526,8 @@ export class HistoryView implements History {
 
   private push(op: OverlayOp): void {
     if (!this.apply(op)) throw new Error(`Assertion failed: ${op.op} of a step that isn't in the history`);
-    if (this.migrating !== undefined) {
-      this.origin.set(op, this.migrating);
-      this.edits.set(this.migrating, (this.edits.get(this.migrating) ?? 0) + 1);
-    }
+    if (this.migrating !== undefined) this.origin.set(op, this.migrating);
+    if (typeof this.migrating === 'string') this.edits.set(this.migrating, (this.edits.get(this.migrating) ?? 0) + 1);
   }
 
   private dropOp(op: OverlayOp): void {
@@ -521,6 +574,7 @@ export class HistoryView implements History {
       case 'rewrite': {
         const node = this.nodes.find((n) => n.id === op.target);
         if (!node) return false;
+        node.rewritten = true;
         if (op.name !== undefined) node.name = op.name;
         if (op.args !== undefined) {
           node.args = op.args;
@@ -548,32 +602,44 @@ export class HistoryView implements History {
 /** Why a run pauses instead of replaying, or instead of completing. */
 export type PauseReason = 'mismatch' | 'args' | 'threw' | 'migration' | 'migrations' | 'overlay' | 'error';
 
-/** The run can't replay on this code: it pauses. `position` is where in the history, if somewhere. */
+/**
+ * The run can't replay on this code: it pauses. `position` is where in the
+ * history, if somewhere. `detail` is cut to `DETAIL_LIMIT` characters, so a
+ * huge argument or error message can't make the pause too big to store.
+ */
 export class ReplayPause extends Error {
+  public readonly detail: string;
+
   public constructor(
     public readonly reason: PauseReason,
-    public readonly detail: string,
+    detail: string,
     public readonly position?: number,
+    /** For a mismatch, whose parts are cut on their own. */
+    limit?: number,
   ) {
-    super(detail);
+    const capped = capDetail(detail, limit);
+    super(capped);
+    this.detail = capped;
     this.name = 'ReplayPause';
   }
 }
 
 /** Replay doesn't match the history: the code made a different call at `position`. The run pauses. */
 export class ReplayMismatch extends ReplayPause {
-  public constructor(
-    position: number,
-    /** The call the code made, and the step the history has there, as JSON. */
-    public readonly expected: string,
-    public readonly recorded: string,
-    standIn = false,
-  ) {
+  /** The call the code made, and the step the history has there, as JSON, each cut to `DETAIL_LIMIT` characters. */
+  public readonly expected: string;
+  public readonly recorded: string;
+
+  public constructor(position: number, expected: string, recorded: string, standIn = false) {
+    const [call, step] = [capDetail(expected), capDetail(recorded)];
     super(
       'mismatch',
-      `Journal entry mismatch at step ${position}: the code calls ${expected}, the history has ${recorded}${hint(expected, recorded, standIn)}`,
+      `Journal entry mismatch at step ${position}: the code calls ${call}, the history has ${step}${hint(expected, recorded, standIn)}`,
       position,
+      Infinity,
     );
+    this.expected = call;
+    this.recorded = step;
     this.name = 'ReplayMismatch';
   }
 }
@@ -617,13 +683,24 @@ export function returnedEarly(history: HistoryView, progress: ReplayProgress): R
 export type ThrowContext = { validated: boolean; hasHistory: boolean; editedNow: readonly string[]; recordedOnly?: boolean };
 
 /**
- * Whether a handler that threw should pause the run instead of failing it.
- * Its throw is a reaction to the run, and fails it, only if it came after the
- * handler had called every recorded step of its history, the last step it
- * got was recorded rather than made up by a migration, no migration edited
- * the history in this handler run, and it hadn't started a step past the
- * history. Otherwise the code and the history may disagree. Args that don't
- * validate pause a run that has history, and fail a new one.
+ * Whether a handler that threw should pause the run instead of failing it,
+ * by the rules in the README's "Pausing and recovery", in their order. Args
+ * that don't validate pause a run that has history, and fail a new one.
+ * Otherwise, the run:
+ *
+ * 1. fails if the handler run started a step past the history, since that
+ *    step's writes commit;
+ * 2. pauses if a recorded step is left that the handler hasn't replayed;
+ * 3. pauses if the last step it got is a stand-in, or has a result a
+ *    migration changed;
+ * 4. fails if the newest recorded steps, which it got last, include one
+ *    that failed or was canceled and that no migration rewrote: the handler
+ *    is passing that failure on;
+ * 5. pauses if migrations edited its history in this handler run;
+ * 6. fails otherwise.
+ *
+ * With `recordedOnly` (a history whose run is known to have failed), only
+ * rules 1 and 2 apply.
  */
 export function threwEarly(history: HistoryView, progress: ReplayProgress, error: unknown, context: ThrowContext): ReplayPause | undefined {
   if (error instanceof ReplayPause) return error;
@@ -643,6 +720,7 @@ export function threwEarly(history: HistoryView, progress: ReplayProgress, error
       next - 1,
     );
   }
+  if (history.endsInFailure(next)) return undefined;
   if (context.editedNow.length > 0) {
     const ids = context.editedNow.map((id) => `"${id}"`).join(', ');
     return new ReplayPause('threw', `The handler threw after migrations ${ids} changed its history: ${message(error)}`);

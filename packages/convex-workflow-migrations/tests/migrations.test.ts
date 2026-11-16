@@ -5,6 +5,7 @@ import { anyApi, componentsGeneric, defineSchema, type FunctionReference, intern
 import { v } from 'convex/values';
 import { afterEach, beforeEach, expect, test, vi } from 'vite-plus/test';
 
+import { DETAIL_LIMIT } from '../src/component/schema.ts';
 import {
   type Migration,
   migration,
@@ -121,6 +122,14 @@ const releases = {
   huge: release({ notify: true }, [
     migration('huge-stand-in', (h) => h.insertAfter(flows.grab, flows.notify, { result: { at: null, padding: 'x'.repeat(600_000) } })),
   ]),
+  // Calls grab with huge args, which the history doesn't have.
+  hugeArgs: manager.define({
+    args: {},
+    handler: async (step: WorkflowCtx): Promise<void> => {
+      await step.runMutation(flows.grab, { blob: 'x'.repeat(600_000) });
+      await step.awaitEvent({ name: 'downloadDone' });
+    },
+  }),
 };
 
 const functions: Record<string, unknown> = {
@@ -334,6 +343,52 @@ test("a step's failure after the history fails the run, as before", async () => 
   expect(result.type === 'failed' && result.error).toContain('the download is corrupt');
   expect(completions.map((c) => c.result.kind)).toEqual(['failed']);
   expect(await paused(t, id)).toBeUndefined();
+});
+
+test('a step that fails right after a deploy fails the run, though the deploy’s migrations edited its history', async () => {
+  const t = setup();
+  const id = await start(t);
+  deploy('r1'); // inserts notify after grab, the next time the run replays
+  await t.run((ctx) => manager.sendEvent(ctx, { workflowId: id, name: 'downloadDone', error: 'the download failed' }));
+  await settle(t);
+  const result = await status(t, id);
+  expect(result.type === 'failed' && result.error).toContain('the download failed');
+  expect(await paused(t, id)).toBeUndefined();
+  expect(pauses).toEqual([]);
+  expect(completions.map((c) => c.result.kind)).toEqual(['failed']);
+  expect((await record(t, id))?.applied).toEqual(['notify-after-grab']);
+});
+
+test("a pause's detail is cut, so a huge argument can't make the pause too big to store", async () => {
+  const t = setup();
+  const id = await start(t);
+  deploy('hugeArgs');
+  await downloadDone(t, id);
+  const run = await paused(t, id);
+  expect(run).toMatchObject({ reason: 'mismatch', step: 0 });
+  expect(run!.detail.length).toBeLessThan(2 * DETAIL_LIMIT + 200);
+  expect(run!.detail).toMatch(
+    /^Journal entry mismatch at step 0: the code calls \{"args":\{"blob":"x+…, the history has \{"args":\{\},"kind":"function","name":"flows:grab"\}$/,
+  );
+  expect(pauses.map((p) => p.detail)).toEqual([run!.detail]);
+});
+
+test('a retry left over from a paused run that was completed ends its pause', async () => {
+  // What `fail` from an action leaves behind if it dies after completing the run.
+  const t = setup();
+  const id = await start(t);
+  deploy('unguarded');
+  await downloadDone(t, id);
+  await t.run(async (ctx) => {
+    const { workflow } = await ctx.runQuery(components.workflow.workflow.getStatus, { workflowId: id });
+    const runResult = { kind: 'failed' as const, error: 'gave up' };
+    await ctx.runMutation(components.workflow.workflow.complete, { workflowId: id, generationNumber: workflow.generationNumber, runResult });
+  });
+  expect(await paused(t, id)).toMatchObject({ attempts: 1 });
+  await settle(t, 73_000);
+  expect(await paused(t, id)).toBeUndefined();
+  expect(await status(t, id)).toEqual({ type: 'failed', error: 'gave up' });
+  expect(completions.map((c) => c.result.kind)).toEqual(['failed']);
 });
 
 test('an overlay over the size limit pauses the run, naming the migration, and saves nothing', async () => {

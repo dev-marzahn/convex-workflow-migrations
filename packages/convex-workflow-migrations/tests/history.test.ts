@@ -2,6 +2,7 @@
 import { anyApi } from 'convex/server';
 import { expect, test } from 'vite-plus/test';
 
+import { DETAIL_LIMIT } from '../src/component/schema.ts';
 import { HistoryView, type RecordedStep, ReplayMismatch, ReplayPause, returnedEarly, threwEarly } from '../src/history.ts';
 import { migration, OVERLAY_LIMIT, prepareHistory, recordedStep } from '../src/migrations.ts';
 import { redactHistory } from '../src/redact.ts';
@@ -285,6 +286,19 @@ test('a mismatch on a stand-in inserted as a function and called as a workflow s
   expect(new ReplayMismatch(1, call, step).reason).toBe('mismatch');
 });
 
+test("a pause's detail is cut to DETAIL_LIMIT, and each call of a mismatch on its own", () => {
+  const long = 'x'.repeat(DETAIL_LIMIT * 2);
+  const pause = new ReplayPause('threw', long);
+  expect(pause.detail).toHaveLength(DETAIL_LIMIT);
+  expect(pause.detail.endsWith('x…')).toBe(true);
+  expect(pause.message).toBe(pause.detail);
+  expect(new ReplayPause('threw', 'short').detail).toBe('short');
+  const mismatch = new ReplayMismatch(3, `{"args":"${long}"}`, `{"args":"${long}","kind":"event"}`);
+  expect(mismatch.expected).toHaveLength(DETAIL_LIMIT);
+  expect(mismatch.recorded).toHaveLength(DETAIL_LIMIT);
+  expect(mismatch.detail).toBe(`Journal entry mismatch at step 3: the code calls ${mismatch.expected}, the history has ${mismatch.recorded}`);
+});
+
 test('returnedEarly: returning before the end of the history is a mismatch', () => {
   const h = new HistoryView(journal());
   expect(returnedEarly(h, { started: false })).toBeUndefined();
@@ -314,6 +328,19 @@ test('threwEarly: which throws pause the run and which fail it', () => {
   expect(threwEarly(standIns, { next: { position: 1 }, started: false }, error, ctx)).toBeUndefined();
   // For a run that failed, only a recorded step left counts.
   expect(threwEarly(standIns, { started: false }, error, { ...ctx, recordedOnly: true, editedNow: ['m'] })).toBeUndefined();
+  // The newest recorded step failed, and the handler passes that on: fail, though migrations edited the history now.
+  const failedWait = new HistoryView([done('j0', 'grab'), { ...event('j1', 'downloadDone'), runResult: { kind: 'failed', error: 'no' } }]);
+  failedWait.insertAfter(fn.grab, fn.notify, { result: null });
+  expect(threwEarly(failedWait, { started: false }, error, { ...ctx, editedNow: ['m'] })).toBeUndefined();
+  // Unless a migration rewrote that step.
+  failedWait.rename({ event: 'downloadDone' }, { event: 'filesReady' });
+  expect(threwEarly(failedWait, { started: false }, error, { ...ctx, editedNow: ['m'] })).toMatchObject({ reason: 'threw' });
+  // Steps started together count as the newest: one failed, the other, last, succeeded.
+  const parallel = new HistoryView([done('j0', 'grab'), { ...done('j1', 'a'), runResult: { kind: 'canceled' } }, { ...done('j2', 'b'), startedAt: 10 }]);
+  expect(threwEarly(parallel, { started: false }, error, { ...ctx, editedNow: ['m'] })).toBeUndefined();
+  // An older failure, which the handler caught then, doesn't count.
+  const older = new HistoryView([{ ...done('j0', 'grab'), runResult: { kind: 'failed', error: 'no' } }, done('j1', 'retry')]);
+  expect(threwEarly(older, { started: false }, error, { ...ctx, editedNow: ['m'] })).toMatchObject({ reason: 'threw' });
   // Args that don't validate: pause a run with history, fail a new one.
   expect(threwEarly(h, { next: { position: 0 }, started: false }, error, { ...ctx, validated: false })).toMatchObject({ reason: 'args' });
   expect(threwEarly(new HistoryView([]), { started: false }, error, { ...ctx, validated: false, hasHistory: false })).toBeUndefined();
@@ -347,6 +374,15 @@ test('prepareHistory refuses a record from a newer format, and an overlay over t
   expect(prepared.blocked).toMatchObject({ reason: 'overlay' });
   expect(prepared.blocked?.detail).toContain('Migration "huge" added the most');
   expect(prepareHistory(journal(), stored, [small], {}).ran).toEqual([{ id: 'small', edits: 1 }]);
+
+  // An overlay that was just under the limit, and a restart's truncate that takes it over.
+  const empty = new HistoryView(journal());
+  empty.insertAfter(fn.grab, fn.notify, { result: '' });
+  const full = new HistoryView(journal());
+  full.insertAfter(fn.grab, fn.notify, { result: 'x'.repeat(OVERLAY_LIMIT - empty.size().bytes - 10) });
+  expect(full.size().bytes).toBeLessThan(OVERLAY_LIMIT);
+  const restarted = prepareHistory(journal(), { applied: [], overlay: full.overlay(), restart: 2 }, [], {});
+  expect(restarted.blocked?.detail).toMatch(/ KiB limit\. The restart added the most, 1 KiB\. Most of it was stored before, \d+ KiB\.$/);
 });
 
 test('redactHistory passes every step and the run args through redact', async () => {
