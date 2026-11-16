@@ -41,6 +41,7 @@
       },
       "devDependencies": {
         "@edge-runtime/vm": "catalog:",
+        "@types/node": "catalog:",
         "convex-test": "catalog:",
         "vite-plus": "catalog:",
       },

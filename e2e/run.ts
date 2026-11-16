@@ -8,6 +8,8 @@
 //
 // Needs Docker. Builds the package first.
 import { spawnSync, type SpawnSyncOptions } from 'node:child_process';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
@@ -80,13 +82,31 @@ const finished = (app: string, backend: Backend, ids: Ids, what: string, timeout
 
 type Exported = { workflowId: string; args: unknown; steps: { name: string; runResult?: unknown }[]; applied?: string[]; overlay?: unknown };
 
-/** Runs the `histories` CLI from `app`'s directory, as a user would: the installed bin, or the build for a fixture without the package. */
-function histories(app: string, backend: Backend, args: string[], status = 0): { exported: Exported[]; stderr: string } {
+/**
+ * Runs the `histories` CLI from `app`'s directory, as a user would: the
+ * installed bin, or the build for a fixture without the package. With `out`,
+ * it writes the export there, and this reads it back.
+ */
+function histories(app: string, backend: Backend, args: string[], { status = 0, out }: { status?: number; out?: string } = {}) {
   const cli =
     app === release3 ? join(appDir(app), 'node_modules/.bin/convex-workflow-migrations') : join(ROOT, 'packages/convex-workflow-migrations/dist/cli.js');
-  const result = spawnSync(cli, ['histories', 'pipeline:run', ...args], { cwd: appDir(app), env: backend.env, encoding: 'utf8' });
+  const argv = ['histories', 'pipeline:run', ...args, ...(out ? ['--out', out] : [])];
+  const result = spawnSync(cli, argv, { cwd: appDir(app), env: backend.env, encoding: 'utf8' });
   if (result.status !== status) throw new Error(`histories exited with ${result.status}, not ${status}:\n${result.stderr}`);
-  return { exported: result.stdout ? (JSON.parse(result.stdout) as Exported[]) : [], stderr: result.stderr };
+  const json = out ? readFileSync(out, 'utf8') : result.stdout;
+  return { exported: json ? (JSON.parse(json) as Exported[]) : [], stderr: result.stderr };
+}
+
+/** Runs examples/basic's test of the exports in `tmp`/histories (pipeline.test.ts), and checks it ran rather than skipped. */
+function replayExports(tmp: string): void {
+  const report = join(tmp, 'report.json');
+  sh(join(appDir(release3), 'node_modules/.bin/vp'), ['test', 'run', 'convex/pipeline.test.ts', '--reporter=json', `--outputFile=${report}`], {
+    cwd: appDir(release3),
+    env: { ...process.env, EXPORTED_HISTORIES: join(tmp, 'histories') },
+  });
+  const { testResults } = JSON.parse(readFileSync(report, 'utf8')) as { testResults: { assertionResults: { title: string; status: string }[] }[] };
+  const test = testResults[0]?.assertionResults.find((a) => a.title === 'runs exported from a deployment replay on the current code');
+  if (test?.status !== 'passed') throw new Error(`The exports' replay test didn't pass: ${JSON.stringify(test)}`);
 }
 const shape = ({ workflowId, args, steps, applied }: Exported) => ({
   workflowId,
@@ -121,14 +141,17 @@ const scenarios: Record<string, (backend: Backend) => Promise<void>> = {
    * without releases 1 and 2 ever being deployed. A run started on release 3
    * has every migration applied from the start. The `histories` CLI exports
    * the release 0 run before the deploy, without the migrations component
-   * (only with --before-adoption), and once it finished on release 3, with
-   * its record.
+   * (only with --before-adoption), and both runs once they finished on
+   * release 3, with their records; release 3's pipeline.test.ts replays the
+   * exports.
    */
   async skip(backend) {
+    // The exports, in a directory that's left behind if the scenario fails.
+    const tmp = mkdtempSync(join(tmpdir(), `${PREFIX}-`));
     deploy('v1', backend);
     const old = await startWaitingRun('v1', backend, 1);
-    histories('v1', backend, [], 2);
-    const before = histories('v1', backend, ['--before-adoption']);
+    histories('v1', backend, [], { status: 2 });
+    const before = histories('v1', backend, ['--before-adoption'], { out: join(tmp, 'histories/before.json') });
     const args = { grabId: old.grabId };
     expectEqual(
       before.exported.map(shape),
@@ -153,13 +176,17 @@ const scenarios: Record<string, (backend: Backend) => Promise<void>> = {
     expectEqual(freshGrab, { log: ['grab', 'notify', 'import', 'transcode', 'publish'], status: 'completed' }, 'the release 3 run');
     expectEqual(record(release3, backend, fresh)?.overlay, [], 'the release 3 run’s overlay');
 
-    const exported = histories(release3, backend, []).exported.find((h) => h.workflowId === old.workflowId);
+    const after = histories(release3, backend, [], { out: join(tmp, 'histories/after.json') }).exported;
+    expectEqual(after.map((h) => h.workflowId).sort(), [old.workflowId, fresh.workflowId].sort(), 'the runs exported after');
+    const exported = after.find((h) => h.workflowId === old.workflowId);
     const steps = ['pipeline:grab', 'downloadDone', 'pipeline:importFiles', 'pipeline:transcode', 'pipeline:publish'];
     expectEqual(exported && shape(exported), { workflowId: old.workflowId, args, steps, applied: ALL }, 'the export after');
     expectEqual(exported?.overlay, record(release3, backend, old)?.overlay, 'the exported overlay, which has notify’s stand-in');
+    replayExports(tmp);
     // Two runs, and --max-scan 1: it stops, says where, and exports nothing.
-    const stopped = histories(release3, backend, ['--max-scan', '1'], 1);
+    const stopped = histories(release3, backend, ['--max-scan', '1'], { status: 1 });
     if (!/read the newest 1, the oldest created \d{4}-/.test(stopped.stderr)) throw new Error(`The --max-scan stop doesn't say where:\n${stopped.stderr}`);
+    rmSync(tmp, { recursive: true, force: true });
   },
 
   /**
