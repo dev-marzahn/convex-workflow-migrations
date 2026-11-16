@@ -1,7 +1,7 @@
 # convex-workflow-migrations
 
 [![npm](https://img.shields.io/npm/v/@dev-marzahn/convex-workflow-migrations)](https://www.npmjs.com/package/@dev-marzahn/convex-workflow-migrations)
-[![CI](https://github.com/dev-marzahn/convex-workflow-patches/actions/workflows/ci.yml/badge.svg)](https://github.com/dev-marzahn/convex-workflow-patches/actions/workflows/ci.yml)
+[![CI](https://github.com/dev-marzahn/convex-workflow-migrations/actions/workflows/ci.yml/badge.svg)](https://github.com/dev-marzahn/convex-workflow-migrations/actions/workflows/ci.yml)
 [![License: MPL-2.0 AND Apache-2.0](https://img.shields.io/badge/license-MPL--2.0%20AND%20Apache--2.0-blue)](#license)
 
 Change a released [`@convex-dev/workflow`](https://www.convex.dev/components/workflow) workflow without failing the runs already in flight.
@@ -88,7 +88,7 @@ export const workflow = new WorkflowManager(components.workflow, {
 
 Import the rest from this package too: `vWorkflowId`, `defineEvent`, the types and upstream's other exports are re-exported unchanged. Three are left out: `defineWorkflow` (use `workflow.define`) and the standalone `restart` and `cleanup` (use the manager's). Upstream's standalone `cancel` is re-exported, but doesn't end a pause: use `workflow.cancel`. Define every workflow on the `workflow` component with this manager, and start runs with `workflow.start` or upstream's `start`: both go through the workflow mutation, which writes the run's record in the transaction that creates it, with `startAsync` too.
 
-A workflow you already run needs no migrations until you change it. Its runs from before you adopted the package get a record at their next handler run, as runs from before the first migration. [`examples/basic`](https://github.com/dev-marzahn/convex-workflow-patches/tree/main/examples/basic) is the pipeline above, with its tests.
+A workflow you already run needs no migrations until you change it. Its runs from before you adopted the package get a record at their next handler run, as runs from before the first migration. [`examples/basic`](https://github.com/dev-marzahn/convex-workflow-migrations/tree/main/examples/basic) is the pipeline above, with its tests.
 
 ## Writing migrations
 
@@ -282,10 +282,10 @@ Upstream's client replays the handler against the raw journal, and its package e
 | -------------------------- | -------------------- |
 | 100.x.x                    | 0.4.10               |
 
-[`VENDORED.md`](https://github.com/dev-marzahn/convex-workflow-patches/blob/main/packages/convex-workflow-migrations/src/vendor/workflow/VENDORED.md) lists the changes to the copy, and a test fails if the copy isn't the installed release plus those changes.
+[`VENDORED.md`](https://github.com/dev-marzahn/convex-workflow-migrations/blob/main/packages/convex-workflow-migrations/src/vendor/workflow/VENDORED.md) lists the changes to the copy, and a test fails if the copy isn't the installed release plus those changes.
 
 ## Versioning, contributing and license
 
-Versions follow [Epoch SemVer](https://antfu.me/posts/epoch-semver), starting at `100.0.0`: a change to the first number can break your app. [CHANGELOG.md](https://github.com/dev-marzahn/convex-workflow-patches/blob/main/CHANGELOG.md) lists the changes, and [CONTRIBUTING.md](https://github.com/dev-marzahn/convex-workflow-patches/blob/main/CONTRIBUTING.md) describes how the package works inside. Report vulnerabilities as [SECURITY.md](https://github.com/dev-marzahn/convex-workflow-patches/blob/main/SECURITY.md) describes.
+Versions follow [Epoch SemVer](https://antfu.me/posts/epoch-semver), starting at `100.0.0`: a change to the first number can break your app. [CHANGELOG.md](https://github.com/dev-marzahn/convex-workflow-migrations/blob/main/CHANGELOG.md) lists the changes, and [CONTRIBUTING.md](https://github.com/dev-marzahn/convex-workflow-migrations/blob/main/CONTRIBUTING.md) describes how the package works inside. Report vulnerabilities as [SECURITY.md](https://github.com/dev-marzahn/convex-workflow-migrations/blob/main/SECURITY.md) describes.
 
-[MPL-2.0](https://github.com/dev-marzahn/convex-workflow-patches/blob/main/LICENSE). The copy of `@convex-dev/workflow`'s client code in `src/vendor/workflow/` is upstream's, under [Apache-2.0](https://github.com/dev-marzahn/convex-workflow-patches/blob/main/packages/convex-workflow-migrations/src/vendor/workflow/LICENSE), and is marked as changed where it was changed.
+[MPL-2.0](https://github.com/dev-marzahn/convex-workflow-migrations/blob/main/LICENSE). The copy of `@convex-dev/workflow`'s client code in `src/vendor/workflow/` is upstream's, under [Apache-2.0](https://github.com/dev-marzahn/convex-workflow-migrations/blob/main/packages/convex-workflow-migrations/src/vendor/workflow/LICENSE), and is marked as changed where it was changed.
