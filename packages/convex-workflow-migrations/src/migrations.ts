@@ -6,7 +6,7 @@ import { createFunctionHandle, type GenericDataModel, type GenericMutationCtx, m
 
 import type { ComponentApi } from './component/_generated/component.js';
 import { FORMAT } from './component/schema.ts';
-import { type History, HistoryView, type OverlayOp, type PauseReason, type RecordedStep, ReplayPause, RESTART, sameOverlay } from './history.ts';
+import { type History, HistoryView, type OverlayOp, type PauseReason, type RecordedStep, ReplayPause, sameOverlay } from './history.ts';
 import type { Replay } from './replay.ts';
 import type { WorkflowId } from './vendor/workflow/publicTypes.ts';
 import type { JournalEntry, WorkflowComponent } from './vendor/workflow/types.ts';
@@ -127,7 +127,7 @@ export function prepareHistory(journal: readonly RecordedStep[], stored: StoredR
   }
   for (const m of migrations.slice(applied.length)) {
     try {
-      const edits = history.migrateAs(m.id, () => {
+      const edits = history.migrateAs(() => {
         const returned: unknown = m.migrate(history);
         if (returned instanceof Promise) throw new Error('it returned a promise; migrations are synchronous');
       });
@@ -172,13 +172,13 @@ export function prepareHistory(journal: readonly RecordedStep[], stored: StoredR
     }
   }
   // The stored overlay fit; only what this handler run added can make it too big to save.
-  if (ran.length > 0 || stored.restart !== undefined || stored.restartFrom !== undefined) {
-    const { bytes, added, largest } = history.size();
+  const restarted = stored.restart !== undefined || stored.restartFrom !== undefined;
+  if (ran.length > 0 || restarted) {
+    const bytes = history.size();
     if (bytes > OVERLAY_LIMIT) {
-      const causes: string[] = [];
-      if (largest) causes.push(`${largest.id === RESTART ? 'The restart' : `Migration "${largest.id}"`} added the most, ${kib(largest.bytes)}.`);
-      if (bytes - added > added) causes.push(`Most of it was stored before, ${kib(bytes - added)}.`);
-      return blocked(new ReplayPause('overlay', `The run's overlay would be ${kib(bytes)}, over the ${kib(OVERLAY_LIMIT)} limit. ${causes.join(' ')}`));
+      const added = [...ran.filter((m) => m.edits > 0).map((m) => `migration "${m.id}"`), ...(restarted ? ['the restart'] : [])];
+      const by = added.length === 0 ? '' : ` This handler run added to it: ${added.join(', ')}.`;
+      return blocked(new ReplayPause('overlay', `The run's overlay would be ${kib(bytes)}, over the ${kib(OVERLAY_LIMIT)} limit.${by}`));
     }
   }
   return { history, applied, ran };

@@ -40,7 +40,6 @@ import {
   type WorkflowMigrations,
 } from "../../migrations.js";
 import { replayHandler } from "../../replay.js";
-import { replayRequest } from "../../testing.js";
 
 export type WorkflowArgs<V extends PropertyValidators, Context = unknown> = {
   /**
@@ -168,13 +167,6 @@ export function workflowMutation<
           );
         }
         assert(validate(vWorkflowArgs, args, { throw: true }));
-      }
-      // PATCHES: expectReplays() and migrate() from /test replay a given
-      // history here, without loading or starting anything (src/testing.ts).
-      if (
-        await replayRequest(ctx, args, migrations, registered, workpoolOptions)
-      ) {
-        return args.workflowId as WorkflowId;
       }
       let workflowId: WorkflowId, generationNumber: number;
 

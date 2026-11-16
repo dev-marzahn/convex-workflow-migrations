@@ -1,12 +1,15 @@
 // One handler run's replay of the handler against a run's history, and the
 // rules for when it pauses the run instead of completing it (README, "Pausing
-// and recovery"). The vendored workflow mutation and expectReplays() in /test
-// both call `replayHandler`, so the two can't drift apart.
+// and recovery"): `returnedEarly` and `threwEarly`. The vendored workflow
+// mutation and expectReplays() in /test both call `replayHandler`, so the two
+// can't drift apart.
+import type { WorkpoolOptions } from '@convex-dev/workpool';
 import { validate, ValidationError } from 'convex-helpers/validators';
 import type { GenericDatabaseReader } from 'convex/server';
-import { asObjectValidator, type PropertyValidators, type Validator } from 'convex/values';
+import { asObjectValidator, convexToJson, type PropertyValidators, type Validator, type Value } from 'convex/values';
 
-import { type HistoryView, ReplayPause, returnedEarly, threwEarly } from './history.ts';
+import { type HistoryView, ReplayPause } from './history.ts';
+import type { Migration } from './migrations.ts';
 import { formatErrorWithStack } from './vendor/workflow/shared.ts';
 import type { StepExecutor, WorkerResult } from './vendor/workflow/step.ts';
 import type { RunResult } from './vendor/workflow/types.ts';
@@ -20,6 +23,15 @@ export type ReplayDefinition = {
   returns?: unknown;
   handler: (step: WorkflowCtx, args: any) => Promise<unknown>;
 };
+
+/**
+ * What `expectReplays()` and `migrate()` in /test need to replay a history
+ * without Convex: `WorkflowManager.define` attaches it to the workflow
+ * mutation under `REPLAY`. A global symbol, so a test that loads two copies
+ * of this package (its build and its sources) still finds it.
+ */
+export type ReplayTarget = { definition: ReplayDefinition; migrations: readonly Migration[]; workpoolOptions?: WorkpoolOptions };
+export const REPLAY = Symbol.for('@dev-marzahn/convex-workflow-migrations/replay');
 
 /** What replay knows about the run. */
 export type Replay = {
@@ -41,6 +53,83 @@ export type ReplayOptions = {
   /** Validates ids in the args against the database, as upstream does. */
   db?: GenericDatabaseReader<any>;
 };
+
+const message = (error: unknown) => (error instanceof Error ? error.message : String(error));
+
+/** Where replay got to when the handler threw or returned: the first history step it hasn't called, and whether it started a step past the history. */
+export type ReplayProgress = { next?: { position: number }; started: boolean };
+
+/**
+ * Whether a handler that returned should pause the run instead of
+ * completing it: it returned before calling every step of its history.
+ * There's no call to show, only the step the history has there.
+ */
+export function returnedEarly(history: HistoryView, progress: ReplayProgress): ReplayPause | undefined {
+  const next = progress.next;
+  if (!next) return undefined;
+  const step = history.steps[next.position]!;
+  const recorded = JSON.stringify(convexToJson({ args: step.args, kind: step.kind, name: step.name } as Value));
+  return new ReplayPause(
+    'mismatch',
+    `Journal entry mismatch at step ${next.position}: the code returned before it, the history has ${recorded}`,
+    next.position,
+  );
+}
+
+/**
+ * What `threwEarly` knows about the handler run: whether the args validated,
+ * whether the run has journal entries, which migrations edited its history in
+ * this handler run, and whether only an unreplayed recorded step counts (for
+ * a history whose run is known to have failed).
+ */
+export type ThrowContext = { validated: boolean; hasHistory: boolean; editedNow: readonly string[]; recordedOnly?: boolean };
+
+/**
+ * Whether a handler that threw should pause the run instead of failing it,
+ * by the rules in the README's "Pausing and recovery", in their order. Args
+ * that don't validate pause a run that has history, and fail a new one.
+ * Otherwise, the run:
+ *
+ * 1. fails if the handler run started a step past the history, since that
+ *    step's writes commit;
+ * 2. pauses if a recorded step is left that the handler hasn't replayed;
+ * 3. pauses if the last step it got is a stand-in, or has a result a
+ *    migration changed;
+ * 4. fails if the newest recorded steps (the journal entries started in the
+ *    last handler run that started steps) include one still in the history
+ *    that failed or was canceled and that no migration rewrote: the handler
+ *    is passing that failure on;
+ * 5. pauses if migrations edited its history in this handler run;
+ * 6. fails otherwise.
+ *
+ * With `recordedOnly` (a history whose run is known to have failed), only
+ * rules 1 and 2 apply.
+ */
+export function threwEarly(history: HistoryView, progress: ReplayProgress, error: unknown, context: ThrowContext): ReplayPause | undefined {
+  if (error instanceof ReplayPause) return error;
+  if (!context.validated) {
+    return context.hasHistory ? new ReplayPause('args', `The workflow's args don't match its args validator: ${message(error)}`) : undefined;
+  }
+  if (progress.started) return undefined;
+  const next = progress.next?.position ?? history.length;
+  if (history.recordedFrom(next)) {
+    return new ReplayPause('threw', `The handler threw before step ${next} of its history: ${message(error)}`, next);
+  }
+  if (context.recordedOnly) return undefined;
+  if (next > 0 && history.fromMigration(next - 1)) {
+    return new ReplayPause(
+      'threw',
+      `The handler threw after step ${next - 1} of its history, which a migration inserted or changed: ${message(error)}`,
+      next - 1,
+    );
+  }
+  if (history.endsInFailure()) return undefined;
+  if (context.editedNow.length > 0) {
+    const ids = context.editedNow.map((id) => `"${id}"`).join(', ');
+    return new ReplayPause('threw', `The handler threw after migrations ${ids} changed its history: ${message(error)}`);
+  }
+  return undefined;
+}
 
 /**
  * Runs the handler against `replay.history`, racing it against the executor

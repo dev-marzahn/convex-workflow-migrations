@@ -3,9 +3,10 @@ import { anyApi } from 'convex/server';
 import { expect, test } from 'vite-plus/test';
 
 import { DETAIL_LIMIT } from '../src/component/schema.ts';
-import { HistoryView, type OverlayOp, type RecordedStep, ReplayMismatch, ReplayPause, returnedEarly, threwEarly } from '../src/history.ts';
+import { HistoryView, type OverlayOp, type RecordedStep, ReplayMismatch, ReplayPause } from '../src/history.ts';
 import { migration, OVERLAY_LIMIT, prepareHistory, recordedStep } from '../src/migrations.ts';
 import { redactHistory } from '../src/redact.ts';
+import { returnedEarly, threwEarly } from '../src/replay.ts';
 import type { JournalEntry } from '../src/vendor/workflow/types.ts';
 
 const fn = anyApi.flows!;
@@ -252,20 +253,16 @@ test('lastPosition finds the last step by name or reference', () => {
   expect(h.lastPosition('missing')).toBe(-1);
 });
 
-test('migrateAs counts each migration’s edits, and size attributes the overlay to them', () => {
+test('migrateAs counts the edits a migration makes, and size is the stored overlay’s', () => {
   const h = new HistoryView(journal());
-  expect(h.migrateAs('small', () => h.insertAfter(fn.grab, fn.notify, { result: null }))).toBe(1);
-  expect(h.migrateAs('none', () => h.remove(fn.missing))).toBe(0);
-  expect(h.migrateAs('big', () => h.updateArgs(fn.importFiles, () => ({ blob: 'x'.repeat(1000) })))).toBe(1);
-  expect([...h.editsBy()]).toEqual([
-    ['small', 1],
-    ['none', 0],
-    ['big', 1],
-  ]);
-  const { bytes, largest } = h.size();
-  expect(largest?.id).toBe('big');
-  expect(largest!.bytes).toBeGreaterThan(1000);
-  expect(bytes).toBeGreaterThan(largest!.bytes);
+  expect(h.size()).toBe(0);
+  expect(h.migrateAs(() => h.insertAfter(fn.grab, fn.notify, { result: null }))).toBe(1);
+  expect(h.migrateAs(() => h.remove(fn.missing))).toBe(0);
+  const small = h.size();
+  expect(h.migrateAs(() => h.updateArgs(fn.importFiles, () => ({ blob: 'x'.repeat(1000) })))).toBe(1);
+  expect(h.size() - small).toBeGreaterThan(1000);
+  // A restart's cut is no migration's edit.
+  expect(h.migrateAs(() => h.truncate(1))).toBe(0);
 });
 
 test('a mismatch on a stand-in inserted as a function and called as a workflow says so', () => {
@@ -364,19 +361,25 @@ test('prepareHistory refuses a record from a newer format, and an overlay over t
 
   const huge = migration('huge', (h) => h.insertAfter(fn.grab, fn.notify, { result: 'x'.repeat(OVERLAY_LIMIT) }));
   const small = migration('small', (h) => h.insertAfter(fn.grab, fn.log, { result: null }));
-  const prepared = prepareHistory(journal(), stored, [small, huge], {});
+  const none = migration('none', (h) => h.remove(fn.missing));
+  const prepared = prepareHistory(journal(), stored, [small, none, huge], {});
   expect(prepared.blocked).toMatchObject({ reason: 'overlay' });
-  expect(prepared.blocked?.detail).toContain('Migration "huge" added the most');
-  expect(prepareHistory(journal(), stored, [small], {}).ran).toEqual([{ id: 'small', edits: 1 }]);
+  expect(prepared.blocked?.detail).toMatch(
+    /^The run's overlay would be \d+ KiB, over the 512 KiB limit\. This handler run added to it: migration "small", migration "huge"\.$/,
+  );
+  expect(prepareHistory(journal(), stored, [small, none], {}).ran).toEqual([
+    { id: 'small', edits: 1 },
+    { id: 'none', edits: 0 },
+  ]);
 
   // An overlay that was just under the limit, and a restart's truncate that takes it over.
   const empty = new HistoryView(journal());
   empty.insertAfter(fn.grab, fn.notify, { result: '' });
   const full = new HistoryView(journal());
-  full.insertAfter(fn.grab, fn.notify, { result: 'x'.repeat(OVERLAY_LIMIT - empty.size().bytes - 10) });
-  expect(full.size().bytes).toBeLessThan(OVERLAY_LIMIT);
+  full.insertAfter(fn.grab, fn.notify, { result: 'x'.repeat(OVERLAY_LIMIT - empty.size() - 10) });
+  expect(full.size()).toBeLessThan(OVERLAY_LIMIT);
   const restarted = prepareHistory(journal(), { applied: [], overlay: full.overlay(), restartFrom: 2 }, [], {});
-  expect(restarted.blocked?.detail).toMatch(/ KiB limit\. The restart added the most, 1 KiB\. Most of it was stored before, \d+ KiB\.$/);
+  expect(restarted.blocked?.detail).toMatch(/ KiB limit\. This handler run added to it: the restart\.$/);
 });
 
 test("prepareHistory's restartFrom checks the position still means what the pause saw", () => {

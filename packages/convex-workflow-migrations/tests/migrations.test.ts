@@ -425,7 +425,7 @@ test('an overlay over the size limit pauses the run, naming the migration, and s
   await downloadDone(t, id);
   const run = await paused(t, id);
   expect(run).toMatchObject({ reason: 'overlay' });
-  expect(run?.detail).toMatch(/^The run's overlay would be \d+ KiB, over the 512 KiB limit\. Migration "huge-stand-in" added the most, \d+ KiB\.$/);
+  expect(run?.detail).toMatch(/^The run's overlay would be \d+ KiB, over the 512 KiB limit\. This handler run added to it: migration "huge-stand-in"\.$/);
   expect((await record(t, id))?.overlay).toEqual([]);
 });
 

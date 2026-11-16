@@ -6,6 +6,7 @@ import type { Infer, PropertyValidators, Validator } from 'convex/values';
 import { FORMAT, type vPausedPage, type vPausedRun } from './component/schema.ts';
 import { HistoryView, type OverlayOp, type StepRef } from './history.ts';
 import { checkMigrations, type Migration, type MigrationsComponent, type PauseInfo, recordedStep, type WorkflowMigrations } from './migrations.ts';
+import { REPLAY, type ReplayTarget } from './replay.ts';
 import type { InferFromOptionalValidator, JournalEntry, WorkflowHandler, WorkflowMutationResult } from './vendor/workflow/types.ts';
 import { type WorkflowArgs, workflowMutation } from './vendor/workflow/workflowMutation.ts';
 
@@ -134,8 +135,18 @@ export class WorkflowManager extends UpstreamWorkflowManager {
   ): unknown {
     const { migrations, handler, ...definition } = workflow;
     const setup: WorkflowMigrations = { component: this.migrationsComponent, list: checkMigrations(migrations), onPause: this.onPause };
-    const build = (fn: WorkflowHandler<ArgsValidator, ReturnsValidator>) =>
-      workflowMutation(this.component, setup, { ...definition, handler: fn }, this.options?.workpoolOptions);
+    const build = (fn: WorkflowHandler<ArgsValidator, ReturnsValidator>) => {
+      const registered = { ...definition, handler: fn };
+      const mutation = workflowMutation(this.component, setup, registered, this.options?.workpoolOptions);
+      // For expectReplays() and migrate() in /test, which replay a history without Convex.
+      const target: ReplayTarget = {
+        definition: registered,
+        migrations: setup.list,
+        workpoolOptions: { ...this.options?.workpoolOptions, ...definition.workpoolOptions },
+      };
+      Object.defineProperty(mutation, REPLAY, { value: target });
+      return mutation;
+    };
     return handler ? build(handler) : { handler: build };
   }
 
