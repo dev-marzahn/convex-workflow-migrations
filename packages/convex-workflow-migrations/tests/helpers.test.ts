@@ -8,7 +8,7 @@ import { expectReplays, history, migrate } from '../src/helpers.ts';
 import { type EventId, migration, type MigrationsComponent, type WorkflowComponent, type WorkflowCtx, WorkflowManager } from '../src/index.ts';
 
 const components = componentsGeneric() as unknown as { workflow: WorkflowComponent; workflowMigrations: MigrationsComponent };
-const manager = new WorkflowManager(components.workflow, { migrationsComponent: components.workflowMigrations });
+const manager = new WorkflowManager(components.workflow, { migrationsComponent: components.workflowMigrations, onPause: null });
 const flows = anyApi.flows!;
 
 const notifyAfterGrab = migration('notify-after-grab', (h) => h.insertAfter(flows.grab, flows.notify, { result: { at: null } }));
@@ -131,17 +131,30 @@ test('expectReplays reports the history, the position, both calls and the migrat
   expect(message).toContain('migrated history: 0: flows:grab, 1: downloadDone (running)');
 });
 
-test("expectReplays reports a handler that throws while replaying, but not one passing on the last step's failure", async () => {
+test('expectReplays reports a handler that throws while replaying, as the reason the run would pause or fail, but not one passing on a failure it got', async () => {
+  // As at runtime: a recorded step is left that the handler didn't replay (throw rule 2).
   const message = await failure(expectReplays(workflows.badStandIn, [release0Waiting]));
-  // As at runtime, where the run fails without saving the migrations as applied.
-  expect(message).toContain(
-    `(migration): The handler threw replaying the history as migrations "notify-after-grab" leave it: TypeError: Cannot read properties of null (reading 'at')`,
+  expect(message).toContain(`(threw): The handler threw before step 2 of its history: Cannot read properties of null (reading 'at')`);
+  // Nothing a migration did: at runtime the run fails (rule 6), and the history doesn't replay.
+  const throwing = manager.define({
+    args: {},
+    handler: async (step: WorkflowCtx) => {
+      await step.runMutation(flows.grab, {});
+      throw new Error('broken handler');
+    },
+  });
+  expect(await failure(expectReplays(throwing, [history([{ step: flows.grab }])]))).toContain(
+    '(fails): The handler threw replaying the history, which fails the run: Error: broken handler',
   );
-  // No migration applies now: at runtime the run just fails, but the history doesn't replay.
-  const recorded = history([{ step: flows.grab }, { step: flows.notify }, { event: 'downloadDone', status: 'running' }], { applied: ['notify-after-grab'] });
-  expect(await failure(expectReplays(workflows.badStandIn, [recorded]))).toContain('(threw): The handler threw replaying the history: TypeError');
-  // The download failed, and the handler throws that: the run fails, as it did.
+  // The download failed, and the handler throws that: the run fails, as it did (rule 4).
   await expectReplays(workflows.current, [history([{ step: flows.grab }, { event: 'downloadDone', error: 'the download failed' }])]);
+});
+
+test('expectReplays reports code that returns before the end of the history', async () => {
+  const short = manager.define({ args: {}, handler: async (step: WorkflowCtx) => void (await step.runMutation(flows.grab, {})) });
+  expect(await failure(expectReplays(short, [release0Waiting]))).toContain(
+    `(mismatch): Journal entry mismatch at step 1 of the run's history, as its migrations leave it: the code returned before it, the history has {"args":{},"kind":"event","name":"downloadDone"}`,
+  );
 });
 
 test('a migration may edit a running step, which at runtime it never sees', async () => {

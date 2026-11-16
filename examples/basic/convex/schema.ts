@@ -10,4 +10,6 @@ export default defineSchema({
     // The grab's run, set once it starts.
     workflowId: v.optional(vWorkflowId),
   }),
+  // What onPause recorded: a run that paused, and why.
+  alerts: defineTable({ workflowId: v.string(), reason: v.string() }).index('workflowId', ['workflowId']),
 });

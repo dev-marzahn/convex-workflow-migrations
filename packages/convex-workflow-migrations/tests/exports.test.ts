@@ -22,7 +22,8 @@ const LEFT_OUT = {
   cleanup: "leaves the run's record behind; use workflow.cleanup",
 };
 /** What the main entry exports besides upstream's names, and what /replay exports, types included. */
-const ADDED = 'History HistoryStep InsertOptions Migration MigrationsComponent StepArgs StepRef StepResult StepSelector WorkflowManagerOptions migration';
+const ADDED =
+  'History HistoryStep InsertOptions Migration MigrationsComponent PauseInfo PauseReason PausedRun StepArgs StepRef StepResult StepSelector WorkflowManagerOptions migration';
 const REPLAY_NAMES = 'History HistoryOptions HistoryStep RecordedHistory RecordedStep StepSpec expectReplays history migrate';
 
 const UPSTREAM_TYPES = join(import.meta.dirname, '../node_modules/@convex-dev/workflow/dist/client/index.d.ts');

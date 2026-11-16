@@ -107,6 +107,8 @@ type Node = {
   recorded?: RecordedStep;
   /** A stand-in's result, or a recorded step's as `updateResult` changed it. */
   result?: { value: unknown };
+  /** Whether a `rewrite` changed its name, args or result. */
+  rewritten?: boolean;
 };
 
 const REWRITTEN = ['name', 'args', 'result'] as const;
@@ -137,6 +139,8 @@ export class HistoryView implements History {
   private ops: OverlayOp[] = [];
   private args: unknown;
   private nextId = 1;
+  /** How many edits migrations made to this view, after it loaded its overlay. */
+  public edits = 0;
 
   /**
    * The journal with `overlay` applied in order, and `args` as the run
@@ -146,7 +150,7 @@ export class HistoryView implements History {
    * changes it.
    */
   public constructor(
-    journal: readonly RecordedStep[],
+    private readonly journal: readonly RecordedStep[],
     overlay: readonly OverlayOp[] = [],
     args: unknown = {},
     private readonly options: { strict?: boolean } = {},
@@ -157,6 +161,7 @@ export class HistoryView implements History {
       if (op.op === 'insert') this.nextId = Math.max(this.nextId, Number(op.id.slice(1)) + 1 || 0);
       this.apply(clone(op));
     }
+    this.edits = 0;
   }
 
   public get steps(): readonly HistoryStep[] {
@@ -241,6 +246,42 @@ export class HistoryView implements History {
     return this.ops.map(clone);
   }
 
+  // For the throw rules in src/replay.ts (README, "Pausing and recovery").
+
+  /** How many steps the history has. */
+  public get length(): number {
+    return this.nodes.length;
+  }
+
+  /** The id of the step at `position`, or undefined past the end. */
+  public idAt(position: number): string | undefined {
+    return this.nodes[position]?.id;
+  }
+
+  /** Whether the step at `position` or a later one is a journal entry. */
+  public recordedFrom(position: number): boolean {
+    return this.nodes.slice(position).some((node) => node.recorded);
+  }
+
+  /** Whether the step at `position` is a stand-in, or has a result a migration changed. */
+  public fromMigration(position: number): boolean {
+    return this.nodes[position]?.result !== undefined;
+  }
+
+  /**
+   * Whether the newest recorded steps (the journal entries with its latest
+   * start time: those the last handler run that started steps started)
+   * include one still in the history that failed or was canceled, and that no
+   * migration rewrote. Read from the journal, before migrations: if one
+   * removed those steps, the failure that's last now is an older one.
+   */
+  public endsInFailure(): boolean {
+    const newest = Math.max(...this.journal.map((step) => step.startedAt));
+    return this.nodes.some(
+      ({ recorded, rewritten }) => recorded?.startedAt === newest && recorded.runResult !== undefined && recorded.runResult.kind !== 'success' && !rewritten,
+    );
+  }
+
   /**
    * The steps for the executor to replay against. A stand-in sees the time of
    * the step before it; one before every recorded step, the first one's time,
@@ -310,6 +351,7 @@ export class HistoryView implements History {
       } else if (op.op === 'remove') {
         this.nodes.splice(index, 1);
       } else {
+        node.rewritten = true;
         if (op.name !== undefined) node.name = op.name;
         if (op.args !== undefined) [node.args, node.argsKnown] = [op.args, true];
         if (op.result !== undefined) node.result = { value: op.result };
@@ -320,6 +362,7 @@ export class HistoryView implements History {
       }
     }
     this.ops.push(op);
+    this.edits++;
   }
 
   /** A copy of the step, so that changing what a migration reads doesn't change the history. */

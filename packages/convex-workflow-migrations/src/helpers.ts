@@ -92,10 +92,10 @@ class ReplayOnly extends StepExecutor {
 
 /**
  * Replays the migrated history, and returns why it doesn't replay, if it
- * doesn't. It starts no step: replay stops where the history ends, or at a
- * running step. A handler that throws fails it, unless the history's last
- * step failed or was canceled: as `migration` if migrations applied in this
- * handler run, as at runtime, otherwise as `threw`.
+ * doesn't: why the run would pause, by the same rules as at runtime, or that
+ * the handler throws and the run would fail, unless it's passing on a failure
+ * among the newest recorded steps (throw rule 4). It starts no step: replay
+ * stops where the history ends, or at a running step.
  */
 async function replayHistory(replay: ReplayTarget, recorded: RecordedHistory, prepared: Prepared): Promise<string | undefined> {
   const workflowId = (recorded.workflowId ?? 'history') as WorkflowId;
@@ -108,11 +108,11 @@ async function replayHistory(replay: ReplayTarget, recorded: RecordedHistory, pr
   try {
     const options = { step: createWorkflowCtx(workflowId, channel), console: { error: () => {} } };
     const result = await replayHandler(replay.definition, prepared, executor, options);
-    if (result.type === 'handlerDone' && result.runResult.kind === 'failed' && prepared.history.steps.at(-1)?.error === undefined) {
-      return `(threw): The handler threw replaying the history: ${result.runResult.error.split('\n')[0]}`;
+    if (result instanceof ReplayError) return `(${result.reason}): ${result.message}`;
+    if (result.type === 'handlerDone' && result.runResult.kind === 'failed' && !prepared.history.endsInFailure()) {
+      return `(fails): The handler threw replaying the history, which fails the run: ${result.runResult.error.split('\n')[0]}`;
     }
   } catch (error) {
-    if (error instanceof ReplayError) return `(${error.reason}): ${error.message}`;
     if (!(error instanceof Frontier)) throw error;
   } finally {
     restoreEnvironment();
