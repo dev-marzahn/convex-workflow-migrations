@@ -216,7 +216,7 @@ To run the current code from scratch with convex-test, `@dev-marzahn/convex-work
 
 ## Exporting histories
 
-The package's `histories` CLI exports a workflow's runs from a deployment as JSON `RecordedHistory[]`, for `expectReplays`: every running run, paused ones included, and the newest that succeeded. Run it from your app's directory: it runs your app's `convex` CLI, which picks the deployment as usual (`.env.local`, `CONVEX_DEPLOY_KEY`, `CONVEX_SELF_HOSTED_*`). Options after `--` go to every `convex` command it runs, so pass only ones that select the deployment: `--prod`, `--deployment-name`, `--env-file`, or `--url` with `--admin-key`.
+The package's `histories` CLI exports a workflow's runs from a deployment as JSON `RecordedHistory[]`, for `expectReplays`: every running run, paused ones included, and the newest that succeeded. Run it from your app's directory: it runs your app's `convex` CLI, which picks the deployment as usual (`.env.local`, `CONVEX_DEPLOY_KEY`, `CONVEX_SELF_HOSTED_*`). Options after `--` go to every `convex` command it runs, `convex run` and `convex data`, so pass only ones that select the deployment: `--prod`, `--deployment`, `--deployment-name`, `--preview-name`, `--env-file`, or `--url` with `--admin-key`.
 
 ```sh
 npx convex-workflow-migrations histories pipeline:run --out convex/histories/pipeline.json -- --prod

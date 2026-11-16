@@ -100,8 +100,9 @@ expectReplays() from @dev-marzahn/convex-workflow-migrations/replay.
 internal.pipeline.run). Run it from your app's directory: it runs the app's
 \`convex\` CLI, so the usual environment (.env.local, CONVEX_DEPLOY_KEY,
 CONVEX_SELF_HOSTED_*) picks the deployment. Options after -- go to every
-\`convex\` command it runs: pass only ones that select the deployment
-(--prod, --deployment-name, --env-file, --url with --admin-key).
+\`convex\` command it runs, \`convex run\` and \`convex data\`: pass only ones
+that select the deployment (--prod, --deployment, --deployment-name,
+--preview-name, --env-file, --url with --admin-key).
 
   --recent <n>        Succeeded runs to export too, the newest by creation
                       time. Failed and canceled runs never replay, so it
