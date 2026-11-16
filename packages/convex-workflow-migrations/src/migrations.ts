@@ -175,7 +175,8 @@ export function prepareHistory(
       } catch (error) {
         return blocked(new ReplayPause('migration', message(error)));
       }
-    } else if (!history.deleted(stored.restart)) {
+    } else if (!history.deleted(stored.restart) && stored.restartFrom === undefined) {
+      // restartFrom, which cuts the history itself, is how a run paused here recovers: it takes precedence.
       const detail = `Can't restart from step ${stored.restart}: a migration removed it. Use restartFrom with a position in the history.`;
       return blocked(new ReplayPause('migration', detail));
     }

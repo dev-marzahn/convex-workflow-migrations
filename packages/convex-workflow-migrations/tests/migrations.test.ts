@@ -143,6 +143,8 @@ const releases = {
   channel: withChannel([channelArg]),
   importing: importing(false),
   validating: importing(true),
+  // Release 1's stand-in, which a later release removes.
+  notifyRemoved: release({}, [m1, migration('notify-removed', (h) => h.remove(flows.notify))]),
   // Code that stops after grab: shorter than the histories of runs past it.
   short: manager.define({
     args: {},
@@ -1134,6 +1136,33 @@ test('restart keeps the stand-ins before its step anchored to an entry it delete
     ['flows:validate', 'after', downloadDoneId],
     ['flows:scan', 'after', downloadDoneId],
   ]);
+});
+
+test('a run paused because a migration removed the step restart stored recovers with restartFrom, which clears it', async () => {
+  const t = setup();
+  const id = await start(t);
+  deploy('r1');
+  await downloadDone(t, id); // grab, notify (a stand-in), downloadDone, importFiles, prepare, publish
+  expect(await status(t, id)).toEqual(completed);
+  await t.run((ctx) => manager.restart(ctx, id, { from: 1, startAsync: true })); // the stand-in, which stays: upstream deletes from the wait on
+  expect((await record(t, id))?.restart).toBe('+1');
+  // A release that removes the stand-in lands before the restarted run's first handler run.
+  deploy('notifyRemoved');
+  await settle(t);
+  expect(await paused(t, id)).toMatchObject({
+    reason: 'migration',
+    detail: "Can't restart from step +1: a migration removed it. Use restartFrom with a position in the history.",
+  });
+
+  ran.length = 0;
+  await t.run((ctx) => manager.restartFrom(ctx, id, 0));
+  await settle(t);
+  expect(await paused(t, id)).toBeUndefined();
+  expect((await record(t, id))?.restart).toBeUndefined();
+  expect(ran).toEqual(['grab']);
+  await downloadDone(t, id);
+  expect(await status(t, id)).toEqual(completed);
+  expect(ran).toEqual(['grab', 'import', 'prepare', 'publish']);
 });
 
 test('restart throws for a running run, and points a paused one to restartFrom', async () => {
