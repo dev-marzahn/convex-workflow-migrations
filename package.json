@@ -13,7 +13,8 @@
     "build": "vp run -r build",
     "test": "vp run -r test",
     "e2e": "node e2e/run.ts",
-    "codegen": "node scripts/codegen.ts"
+    "codegen": "node scripts/codegen.ts",
+    "vendor": "node scripts/vendor.ts"
   },
   "devDependencies": {
     "@types/node": "catalog:",

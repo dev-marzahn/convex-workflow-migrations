@@ -18,9 +18,11 @@ The main changes are marked `PATCHES:`; [`upstream.diff`](upstream.diff) is the 
 
 ## Updating to a new upstream release
 
-1. Bump the exact `@convex-dev/workflow` version in the root catalog and the peer dependency, then `bun install`.
-2. Copy the new release's sources from the installed package, the directory `packages/convex-workflow-migrations/node_modules/@convex-dev/workflow` (a link into `node_modules/.bun/`, which is where `tests/vendor.test.ts` resolves it from): `src/client/{workflowMutation,step,workflowContext,environment,safeFunctionName,types}.ts`, `src/component/logging.ts`, `src/shared.ts` and `src/types.ts`. Put them in a temporary directory, and keep it. The copy is flat, under the names they have here: `src/component/logging.ts` as `logging.ts`, `src/shared.ts` as `shared.ts`, `src/types.ts` as `publicTypes.ts`, and each `src/client/` file under its own name.
-3. Copy them over these files too, then apply the changes: from this directory, `patch -p1 < upstream.diff`. Fix conflicts.
-4. Update the version and commit in this file, and the `vendored from @convex-dev/workflow <version>` header comments. Find the commit with `npm view @convex-dev/workflow@<version> gitHead`. The README and CHANGELOG edits are in CONTRIBUTING.md's "Updating @convex-dev/workflow".
-5. Regenerate the diff against the temporary directory, after step 4, since the header comments are part of it: for each file, `diff -u --label upstream/<file> --label vendor/<file> <temporary copy> <file>`, concatenated in alphabetical order of the file names (`step`, `types`, `workflowContext`, `workflowMutation`). Unchanged files produce no hunk.
-6. `bun run ready` and `bun run e2e`. `packages/convex-workflow-migrations/tests/vendor.test.ts` checks that these files are the installed release plus `upstream.diff`; its file list matches the table above. A type error usually means the component API changed shape.
+[`scripts/vendor.ts`](../../../../../scripts/vendor.ts) does the copying and diffing. Its `FILES` map, which `tests/vendor.test.ts` uses too, lists each vendored file and its source in the upstream package. CONTRIBUTING.md's "Updating @convex-dev/workflow" has the version bump and the README and CHANGELOG edits around these steps.
+
+1. With the new version installed, run `bun run vendor` from the repo root. It copies the installed release's sources over these files, re-applies `upstream.diff`, sets the version in the `vendored from @convex-dev/workflow <version>` header comments, and regenerates the diff.
+2. If a hunk doesn't apply, the script says so and leaves a `<file>.rej` next to the file it belongs to, with the vendored file as far as the patch got. Make the change by hand, delete the `.rej` file, then run `bun run vendor diff`, which regenerates the diff from the files as they are. It refuses while a `.rej` or `.orig` file is left.
+3. If a vendored file imports a file upstream added, add it to `FILES` and to the table above, and run `bun run vendor` again.
+4. After changing a vendored file for this package, run `bun run vendor diff` too: the diff is the record of every change.
+5. Update the version and commit at the top of this file. Find the commit with `npm view @convex-dev/workflow@<version> gitHead`.
+6. `bun run ready` and `bun run e2e`. `tests/vendor.test.ts` checks that these files are the installed release plus `upstream.diff`, and that the diff is what `bun run vendor diff` writes. A type error usually means the component API changed shape.
