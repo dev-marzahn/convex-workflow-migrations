@@ -115,14 +115,10 @@ class ReplayOnly extends StepExecutor {
  * doesn't: why the run would pause, by the same rules as at runtime, or that
  * the run would fail, because the handler throws, unless it's passing on a
  * failure among the newest recorded steps (throw rule 4), or because its
- * return value fails its `returns` validator. For a run whose `outcome` is
- * `success`, a handler that throws fails; for one that failed or was
- * canceled, only a throw before its last recorded step does, since it ended
- * after it. It starts no step: replay stops where the history ends, or at a
- * running step.
+ * return value fails its `returns` validator. It starts no step: replay stops
+ * where the history ends, or at a running step.
  */
 async function replayHistory(replay: ReplayTarget, recorded: RecordedHistory, prepared: Prepared): Promise<string | undefined> {
-  const ended = recorded.outcome === 'failed' || recorded.outcome === 'canceled';
   const workflowId = (recorded.workflowId ?? 'history') as WorkflowId;
   const channel = new BaseChannel<StepRequest>(replay.workpoolOptions?.maxParallelism ?? 10);
   const now = Math.max(0, ...recorded.steps.map((s) => s.startedAt));
@@ -132,12 +128,11 @@ async function replayHistory(replay: ReplayTarget, recorded: RecordedHistory, pr
   const restoreEnvironment = setupEnvironment(executor.getGenerationState.bind(executor), workflowId);
   try {
     const options = { step: createWorkflowCtx(workflowId, channel), console: { error: () => {} } };
-    const result = await replayHandler(replay.definition, { ...prepared, recordedOnly: ended }, executor, options);
+    const result = await replayHandler(replay.definition, prepared, executor, options);
     if (result instanceof ReplayError) return `(${result.reason}): ${result.message}`;
-    if (result.type === 'handlerDone' && result.runResult.kind === 'failed' && !ended) {
+    if (result.type === 'handlerDone' && result.runResult.kind === 'failed') {
       const error = result.runResult.error.split('\n')[0];
       if (result.invalidReturn) return `(returns): The handler's return value doesn't match its returns validator, which fails the run: ${error}`;
-      if (recorded.outcome === 'success') return `(fails): The run succeeded, but the handler now fails replaying its history: ${error}`;
       if (!prepared.history.endsInFailure()) return `(fails): The handler threw replaying the history, which fails the run (${RULE[6]}): ${error}`;
     }
   } catch (error) {
@@ -164,9 +159,8 @@ function incomplete(recorded: RecordedHistory): string | undefined {
  * history. An `updateResult` or `updateWorkflowArgs` that changes its own
  * output when run on it again fails too, and so does a handler that throws,
  * unless it's passing on a failure (throw rule 4; README, "Testing"), or
- * returns a value its `returns` validator rejects; a finished run's
- * `outcome` adjusts that. A `truncated` or `unstable` history fails, and so
- * does an empty list.
+ * returns a value its `returns` validator rejects. A `truncated` or
+ * `unstable` history fails, and so does an empty list.
  */
 export async function expectReplays(workflow: Workflow, histories: readonly RecordedHistory[]): Promise<void> {
   const replay = target(workflow, 'expectReplays');

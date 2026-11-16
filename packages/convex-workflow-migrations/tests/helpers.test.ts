@@ -234,31 +234,7 @@ test('migrate returns the history after the migrations', () => {
   expect(() => migrate(workflows.unguarded, { ...release0Done, applied: ['gone'] })).toThrow('The run has migrations "gone" applied');
 });
 
-test('an exported history: its outcome decides which throws fail, and a truncated or unstable one fails', async () => {
-  const givesUp = manager.define({
-    args: {},
-    migrations: [notifyAfterGrab],
-    handler: async (step: WorkflowCtx) => {
-      await step.runMutation(flows.grab, {});
-      await step.runMutation(flows.notify, {});
-      await step.awaitEvent({ name: 'downloadDone' });
-      throw new Error('gave up');
-    },
-  });
-  const waited = history([{ step: flows.grab }, { event: 'downloadDone' }]);
-  // A run still going would pause: migrations edited its history in this handler run (rule 5).
-  expect(await failure(expectReplays(givesUp, [waited]))).toContain('(threw): The handler threw after migrations "notify-after-grab"');
-  // One that failed or was canceled after its last step: that throw is how it ended.
-  for (const outcome of ['failed', 'canceled'] as const) await expectReplays(givesUp, [{ ...waited, outcome }]);
-  // A throw before its last recorded step still fails (rule 2).
-  expect(await failure(expectReplays(workflows.badStandIn, [{ ...waited, outcome: 'failed' }]))).toContain('(threw): The handler threw before step 2');
-  // One that succeeded fails when the handler now passes on a failure (rule 4), which replays otherwise.
-  const failedDownload = history([{ step: flows.grab }, { event: 'downloadDone', error: 'the download failed' }]);
-  await expectReplays(workflows.current, [failedDownload]);
-  expect(await failure(expectReplays(workflows.current, [{ ...failedDownload, outcome: 'success' }]))).toContain(
-    '(fails): The run succeeded, but the handler now fails replaying its history: Error: the download failed',
-  );
-  // An export cut short, or read while its record changed, can't be checked.
+test('an exported history cut short, or read while its record changed, fails: it cannot be checked', async () => {
   expect(await failure(expectReplays(workflows.current, [{ ...release0Waiting, truncated: true }]))).toContain('(truncated): The export stopped at 2 steps');
   expect(await failure(expectReplays(workflows.current, [{ ...release0Waiting, unstable: true }]))).toContain("(unstable): The run's record changed");
   expect(() => migrate(workflows.current, { ...release0Waiting, truncated: true })).toThrow('(truncated)');

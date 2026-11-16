@@ -13,29 +13,31 @@ import type { JournalEntry, RunResult } from './vendor/workflow/types.ts';
 /** Runs the app's `convex` CLI with `args`: whether it exited with 0, its stdout, and stdout and stderr for an error. */
 export type Convex = (args: string[]) => { ok: boolean; stdout: string; output: string };
 /** Runs a query of a component and returns its result. */
-export type Query = <T>(component: string, path: string, args: object) => T;
+type Query = <T>(component: string, path: string, args: object) => T;
 /** Where the components are mounted; `migrations` is left out when this package's component isn't deployed. */
-export type Components = { workflow: string; migrations?: string };
+type Components = { workflow: string; migrations?: string };
 
 type Page<T> = { page: T[]; isDone: boolean; continueCursor: string };
 type RunRecord = { applied: string[]; overlay: OverlayOp[] } | null;
-type Journal = { workflow: { _creationTime: number; args: unknown; runResult?: RunResult }; journalEntries: JournalEntry[]; ok: boolean };
+type Journal = { workflow: { args: unknown }; journalEntries: JournalEntry[]; ok: boolean };
 
 /** How many times `runHistory` reads a run whose record keeps changing before it marks the history `unstable`. */
 export const READS = 3;
 
 /** The runs to export, newest first, and how many runs the scan read. `stopped`: it read `maxScan` and there were more; `oldest` is the last it read. */
-export type Collected = { workflowIds: string[]; scanned: number; stopped: boolean; oldest?: string };
+type Collected = { workflowIds: string[]; scanned: number; stopped: boolean; oldest?: string };
 
 /**
  * The runs of workflow `name` to export: every running one, and the newest
- * `recent` finished ones. Upstream has no index by status, so it pages
- * through the workflow's runs newest first, reading at most `maxScan`.
- * Exactly `maxScan` runs isn't more: it asks for one more to tell.
+ * `recent` that succeeded. A run that failed or was canceled never replays
+ * again, and its history may not replay on the current handler. Upstream has
+ * no index by status, so it pages through the workflow's runs newest first,
+ * reading at most `maxScan`. Exactly `maxScan` runs isn't more: it asks for
+ * one more to tell.
  */
-export function collectRuns(query: Query, component: string, name: string, { recent, maxScan }: { recent: number; maxScan: number }): Collected {
+function collectRuns(query: Query, component: string, name: string, { recent, maxScan }: { recent: number; maxScan: number }): Collected {
   const workflowIds: string[] = [];
-  let [scanned, finished, oldest] = [0, 0, undefined as string | undefined];
+  let [scanned, succeeded, oldest] = [0, 0, undefined as string | undefined];
   for (let cursor: string | null = null; ;) {
     const paginationOpts = { numItems: Math.min(100, maxScan + 1 - scanned), cursor };
     const page: Page<{ workflowId: string; runResult?: RunResult }> = query(component, 'workflow:listByName', { name, order: 'desc', paginationOpts });
@@ -43,7 +45,7 @@ export function collectRuns(query: Query, component: string, name: string, { rec
       if (scanned === maxScan) return { workflowIds, scanned, stopped: true, ...(oldest ? { oldest } : {}) };
       [scanned, oldest] = [scanned + 1, run.workflowId];
       if (run.runResult === undefined) workflowIds.push(run.workflowId);
-      else if (finished++ < recent) workflowIds.push(run.workflowId);
+      else if (run.runResult.kind === 'success' && succeeded++ < recent) workflowIds.push(run.workflowId);
     }
     if (page.isDone) return { workflowIds, scanned, stopped: false, ...(oldest ? { oldest } : {}) };
     cursor = page.continueCursor;
@@ -57,14 +59,13 @@ const sameRecord = (a: RunRecord, b: RunRecord) => JSON.stringify(a && [a.applie
 
 /**
  * A run's history: its first `maxSteps` journal entries, read raw with
- * upstream's `journal.load`, marked `truncated` if there are more, its
- * outcome if it finished, and its record's `applied` and `overlay` if it has
- * one. The record is read before and after the journal, up to `READS` times
+ * upstream's `journal.load`, marked `truncated` if there are more, and its
+ * record's `applied` and `overlay` if it has one. The record is read before and after the journal, up to `READS` times
  * until the two reads agree; if they never do, the history is `unstable`.
  * `gone` if the run is gone, and `tooBig` if its journal is too big to load
  * (over 8 MiB), which upstream fails at the run's next handler run.
  */
-export function runHistory(query: Query, components: Components, name: string, workflowId: string, maxSteps: number): RecordedHistory | 'gone' | 'tooBig' {
+function runHistory(query: Query, components: Components, workflowId: string, maxSteps: number): RecordedHistory | 'gone' | 'tooBig' {
   const load = (): RunRecord => (components.migrations === undefined ? null : query(components.migrations, 'runs:load', { workflowId }));
   let [record, stable, journal] = [load(), false, undefined as Journal | undefined];
   for (let read = 0; read < READS && !stable; read++) {
@@ -81,11 +82,9 @@ export function runHistory(query: Query, components: Components, name: string, w
   const { workflow, journalEntries } = journal!;
   return {
     workflowId,
-    workflow: name,
     args: workflow.args,
     steps: journalEntries.slice(0, maxSteps).map(recordedStep),
     ...(record ? { applied: record.applied, overlay: record.overlay } : {}),
-    ...(workflow.runResult ? { outcome: workflow.runResult.kind } : {}),
     ...(journalEntries.length > maxSteps ? { truncated: true } : {}),
     ...(stable ? {} : { unstable: true }),
   };
@@ -94,13 +93,15 @@ export function runHistory(query: Query, components: Components, name: string, w
 const USAGE = `Usage: convex-workflow-migrations histories <workflow> [options] [-- <convex options>]
 
 Exports the histories of a workflow's running runs, and of its newest
-finished ones, as JSON RecordedHistory[]: the input for expectReplays() from
+succeeded ones, as JSON RecordedHistory[]: the input for expectReplays() from
 @dev-marzahn/convex-workflow-migrations/replay. <workflow> is the workflow's
 function name, like pipeline:run. Run it from your app's directory: it runs
 the app's \`convex run\`, so options after -- (like --prod) and the usual
 environment (CONVEX_DEPLOY_KEY, CONVEX_SELF_HOSTED_*) pick the deployment.
 
-  --recent <n>        Finished runs to export too, the newest. Default: 10
+  --recent <n>        Succeeded runs to export too, the newest. Failed and
+                      canceled runs never replay, so it leaves them out.
+                      Default: 10
   --max-scan <n>      Runs to read, newest first, finished ones included, at
                       least 1. If there are more, running runs older than
                       those may be missing: it exports nothing and exits
@@ -224,7 +225,7 @@ function histories(argv: string[], io: Io): number {
   }
   const [exported, tooBig] = [[] as RecordedHistory[], [] as string[]];
   for (const workflowId of collected.workflowIds) {
-    const history = runHistory(query, components, name, workflowId, maxSteps);
+    const history = runHistory(query, components, workflowId, maxSteps);
     if (history === 'tooBig') tooBig.push(workflowId);
     else if (history !== 'gone') exported.push({ ...history, encoding: 'json' });
   }

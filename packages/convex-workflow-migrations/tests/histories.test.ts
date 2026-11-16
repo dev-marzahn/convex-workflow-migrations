@@ -41,7 +41,7 @@ function deployment(runs: Run[], { component = true } = {}) {
       // Older upstream versions wrote entries without a kind.
       step: { name: `step${i}`, ...(i === 0 ? {} : { kind: 'function' }), args: {}, inProgress: false, runResult: done, startedAt: i },
     }));
-    return reply({ workflow: { _creationTime: runs.indexOf(run), args: { n: run.workflowId }, runResult: run.runResult }, journalEntries, ok: run.ok ?? true });
+    return reply({ workflow: { args: { n: run.workflowId } }, journalEntries, ok: run.ok ?? true });
   };
   return { convex, calls };
 }
@@ -54,20 +54,15 @@ function cli(argv: string[], { convex }: { convex: Convex }) {
 }
 const ids = (histories?: RecordedHistory[]) => histories?.map((h) => h.workflowId);
 
-test('it pages through the runs newest first, and exports every running one and the newest --recent finished ones', () => {
-  const runs: Run[] = Array.from({ length: 250 }, (_, i) => ({ workflowId: `r${i}`, ...(i % 50 === 0 ? {} : { runResult: done }) }));
+test('it pages through the runs newest first, and exports every running one and the newest --recent that succeeded', () => {
+  const ended: Record<number, RunResult> = { 249: { kind: 'failed', error: 'gave up' }, 247: { kind: 'canceled' } };
+  const runs: Run[] = Array.from({ length: 250 }, (_, i) => ({ workflowId: `r${i}`, ...(i % 50 === 0 ? {} : { runResult: ended[i] ?? done }) }));
   const d = deployment(runs);
   const { code, histories, stderr } = cli(['histories', 'p:run', '--recent', '2', '--', '--prod'], d);
   expect(code).toBe(0);
-  expect(ids(histories)).toEqual(['r249', 'r248', 'r200', 'r150', 'r100', 'r50', 'r0']);
-  expect(histories![0]).toMatchObject({
-    workflow: 'p:run',
-    args: { n: 'r249' },
-    outcome: 'success',
-    steps: [{ id: 'r249.0', kind: 'function' }],
-    encoding: 'json',
-  });
-  expect(histories![2]!.outcome).toBeUndefined();
+  // r249 failed and r247 was canceled: they never replay again.
+  expect(ids(histories)).toEqual(['r248', 'r246', 'r200', 'r150', 'r100', 'r50', 'r0']);
+  expect(histories![0]).toMatchObject({ args: { n: 'r248' }, steps: [{ id: 'r248.0', kind: 'function' }], encoding: 'json' });
   // Three pages of at most 100, and the convex options on every call.
   expect(d.calls.filter((c) => c.path === 'workflow:listByName').map((c) => c.numItems)).toEqual([100, 100, 100]);
   expect(d.calls.every((c) => c.extra.join(' ') === '--prod')).toBe(true);
@@ -198,7 +193,6 @@ test('without the migrations component it exits 2, unless --before-adoption: the
   expect(histories).toEqual([
     {
       workflowId: 'old',
-      workflow: 'p:run',
       args: { n: 'old' },
       steps: [{ id: 'old.0', name: 'step0', kind: 'function', args: {}, runResult: done, startedAt: 0 }],
       encoding: 'json',

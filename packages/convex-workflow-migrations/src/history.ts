@@ -23,14 +23,10 @@ export type RecordedStep = { id: string; name: string; kind: StepKind; args: unk
  */
 export type RecordedHistory = {
   workflowId?: string;
-  /** The workflow's function name. */
-  workflow?: string;
   args?: unknown;
   steps: RecordedStep[];
   applied?: string[];
   overlay?: OverlayOp[];
-  /** How the run ended, if it has. */
-  outcome?: RunResult['kind'];
   /** The export stopped at its step limit: the run has more steps than these. */
   truncated?: boolean;
   /** The run's record changed every time the export read its journal, so the two may not match. */
