@@ -1,7 +1,7 @@
 // End-to-end tests on a real self-hosted backend: a fixture app starts a run
 // that waits on `awaitEvent`, a later release (another fixture, or
 // examples/basic) is deployed over it, and the run finishes on the new code,
-// or fails.
+// pauses, or fails.
 //
 //   bun run e2e                 all scenarios
 //   bun run e2e skip            only these
@@ -47,6 +47,7 @@ function call<T>(app: string, backend: Backend, fn: string, args: Record<string,
 
 type Ids = { grabId: string; workflowId: string };
 type Grab = { log: string[]; status: string; error?: string };
+type Pauses = { paused: { reason: string; attempts: number } | null; alerts: string[] };
 
 async function until<T>(read: () => T, done: (value: T) => boolean, what: string, timeoutMs = 60_000): Promise<T> {
   const deadline = Date.now() + timeoutMs;
@@ -58,13 +59,23 @@ async function until<T>(read: () => T, done: (value: T) => boolean, what: string
   }
 }
 const grab = (app: string, backend: Backend, { grabId }: Ids) => call<Grab>(app, backend, 'pipeline:status', { grabId });
+/** Whether the run is paused, and the reasons `onPause` recorded for it. */
+const pauses = (app: string, backend: Backend, { workflowId }: Ids) => call<Pauses>(app, backend, 'pipeline:pauses', { workflowId });
+/** Waits for the run to pause, or to finish, and returns its pause and its grab. */
+const pausedRun = (app: string, backend: Backend, ids: Ids) =>
+  until(
+    () => ({ ...pauses(app, backend, ids), run: grab(app, backend, ids) }),
+    (p) => p.paused !== null || p.run.status !== 'inProgress',
+    'the run to pause',
+  );
 const record = (app: string, backend: Backend, { workflowId }: Ids) =>
   call<{ applied: string[]; overlay: unknown[] } | null>(app, backend, 'runs:load', { workflowId }, 'workflowMigrations');
-const finished = (app: string, backend: Backend, ids: Ids, what: string) =>
+const finished = (app: string, backend: Backend, ids: Ids, what: string, timeoutMs?: number) =>
   until(
     () => grab(app, backend, ids),
     (g) => g.status !== 'inProgress',
     what,
+    timeoutMs,
   );
 
 function expectEqual(actual: unknown, expected: unknown, what: string): void {
@@ -116,21 +127,77 @@ const scenarios: Record<string, (backend: Backend) => Promise<void>> = {
 
   /**
    * Release 2's change without its migrations: the run release 0 left
-   * waiting fails at its next handler run, with the mismatch, as it would
-   * without this package.
+   * waiting pauses at its next handler run instead of failing, and onPause
+   * records it once. Deploying the fix, release 3, resumes it at the
+   * scheduled retry, about a minute later.
    */
-  async 'failed-mismatch'(backend) {
+  async unguarded(backend) {
     deploy('v1', backend);
     const old = await startWaitingRun('v1', backend, 1);
     deploy('v2-unguarded', backend);
     call('v2-unguarded', backend, 'pipeline:downloadDone', { workflowId: old.workflowId });
-    const failed = await finished('v2-unguarded', backend, old, 'the run to fail');
-    expectEqual({ log: failed.log, status: failed.status }, { log: ['grab'], status: 'failed' }, 'the release 0 run');
-    const mismatch =
-      'Journal entry mismatch at step 1 of the run\'s history, as its migrations leave it: the code calls {"args":{"grabId":"' +
-      `${old.grabId}"},"kind":"function","name":"pipeline:notify"}, the history has {"args":{},"kind":"event","name":"downloadDone"}`;
-    if (!failed.error?.includes(mismatch)) throw new Error(`Expected the mismatch "${mismatch}", got: ${failed.error}`);
-    expectEqual(record('v2-unguarded', backend, old), null, 'the failed run’s record');
+    expectEqual(
+      await pausedRun('v2-unguarded', backend, old),
+      { paused: { reason: 'mismatch', attempts: 1 }, alerts: ['mismatch'], run: { log: ['grab'], status: 'inProgress' } },
+      'the paused run',
+    );
+    expectEqual(record('v2-unguarded', backend, old), null, 'the paused run’s record: nothing of the handler run was saved');
+
+    deploy(release3, backend);
+    log('  waiting for the retry');
+    const done = await finished(release3, backend, old, 'the retry to resume the run', 120_000);
+    expectEqual(done, { log: ['grab', 'import', 'transcode', 'publish'], status: 'completed' }, 'the resumed run');
+    expectEqual(pauses(release3, backend, old), { paused: null, alerts: ['mismatch'] }, 'the pauses after the retry');
+    expectEqual(record(release3, backend, old)?.applied, ALL, 'the resumed run’s applied migrations');
+  },
+
+  /**
+   * A run started on release 3 pauses when release 2's code without its
+   * migrations is deployed over it, a rollback: its applied migrations aren't
+   * a prefix of that code's list. Rolling forward and calling resume
+   * finishes it.
+   */
+  async rollback(backend) {
+    deploy(release3, backend);
+    const ids = await startWaitingRun(release3, backend, 2);
+    deploy('v2-unguarded', backend);
+    call('v2-unguarded', backend, 'pipeline:downloadDone', { workflowId: ids.workflowId });
+    expectEqual(
+      await pausedRun('v2-unguarded', backend, ids),
+      { paused: { reason: 'migrations', attempts: 1 }, alerts: ['migrations'], run: { log: ['grab', 'notify'], status: 'inProgress' } },
+      'the paused run',
+    );
+
+    deploy(release3, backend);
+    expectEqual(call(release3, backend, 'pipeline:resume', { workflowId: ids.workflowId }), true, 'resume');
+    const done = await finished(release3, backend, ids, 'the run to finish');
+    expectEqual(done, { log: ['grab', 'notify', 'import', 'transcode', 'publish'], status: 'completed' }, 'the resumed run');
+    expectEqual(pauses(release3, backend, ids).paused, null, 'the pause after resume');
+  },
+
+  /**
+   * A run from release 0 waiting across the deploy of release 3, whose
+   * download then fails: the handler passes the failure on, and the run
+   * fails, as before, though the migrations edited its history in that
+   * handler run (throw rule 4).
+   */
+  async failed(backend) {
+    deploy('v1', backend);
+    const ids = await startWaitingRun('v1', backend, 1);
+    deploy(release3, backend);
+    call(release3, backend, 'pipeline:downloadDone', { workflowId: ids.workflowId, error: 'the download failed' });
+    const done = await until(
+      () => ({ ...grab(release3, backend, ids), paused: pauses(release3, backend, ids).paused }),
+      (g) => g.status !== 'inProgress' || g.paused !== null,
+      'the run to fail',
+    );
+    expectEqual(
+      { ...done, error: done.error?.includes('the download failed') },
+      { log: ['grab'], status: 'failed', error: true, paused: null },
+      'the failed run',
+    );
+    expectEqual(pauses(release3, backend, ids).alerts, [], 'the alerts');
+    expectEqual(record(release3, backend, ids)?.applied, ALL, 'the failed run’s applied migrations');
   },
 };
 

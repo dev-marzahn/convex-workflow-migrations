@@ -83,13 +83,34 @@ export const startGrab = mutation({
   },
 });
 
-// The worker calls this when the download client reports completion.
+// The worker calls this when the download client reports completion, or failure.
 export const downloadDone = mutation({
-  args: { workflowId: vWorkflowId },
+  args: { workflowId: vWorkflowId, error: v.optional(v.string()) },
   returns: v.null(),
-  handler: async (ctx, { workflowId }) => {
-    await workflow.sendEvent(ctx, { workflowId, name: 'downloadDone' });
+  handler: async (ctx, { workflowId, error }) => {
+    await workflow.sendEvent(ctx, error === undefined ? { workflowId, name: 'downloadDone' } : { workflowId, name: 'downloadDone', error });
     return null;
+  },
+});
+
+// For an admin, after deploying a fix: retries a paused run now, and says whether it got past its pause.
+export const resume = internalMutation({
+  args: { workflowId: vWorkflowId },
+  returns: v.boolean(),
+  handler: (ctx, { workflowId }) => workflow.resume(ctx, workflowId),
+});
+
+// For the UI: whether a run is paused, and the alerts onPause recorded for it.
+export const pauses = query({
+  args: { workflowId: vWorkflowId },
+  returns: v.object({ paused: v.union(v.object({ reason: v.string(), attempts: v.number() }), v.null()), alerts: v.array(v.string()) }),
+  handler: async (ctx, { workflowId }) => {
+    const run = (await workflow.paused(ctx)).page.find((paused) => paused.workflowId === workflowId);
+    const alerts = await ctx.db
+      .query('alerts')
+      .withIndex('workflowId', (q) => q.eq('workflowId', workflowId))
+      .collect();
+    return { paused: run ? { reason: run.reason, attempts: run.attempts } : null, alerts: alerts.map((alert) => alert.reason) };
   },
 });
 

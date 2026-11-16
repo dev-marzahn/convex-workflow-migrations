@@ -7,8 +7,9 @@ import { internalMutation, type MutationCtx, mutation, query } from './_generate
 import { workflow } from './workflow';
 
 // Release 2's code without its migrations: the same new step before the wait,
-// unguarded. Runs that release 0 left waiting fail with a journal entry
-// mismatch on their next replay.
+// unguarded. Runs that release 0 left waiting pause with a journal entry
+// mismatch on their next replay; runs that release 3 started pause too, since
+// their applied migrations aren't a prefix of this code's (none).
 export const run = workflow.define({
   args: { grabId: v.id('grabs') },
   handler: async (step, { grabId }): Promise<void> => {
@@ -79,5 +80,18 @@ export const status = query({
     if (!grab?.workflowId) throw new Error(`Grab ${grabId} has no workflow`);
     const status = await workflow.status(ctx, grab.workflowId);
     return { log: grab.log, status: status.type, ...(status.type === 'failed' ? { error: status.error } : {}) };
+  },
+});
+
+export const pauses = query({
+  args: { workflowId: vWorkflowId },
+  returns: v.object({ paused: v.union(v.object({ reason: v.string(), attempts: v.number() }), v.null()), alerts: v.array(v.string()) }),
+  handler: async (ctx, { workflowId }) => {
+    const run = (await workflow.paused(ctx)).page.find((paused) => paused.workflowId === workflowId);
+    const alerts = await ctx.db
+      .query('alerts')
+      .withIndex('workflowId', (q) => q.eq('workflowId', workflowId))
+      .collect();
+    return { paused: run ? { reason: run.reason, attempts: run.attempts } : null, alerts: alerts.map((alert) => alert.reason) };
   },
 });
