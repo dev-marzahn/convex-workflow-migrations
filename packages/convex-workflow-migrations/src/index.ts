@@ -3,7 +3,7 @@ import type { WorkpoolOptions } from '@convex-dev/workpool';
 import type { GenericActionCtx, GenericDataModel, GenericMutationCtx, GenericQueryCtx, RegisteredMutation } from 'convex/server';
 import type { PropertyValidators, Validator } from 'convex/values';
 
-import { checkMigrations, type Migration, type PatchesComponent, type PauseInfo, type PauseReason, type WorkflowPatches } from './migrations.ts';
+import { checkMigrations, type Migration, type MigrationsComponent, type PauseInfo, type PauseReason, type WorkflowMigrations } from './migrations.ts';
 import type { InferFromOptionalValidator, WorkflowHandler, WorkflowMutationResult } from './vendor/workflow/types.ts';
 import { type WorkflowArgs, workflowMutation } from './vendor/workflow/workflowMutation.ts';
 
@@ -42,7 +42,7 @@ export type {
   WorkflowStep,
 } from '@convex-dev/workflow';
 export { migration } from './migrations.ts';
-export type { Migration, PatchesComponent, PauseInfo, PauseReason } from './migrations.ts';
+export type { Migration, MigrationsComponent, PauseInfo, PauseReason } from './migrations.ts';
 export type { History, HistoryStep, InsertOptions, OverlayOp, RecordedHistory, RecordedStep, StepArgs, StepRef, StepResult, StepSelector } from './history.ts';
 export type { WorkflowHandler } from './vendor/workflow/types.ts';
 export type { WorkflowCtx } from './vendor/workflow/workflowContext.ts';
@@ -83,8 +83,8 @@ export type PausedRun = {
 };
 
 export type WorkflowManagerOptions = {
-  /** The patches component, `components.workflowPatches`. */
-  patches: PatchesComponent;
+  /** The migrations component, `components.workflowMigrations`. */
+  migrationsComponent: MigrationsComponent;
   /**
    * Called once when a run pauses, in the transaction that pauses it. An
    * error it throws is logged; the run stays paused.
@@ -100,17 +100,17 @@ export type WorkflowManagerOptions = {
  *
  * ```ts
  * export const workflow = new WorkflowManager(components.workflow, {
- *   patches: components.workflowPatches,
+ *   migrationsComponent: components.workflowMigrations,
  * });
  * ```
  */
 export class WorkflowManager extends UpstreamWorkflowManager {
-  public readonly patches: PatchesComponent;
-  private readonly onPause: WorkflowPatches['onPause'];
+  public readonly migrationsComponent: MigrationsComponent;
+  private readonly onPause: WorkflowMigrations['onPause'];
 
   public constructor(component: WorkflowComponent, options: WorkflowManagerOptions) {
     super(component, options.workpoolOptions ? { workpoolOptions: options.workpoolOptions } : undefined);
-    this.patches = options.patches;
+    this.migrationsComponent = options.migrationsComponent;
     this.onPause = options.onPause?.bind(options);
   }
 
@@ -131,15 +131,15 @@ export class WorkflowManager extends UpstreamWorkflowManager {
     workflow: Definition<ArgsValidator, ReturnsValidator> & { handler?: WorkflowHandler<ArgsValidator, ReturnsValidator> },
   ): unknown {
     const { migrations, handler, ...definition } = workflow;
-    const patches: WorkflowPatches = { component: this.patches, migrations: checkMigrations(migrations), onPause: this.onPause };
+    const setup: WorkflowMigrations = { component: this.migrationsComponent, list: checkMigrations(migrations), onPause: this.onPause };
     const build = (fn: WorkflowHandler<ArgsValidator, ReturnsValidator>) =>
-      workflowMutation(this.component, patches, { ...definition, handler: fn }, this.options?.workpoolOptions);
+      workflowMutation(this.component, setup, { ...definition, handler: fn }, this.options?.workpoolOptions);
     return handler ? build(handler) : { handler: build };
   }
 
   /** Paused runs, the next one due for a retry first. */
   public async paused(ctx: QueryCtx, opts?: { limit?: number }): Promise<PausedRun[]> {
-    return (await ctx.runQuery(this.patches.runs.list, { limit: opts?.limit })) as PausedRun[];
+    return (await ctx.runQuery(this.migrationsComponent.runs.list, { limit: opts?.limit })) as PausedRun[];
   }
 
   /**
@@ -148,7 +148,7 @@ export class WorkflowManager extends UpstreamWorkflowManager {
    * reason. An error from the workflow mutation is thrown.
    */
   public async resume(ctx: MutationCtx | ActionCtx, workflowId: WorkflowId): Promise<boolean> {
-    return !(await ctx.runMutation(this.patches.runs.retry, { workflowId, now: true }));
+    return !(await ctx.runMutation(this.migrationsComponent.runs.retry, { workflowId, now: true }));
   }
 
   /**
@@ -159,7 +159,7 @@ export class WorkflowManager extends UpstreamWorkflowManager {
   public async restartFrom(ctx: MutationCtx | ActionCtx, workflowId: WorkflowId, step: number): Promise<void> {
     if (!Number.isInteger(step) || step < 0) throw new Error(`restartFrom: step must be a position in the history, got ${step}.`);
     await this.expectPaused(ctx, workflowId, 'restartFrom');
-    await ctx.runMutation(this.patches.runs.retry, { workflowId, restartFrom: step });
+    await ctx.runMutation(this.migrationsComponent.runs.retry, { workflowId, restartFrom: step });
   }
 
   /**
@@ -169,7 +169,7 @@ export class WorkflowManager extends UpstreamWorkflowManager {
    */
   public async fail(ctx: MutationCtx | ActionCtx, workflowId: WorkflowId): Promise<void> {
     const paused = await this.expectPaused(ctx, workflowId, 'fail');
-    await ctx.runMutation(this.patches.runs.unpause, { workflowId });
+    await ctx.runMutation(this.migrationsComponent.runs.unpause, { workflowId });
     const { workflow } = await ctx.runQuery(this.component.workflow.getStatus, { workflowId });
     await ctx.runMutation(this.component.workflow.complete, {
       workflowId,
@@ -181,7 +181,7 @@ export class WorkflowManager extends UpstreamWorkflowManager {
   /** Upstream's `cancel`. A paused run's pause ends too. */
   public override async cancel(ctx: MutationCtx | ActionCtx, workflowId: WorkflowId): Promise<void> {
     await super.cancel(ctx, workflowId);
-    await ctx.runMutation(this.patches.runs.unpause, { workflowId });
+    await ctx.runMutation(this.migrationsComponent.runs.unpause, { workflowId });
   }
 
   /**
@@ -190,12 +190,12 @@ export class WorkflowManager extends UpstreamWorkflowManager {
    */
   public override async cleanup(ctx: MutationCtx | ActionCtx, workflowId: WorkflowId): Promise<boolean> {
     const removed = await super.cleanup(ctx, workflowId);
-    if (removed) await ctx.runMutation(this.patches.runs.cleanup, { workflowId });
+    if (removed) await ctx.runMutation(this.migrationsComponent.runs.cleanup, { workflowId });
     return removed;
   }
 
   private async expectPaused(ctx: MutationCtx | ActionCtx, workflowId: WorkflowId, action: string) {
-    const record = await ctx.runQuery(this.patches.runs.load, { workflowId });
+    const record = await ctx.runQuery(this.migrationsComponent.runs.load, { workflowId });
     if (!record?.paused) throw new Error(`${action}: workflow ${workflowId} isn't paused.`);
     return record.paused;
   }

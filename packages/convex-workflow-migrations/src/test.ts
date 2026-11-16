@@ -12,16 +12,16 @@ import { safeFunctionName } from './vendor/workflow/safeFunctionName.ts';
 const modules = import.meta.glob(['./component/**/*.{ts,js}', '!./component/**/*.d.ts']);
 
 /**
- * Registers `@convex-dev/workflow` (with its workpool) and the patches
+ * Registers `@convex-dev/workflow` (with its workpool) and the migrations
  * component with a convex-test instance, under the names `convex.config.ts`
  * gives them.
  */
 export function register<Schema extends SchemaDefinition<GenericSchema, boolean>>(
   t: TestConvex<Schema>,
-  names: { workflow?: string; patches?: string } = {},
+  names: { workflow?: string; migrations?: string } = {},
 ): void {
   workflowTest.register(t, names.workflow ?? 'workflow');
-  t.registerComponent(names.patches ?? 'workflowPatches', schema, modules);
+  t.registerComponent(names.migrations ?? 'workflowMigrations', schema, modules);
 }
 
 type Outcome = { result?: unknown; error?: string; status?: 'done' | 'running' };

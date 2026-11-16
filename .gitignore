@@ -3,5 +3,5 @@ dist
 *.log
 .DS_Store
 # Copied from the repo root when the package is packed.
-packages/convex-workflow-patches/README.md
-packages/convex-workflow-patches/LICENSE
+packages/convex-workflow-migrations/README.md
+packages/convex-workflow-migrations/LICENSE

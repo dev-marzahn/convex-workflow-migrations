@@ -34,7 +34,7 @@ import {
 } from "./types.js";
 import { createWorkflowCtx } from "./workflowContext.js";
 import { ReplayMismatch } from "../../history.js";
-import { RunRecord, type WorkflowPatches } from "../../migrations.js";
+import { RunRecord, type WorkflowMigrations } from "../../migrations.js";
 import { replayRequest } from "../../testing.js";
 
 export type WorkflowArgs<V extends PropertyValidators, Context = unknown> = {
@@ -114,8 +114,8 @@ export function workflowMutation<
   ReturnsValidator extends Validator<any, "required", any> | void,
 >(
   component: WorkflowComponent,
-  // PATCHES: the patches component, and this workflow's migrations.
-  patches: WorkflowPatches,
+  // PATCHES: the migrations component, and this workflow's migrations.
+  migrations: WorkflowMigrations,
   registered: WorkflowDefinition<ArgsValidator, ReturnsValidator> & {
     handler: WorkflowHandler<ArgsValidator, ReturnsValidator>;
   },
@@ -171,7 +171,7 @@ export function workflowMutation<
           ? replayRequest(args.workflowId)
           : undefined;
       if (check) {
-        await check(ctx, patches, registered, workpoolOptions);
+        await check(ctx, migrations, registered, workpoolOptions);
         return args.workflowId as WorkflowId;
       }
       let workflowId: WorkflowId, generationNumber: number;
@@ -247,7 +247,7 @@ export function workflowMutation<
       // so the workpool doesn't fail it.
       const run = await RunRecord.load(
         ctx,
-        patches,
+        migrations,
         workflowId,
         journalEntries as JournalEntry[],
       );

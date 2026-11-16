@@ -12,7 +12,7 @@ import { BaseChannel } from 'async-channel';
 import type { GenericDataModel, GenericMutationCtx } from 'convex/server';
 
 import { type HistoryView, type RecordedHistory, ReplayMismatch } from './history.ts';
-import { prepareHistory, type WorkflowPatches } from './migrations.ts';
+import { prepareHistory, type WorkflowMigrations } from './migrations.ts';
 import { setupEnvironment } from './vendor/workflow/environment.ts';
 import type { WorkflowId } from './vendor/workflow/publicTypes.ts';
 import { StepExecutor, type StepRequest } from './vendor/workflow/step.ts';
@@ -27,8 +27,8 @@ export type ReplayOutcome =
 type Request = { history: RecordedHistory; replay: boolean; outcome?: ReplayOutcome };
 type Handler = (step: ReturnType<typeof createWorkflowCtx>, args: any) => Promise<unknown>;
 
-const PREFIX = 'convex-workflow-patches-replay:';
-const key = Symbol.for('@dev-marzahn/convex-workflow-patches/replay');
+const PREFIX = 'convex-workflow-migrations-replay:';
+const key = Symbol.for('@dev-marzahn/convex-workflow-migrations/replay');
 const state = ((globalThis as { [key]?: { next: number; requests: Map<string, Request> } })[key] ??= { next: 0, requests: new Map() });
 
 /**
@@ -55,15 +55,15 @@ export function replayRequest(
 ):
   | ((
       ctx: GenericMutationCtx<GenericDataModel>,
-      patches: WorkflowPatches,
+      migrations: WorkflowMigrations,
       registered: { handler: Handler },
       workpoolOptions?: WorkpoolOptions,
     ) => Promise<void>)
   | undefined {
   const request = workflowId.startsWith(PREFIX) ? state.requests.get(workflowId) : undefined;
   if (!request) return undefined;
-  return async (ctx, patches, registered, workpoolOptions) => {
-    request.outcome = await replay(ctx, patches, registered.handler, request, workpoolOptions);
+  return async (ctx, migrations, registered, workpoolOptions) => {
+    request.outcome = await replay(ctx, migrations, registered.handler, request, workpoolOptions);
   };
 }
 
@@ -78,13 +78,13 @@ class ReplayOnly extends StepExecutor {
 
 async function replay(
   ctx: GenericMutationCtx<GenericDataModel>,
-  patches: WorkflowPatches,
+  migrations: WorkflowMigrations,
   handler: Handler,
   request: Request,
   workpoolOptions?: WorkpoolOptions,
 ): Promise<ReplayOutcome> {
   const { history: recorded } = request;
-  const prepared = prepareHistory(recorded.steps, { applied: recorded.applied ?? [], overlay: recorded.overlay ?? [] }, patches.migrations);
+  const prepared = prepareHistory(recorded.steps, { applied: recorded.applied ?? [], overlay: recorded.overlay ?? [] }, migrations.list);
   const { history } = prepared;
   if (prepared.blocked) return { ok: false, ...prepared.blocked, history };
   if (!request.replay) return { ok: true, history };

@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "convex-workflow-patches-monorepo",
+      "name": "convex-workflow-migrations-monorepo",
       "devDependencies": {
         "@types/node": "catalog:",
         "typescript": "catalog:",
@@ -25,7 +25,7 @@
       "dependencies": {
         "@convex-dev/workflow": "catalog:",
         "@convex-dev/workpool": "catalog:",
-        "@dev-marzahn/convex-workflow-patches": "workspace:*",
+        "@dev-marzahn/convex-workflow-migrations": "workspace:*",
         "convex": "catalog:",
         "convex-helpers": "catalog:",
       },
@@ -35,7 +35,7 @@
       "dependencies": {
         "@convex-dev/workflow": "catalog:",
         "@convex-dev/workpool": "catalog:",
-        "@dev-marzahn/convex-workflow-patches": "workspace:*",
+        "@dev-marzahn/convex-workflow-migrations": "workspace:*",
         "convex": "catalog:",
         "convex-helpers": "catalog:",
       },
@@ -45,7 +45,7 @@
       "dependencies": {
         "@convex-dev/workflow": "catalog:",
         "@convex-dev/workpool": "catalog:",
-        "@dev-marzahn/convex-workflow-patches": "workspace:*",
+        "@dev-marzahn/convex-workflow-migrations": "workspace:*",
         "convex": "catalog:",
         "convex-helpers": "catalog:",
       },
@@ -55,7 +55,7 @@
       "dependencies": {
         "@convex-dev/workflow": "catalog:",
         "@convex-dev/workpool": "catalog:",
-        "@dev-marzahn/convex-workflow-patches": "workspace:*",
+        "@dev-marzahn/convex-workflow-migrations": "workspace:*",
         "convex": "catalog:",
         "convex-helpers": "catalog:",
       },
@@ -65,11 +65,11 @@
         "vite-plus": "catalog:",
       },
     },
-    "packages/convex-workflow-patches": {
-      "name": "@dev-marzahn/convex-workflow-patches",
+    "packages/convex-workflow-migrations": {
+      "name": "@dev-marzahn/convex-workflow-migrations",
       "version": "100.0.0",
       "bin": {
-        "convex-workflow-patches": "./dist/cli.js",
+        "convex-workflow-migrations": "./dist/cli.js",
       },
       "dependencies": {
         "async-channel": "catalog:",
@@ -128,7 +128,7 @@
 
     "@convex-dev/workpool": ["@convex-dev/workpool@0.4.16", "", { "dependencies": { "@convex-dev/batch-worker": "^0.3.6" }, "peerDependencies": { "convex": "^1.43.0", "convex-helpers": "^0.1.94" } }, "sha512-QtR9lEidys0yGtjlbtJzhcC6RGxs4uICnewWZmiolDnUlX4Y8z5v4hGwDzON3TRDIzL3Pd/WPY/jXRKZnQW4Bg=="],
 
-    "@dev-marzahn/convex-workflow-patches": ["@dev-marzahn/convex-workflow-patches@workspace:packages/convex-workflow-patches"],
+    "@dev-marzahn/convex-workflow-migrations": ["@dev-marzahn/convex-workflow-migrations@workspace:packages/convex-workflow-migrations"],
 
     "@edge-runtime/primitives": ["@edge-runtime/primitives@6.0.0", "", {}, "sha512-FqoxaBT+prPBHBwE1WXS1ocnu/VLTQyZ6NMUBAdbP7N2hsFTTxMC/jMu2D/8GAlMQfxeuppcPuCUk/HO3fpIvA=="],
 

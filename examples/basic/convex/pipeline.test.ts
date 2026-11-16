@@ -1,5 +1,5 @@
 /// <reference types="vite/client" />
-import patchesTest, { expectReplays, history, migrate } from '@dev-marzahn/convex-workflow-patches/test';
+import migrationsTest, { expectReplays, history, migrate } from '@dev-marzahn/convex-workflow-migrations/test';
 import { convexTest } from 'convex-test';
 import { makeFunctionReference } from 'convex/server';
 import { afterEach, beforeEach, expect, test, vi } from 'vite-plus/test';
@@ -12,14 +12,14 @@ const modules = import.meta.glob('./**/*.ts');
 
 function setup() {
   const t = convexTest(schema, modules);
-  patchesTest.register(t);
+  migrationsTest.register(t);
   return t;
 }
 
 beforeEach(() => vi.useFakeTimers());
 afterEach(() => vi.useRealTimers());
 
-// Histories the older releases recorded, as `npx convex-workflow-patches
+// Histories the older releases recorded, as `npx convex-workflow-migrations
 // histories pipeline:run` exports them, or built by hand.
 const grabId = 'k57' as Id<'grabs'>;
 const prepare = makeFunctionReference<'mutation'>('pipeline:prepare');

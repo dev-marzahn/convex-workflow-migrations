@@ -1,4 +1,4 @@
-// The patches component's functions. They're internal to this package: the
+// The migrations component's functions. They're internal to this package: the
 // workflow mutation calls `load`, `save` and `pause`; a pause schedules
 // `retry`; the `WorkflowManager` calls `list`, `retry`, `unpause` and
 // `cleanup`; the CLI's `histories` reads `load`. Rows, scheduled `retry` calls

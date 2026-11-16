@@ -36,7 +36,7 @@ test('the installed @convex-dev/workflow is the version the copy was made from',
 });
 
 test('the vendored files are upstream plus upstream.diff', () => {
-  const work = mkdtempSync(join(tmpdir(), 'convex-workflow-patches-vendor-'));
+  const work = mkdtempSync(join(tmpdir(), 'convex-workflow-migrations-vendor-'));
   try {
     for (const [name, source] of Object.entries(FILES)) copyFileSync(join(UPSTREAM, source), join(work, name));
     const patch = spawnSync('patch', ['-s', '-p1', '-d', work], { input: readFileSync(join(VENDOR, 'upstream.diff')), encoding: 'utf8' });

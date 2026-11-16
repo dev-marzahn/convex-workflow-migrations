@@ -27,7 +27,7 @@ export type RecordedStep = {
 
 /**
  * A run's recorded history: its journal and, if the run has a record in the
- * patches component, the migrations applied to it and their edits. The CLI's
+ * migrations component, the migrations applied to it and their edits. The CLI's
  * `histories` command exports these as JSON, and `history([...])` in `/test`
  * builds one. Without `applied`, every migration applies: a history from
  * code before the first migration.

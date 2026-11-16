@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// convex-workflow-patches histories: exports a workflow's run histories from a
+// convex-workflow-migrations histories: exports a workflow's run histories from a
 // deployment as JSON, for expectReplays() in /test. Run it from the app's
 // directory; it reads through `convex run`.
 import { spawnSync } from 'node:child_process';
@@ -10,11 +10,11 @@ import { parseArgs } from 'node:util';
 
 import type { OverlayOp, RecordedHistory, RecordedStep, RunResult, StepKind } from './history.ts';
 
-const USAGE = `Usage: convex-workflow-patches histories <workflow> [options] [-- <convex options>]
+const USAGE = `Usage: convex-workflow-migrations histories <workflow> [options] [-- <convex options>]
 
 Exports the histories of a workflow's running runs, and of its most recent
 finished ones, as JSON: the input for expectReplays() from
-@dev-marzahn/convex-workflow-patches/test. <workflow> is the workflow's
+@dev-marzahn/convex-workflow-migrations/test. <workflow> is the workflow's
 function name, like pipeline:run. Run it from your app's directory.
 
   --recent <n>                 Finished runs to export too, newest first. Default: 10
@@ -24,7 +24,7 @@ function name, like pipeline:run. Run it from your app's directory.
                                Default: 1000
   --out <file>                 Write the JSON to <file> instead of stdout.
   --workflow-component <name>  Where @convex-dev/workflow is mounted. Default: workflow
-  --patches-component <name>   Where this package's component is mounted. Default: workflowPatches
+  --migrations-component <name>   Where this package's component is mounted. Default: workflowMigrations
 
 Options after -- go to every \`convex\` command it runs, e.g. -- --prod.
 Exit codes: 0 exported, 2 usage or deployment error.`;
@@ -90,7 +90,7 @@ function histories(argv: string[]): number {
       'max-steps': { type: 'string', default: '1000' },
       out: { type: 'string' },
       'workflow-component': { type: 'string', default: 'workflow' },
-      'patches-component': { type: 'string', default: 'workflowPatches' },
+      'migrations-component': { type: 'string', default: 'workflowMigrations' },
       help: { type: 'boolean', short: 'h' },
     },
   });
@@ -106,7 +106,7 @@ function histories(argv: string[]): number {
   const convexArgs = split < 0 ? [] : argv.slice(split + 1);
   const query = cliQuery(convexArgs);
   const workflowComponent = values['workflow-component'];
-  const patchesComponent = values['patches-component'];
+  const migrationsComponent = values['migrations-component'];
 
   // Upstream has no index by status, so this pages through the runs newest first.
   const runs: PublicWorkflow[] = [];
@@ -128,14 +128,14 @@ function histories(argv: string[]): number {
     cursor = result.continueCursor;
   }
 
-  const records = isDeployed(patchesComponent, convexArgs);
+  const records = isDeployed(migrationsComponent, convexArgs);
   const exported = runs.map((run): RecordedHistory => {
     const steps: Page<WorkflowStep> = query(workflowComponent, 'workflow:listSteps', {
       workflowId: run.workflowId,
       order: 'asc',
       paginationOpts: { numItems: maxSteps, cursor: null },
     });
-    const record: RunRecord = records ? query(patchesComponent, 'runs:load', { workflowId: run.workflowId }) : null;
+    const record: RunRecord = records ? query(migrationsComponent, 'runs:load', { workflowId: run.workflowId }) : null;
     return {
       workflowId: run.workflowId,
       workflow: name,

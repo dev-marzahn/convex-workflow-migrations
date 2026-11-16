@@ -8,8 +8,8 @@ import { type History, HistoryView, type OverlayOp, type RecordedStep, type Repl
 import type { WorkflowId } from './vendor/workflow/publicTypes.ts';
 import type { JournalEntry } from './vendor/workflow/types.ts';
 
-/** The installed patches component, `components.workflowPatches`. */
-export type PatchesComponent = ComponentApi;
+/** The installed migrations component, `components.workflowMigrations`. */
+export type MigrationsComponent = ComponentApi;
 
 /** A change to a workflow's recorded histories. Create one with `migration(id, migrate)`. */
 export type Migration = { readonly id: string; readonly migrate: (h: History) => void };
@@ -45,10 +45,10 @@ export type PauseReason = 'mismatch' | 'migration' | 'migrations' | 'error';
 /** What `onPause` is told about a run that paused. */
 export type PauseInfo = { workflowId: WorkflowId; workflow: string; reason: PauseReason; detail: string };
 
-/** What the vendored workflow mutation gets from the manager. */
-export type WorkflowPatches = {
-  component: PatchesComponent;
-  migrations: readonly Migration[];
+/** What the vendored workflow mutation gets from the manager: the migrations component, the workflow's migrations and `onPause`. */
+export type WorkflowMigrations = {
+  component: MigrationsComponent;
+  list: readonly Migration[];
   onPause?: (ctx: GenericMutationCtx<GenericDataModel>, info: PauseInfo) => void | Promise<void>;
 };
 
@@ -125,7 +125,7 @@ type Logger = { warn: (...args: unknown[]) => void; error: (...args: unknown[]) 
 /** A run's record during one handler run of the vendored workflow mutation. */
 export class RunRecord {
   private constructor(
-    private readonly patches: WorkflowPatches,
+    private readonly migrations: WorkflowMigrations,
     private readonly workflowId: WorkflowId,
     private readonly workflow: string,
     private readonly stored: { applied: readonly string[]; overlay: readonly OverlayOp[]; dirty: boolean },
@@ -133,21 +133,21 @@ export class RunRecord {
   ) {}
 
   /** Loads the run's record and applies pending migrations. Call once per handler run, before replay. */
-  public static async load(ctx: MutationCtx, patches: WorkflowPatches, workflowId: WorkflowId, journal: readonly JournalEntry[]): Promise<RunRecord> {
+  public static async load(ctx: MutationCtx, migrations: WorkflowMigrations, workflowId: WorkflowId, journal: readonly JournalEntry[]): Promise<RunRecord> {
     const workflow = (await ctx.meta.getFunctionMetadata()).name;
-    const row = await ctx.runQuery(patches.component.runs.load, { workflowId });
+    const row = await ctx.runQuery(migrations.component.runs.load, { workflowId });
     // A run without a record is new, or from before the app adopted this
     // package. A new run's history is empty and in the current shape, so it
     // starts with every migration applied.
-    const applied = row ? row.applied : journal.length === 0 ? patches.migrations.map((m) => m.id) : [];
+    const applied = row ? row.applied : journal.length === 0 ? migrations.list.map((m) => m.id) : [];
     const overlay = row?.overlay ?? [];
     const prepared = prepareHistory(
       journal.map(recordedStep),
       { applied, overlay, ...(row?.restart === undefined ? {} : { restart: row.restart }) },
-      patches.migrations,
+      migrations.list,
     );
     const dirty = !row || row.workflow !== workflow || row.paused !== undefined || row.restart !== undefined;
-    return new RunRecord(patches, workflowId, workflow, { applied, overlay, dirty }, prepared);
+    return new RunRecord(migrations, workflowId, workflow, { applied, overlay, dirty }, prepared);
   }
 
   /** The history to replay against. */
@@ -166,7 +166,7 @@ export class RunRecord {
     const overlay = history.overlay();
     const same = this.stored.applied.length === applied.length && this.stored.applied.every((id, i) => applied[i] === id);
     if (!this.stored.dirty && same && sameOverlay(this.stored.overlay, overlay)) return;
-    await ctx.runMutation(this.patches.component.runs.save, { workflowId: this.workflowId, workflow: this.workflow, applied, overlay });
+    await ctx.runMutation(this.migrations.component.runs.save, { workflowId: this.workflowId, workflow: this.workflow, applied, overlay });
   }
 
   /**
@@ -181,7 +181,7 @@ export class RunRecord {
       'position' in cause ? { reason: 'mismatch' as const, detail: cause.message, step: cause.position } : { reason: cause.reason, detail: cause.detail };
     const handle = await createFunctionHandle(makeFunctionReference<'mutation'>(this.workflow));
     const { history, applied } = this.prepared;
-    const { first } = await ctx.runMutation(this.patches.component.runs.pause, {
+    const { first } = await ctx.runMutation(this.migrations.component.runs.pause, {
       workflowId: this.workflowId,
       workflow: this.workflow,
       ...pause,
@@ -190,9 +190,9 @@ export class RunRecord {
       ...(history.lateStepRan ? { record: { applied, overlay: history.overlay() } } : {}),
     });
     console.warn(`Workflow ${this.workflow} (${this.workflowId}) paused (${pause.reason}): ${pause.detail}`);
-    if (!first || !this.patches.onPause) return;
+    if (!first || !this.migrations.onPause) return;
     try {
-      await this.patches.onPause(ctx, { workflowId: this.workflowId, workflow: this.workflow, reason: pause.reason, detail: pause.detail });
+      await this.migrations.onPause(ctx, { workflowId: this.workflowId, workflow: this.workflow, reason: pause.reason, detail: pause.detail });
     } catch (error) {
       console.error(`onPause threw for workflow ${this.workflowId}:`, error);
     }

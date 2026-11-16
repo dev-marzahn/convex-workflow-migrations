@@ -2,11 +2,11 @@ import { convexTest } from 'convex-test';
 import { anyApi, componentsGeneric, defineSchema, type FunctionReference, internalMutationGeneric } from 'convex/server';
 import { expect, test } from 'vite-plus/test';
 
-import { migration, type PatchesComponent, type WorkflowComponent, type WorkflowCtx, WorkflowManager } from '../src/index.ts';
-import patchesTest, { expectReplays, history, migrate } from '../src/test.ts';
+import { migration, type MigrationsComponent, type WorkflowComponent, type WorkflowCtx, WorkflowManager } from '../src/index.ts';
+import migrationsTest, { expectReplays, history, migrate } from '../src/test.ts';
 
-const components = componentsGeneric() as unknown as { workflow: WorkflowComponent; workflowPatches: PatchesComponent };
-const manager = new WorkflowManager(components.workflow, { patches: components.workflowPatches });
+const components = componentsGeneric() as unknown as { workflow: WorkflowComponent; workflowMigrations: MigrationsComponent };
+const manager = new WorkflowManager(components.workflow, { migrationsComponent: components.workflowMigrations });
 const flows = anyApi.flows!;
 const ref = (name: string) => flows[name] as FunctionReference<'mutation', 'internal'>;
 const noop = internalMutationGeneric({ handler: async () => null });
@@ -51,7 +51,7 @@ function setup() {
     './_generated/api.ts': async () => ({}),
     './flows.ts': async () => functions,
   });
-  patchesTest.register(t);
+  migrationsTest.register(t);
   return t;
 }
 

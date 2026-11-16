@@ -16,7 +16,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { type Backend, startBackend } from './backend.ts';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
-const PREFIX = 'convex-workflow-patches-e2e';
+const PREFIX = 'convex-workflow-migrations-e2e';
 
 function sh(cmd: string, args: string[], options: SpawnSyncOptions = {}): string {
   const result = spawnSync(cmd, args, { encoding: 'utf8', maxBuffer: 64 << 20, ...options });
@@ -59,7 +59,7 @@ async function until<T>(read: () => T, done: (value: T) => boolean, what: string
 const grab = (app: string, backend: Backend, { grabId }: Ids) => call<Grab>(app, backend, 'pipeline:status', { grabId });
 const pauses = (app: string, backend: Backend, { workflowId }: Ids) => call<Pauses>(app, backend, 'pipeline:pauses', { workflowId });
 const record = (app: string, backend: Backend, { workflowId }: Ids) =>
-  call<{ applied: string[]; paused?: unknown } | null>(app, backend, 'runs:load', { workflowId }, 'workflowPatches');
+  call<{ applied: string[]; paused?: unknown } | null>(app, backend, 'runs:load', { workflowId }, 'workflowMigrations');
 
 function expectEqual(actual: unknown, expected: unknown, what: string): void {
   if (!isDeepStrictEqual(actual, expected)) throw new Error(`${what}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
@@ -71,8 +71,8 @@ function expectEqual(actual: unknown, expected: unknown, what: string): void {
  * fresh install doesn't link before the first build.
  */
 function cli(app: string, backend: Backend, args: string[]): string {
-  const pkg = join(appDir(app), 'node_modules/@dev-marzahn/convex-workflow-patches');
-  const bin = (JSON.parse(readFileSync(join(pkg, 'package.json'), 'utf8')) as { bin: Record<string, string> }).bin['convex-workflow-patches']!;
+  const pkg = join(appDir(app), 'node_modules/@dev-marzahn/convex-workflow-migrations');
+  const bin = (JSON.parse(readFileSync(join(pkg, 'package.json'), 'utf8')) as { bin: Record<string, string> }).bin['convex-workflow-migrations']!;
   return sh(process.execPath, [join(pkg, bin), ...args], { cwd: appDir(app), env: backend.env });
 }
 

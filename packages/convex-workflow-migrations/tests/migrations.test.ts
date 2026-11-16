@@ -8,20 +8,20 @@ import { afterEach, beforeEach, expect, test, vi } from 'vite-plus/test';
 import {
   type Migration,
   migration,
-  type PatchesComponent,
+  type MigrationsComponent,
   type PauseInfo,
   type WorkflowComponent,
   type WorkflowCtx,
   type WorkflowId,
   WorkflowManager,
 } from '../src/index.ts';
-import patchesTest from '../src/test.ts';
+import migrationsTest from '../src/test.ts';
 
-const components = componentsGeneric() as unknown as { workflow: WorkflowComponent; workflowPatches: PatchesComponent };
+const components = componentsGeneric() as unknown as { workflow: WorkflowComponent; workflowMigrations: MigrationsComponent };
 const pauses: PauseInfo[] = [];
 let onPauseThrows = false;
 const manager = new WorkflowManager(components.workflow, {
-  patches: components.workflowPatches,
+  migrationsComponent: components.workflowMigrations,
   onPause: (_ctx, info) => {
     pauses.push(info);
     if (onPauseThrows) throw new Error('alerting is down');
@@ -108,7 +108,7 @@ function setup() {
     './_generated/api.ts': async () => ({}),
     './flows.ts': async () => functions,
   });
-  patchesTest.register(t);
+  migrationsTest.register(t);
   return t;
 }
 type T = ReturnType<typeof setup>;
@@ -132,7 +132,7 @@ async function downloadDone(t: T, workflowId: WorkflowId) {
 }
 const completed = { type: 'completed', result: null };
 const status = (t: T, workflowId: WorkflowId) => t.run((ctx) => manager.status(ctx, workflowId));
-const record = (t: T, workflowId: WorkflowId) => t.run((ctx) => ctx.runQuery(components.workflowPatches.runs.load, { workflowId }));
+const record = (t: T, workflowId: WorkflowId) => t.run((ctx) => ctx.runQuery(components.workflowMigrations.runs.load, { workflowId }));
 const paused = async (t: T, workflowId: WorkflowId) => (await t.run((ctx) => manager.paused(ctx))).find((run) => run.workflowId === workflowId);
 const steps = (t: T, workflowId: WorkflowId) => t.run(async (ctx) => (await manager.listSteps(ctx, workflowId)).page.map((s) => s.name.replace('flows:', '')));
 
