@@ -2,8 +2,9 @@ import { defineSchema, defineTable } from 'convex/server';
 import { v } from 'convex/values';
 
 // A record per workflow run: the migrations applied to its history, and the
-// edits they made (the overlay). Ids are strings because the workflows and
-// their journals live in the @convex-dev/workflow component.
+// edits they made (the overlay); and a pause per paused run. Ids are strings
+// because the workflows and their journals live in the @convex-dev/workflow
+// component.
 
 export const vStepKind = v.union(v.literal('function'), v.literal('workflow'), v.literal('event'), v.literal('sleep'));
 

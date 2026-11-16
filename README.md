@@ -50,6 +50,7 @@ Say a run started on release 0 is waiting for its download when release 3 ships.
 
 - **Skip releases.** Every release lists every migration, and each run records which ones it has had. A run applies the ones it's missing, in order, the next time it replays. Nothing has to be deployed first, and nothing has to drain.
 - **Same API otherwise.** `WorkflowManager` is upstream's, with `migrations` in `define()`. Your workflows, journals and events stay in upstream's component; this package adds a small one with a record per run: the migrations applied to it and their edits (the **overlay**).
+- **Pause, don't fail.** A run that can't replay on the current code, because a migration is missing or wrong, pauses and is retried, so deploying the fix resumes it ([Pausing and recovery](#pausing-and-recovery)).
 - **Tests against old histories.** `expectReplays` replays histories of older releases, with the migrations, against the current handler, without a Convex backend.
 
 ## Quick start
@@ -78,7 +79,11 @@ import { WorkflowManager } from '@dev-marzahn/convex-workflow-migrations';
 
 import { components } from './_generated/api';
 
-export const workflow = new WorkflowManager(components.workflow, { migrationsComponent: components.workflowMigrations });
+export const workflow = new WorkflowManager(components.workflow, {
+  migrationsComponent: components.workflowMigrations,
+  // Told when a run pauses instead of failing ("Pausing and recovery"). Required; null opts out.
+  onPause: (_ctx, { workflowId, reason, detail }) => console.error(`Workflow ${workflowId} paused (${reason}): ${detail}`),
+});
 ```
 
 Import the rest from this package too: `vWorkflowId`, `defineEvent`, the types and upstream's other exports are re-exported unchanged. Three are left out: `defineWorkflow` (use `workflow.define`) and the standalone `restart` and `cleanup` (use the manager's). Define every workflow on the `workflow` component with this manager, and start runs with `workflow.start` or upstream's `start`: both go through the workflow mutation, which writes the run's record in the transaction that creates it, with `startAsync` too.
@@ -110,14 +115,57 @@ Add each migration to the end of the workflow's `migrations` list:
 - `h.remove(step)`: drop a step the code no longer calls.
 - `h.rename(step, ref, { name }?)`: the step now counts as a call to `ref`, of the same kind. Across kinds it throws.
 - `h.updateArgs(step, (args) => newArgs)`: the args the current code passes, for matching only. Args are compared as JSON, so build them the way the handler does: `{ ...args, notifiedAt }`.
-- `h.updateResult(step, (result) => newResult)`: the result replay gives the call. On a failed or canceled step it throws, which fails the run: if the handler can continue past that failure, guard it with `if (h.result(ref) !== undefined)`.
+- `h.updateResult(step, (result) => newResult)`: the result replay gives the call. On a failed or canceled step it throws, which pauses the run: if the handler can continue past that failure, guard it with `if (h.result(ref) !== undefined)`.
 - `h.updateWorkflowArgs((args) => newArgs)`: the args the handler gets, for example with a new required field. The run keeps its recorded args.
 
 At runtime a migration only sees finished steps: the workflow mutation doesn't replay while a step runs. A test history can have a running step, where the run waits: `remove`, `rename` and `updateArgs` edit it as they edit a finished one, and `updateResult` does nothing to it. Inserting before it works; after it, as the last step, only with `atEnd: true`.
 
-### When a run can't replay
+## Pausing and recovery
 
-It fails, as upstream fails a run on a mismatch, with a message that says why: the code's call doesn't match the step at that position of the migrated history (a change without a migration, or a wrong one); its args, as the migrations leave them, don't pass the `args` validator; a migration throws; the handler throws after migrations applied in this handler run (likely a wrong migration), unless the history's last step failed or was canceled; the ids applied to it aren't the start of the code's list (a migration removed or reordered, or a rollback); or its record edits a journal entry something outside the `WorkflowManager` deleted. A record too big for a Convex document fails the run too, when it's saved. Nothing of that handler run is saved. Inline (`restart` without `startAsync`), the error throws to the caller instead of failing the run. Once the code is fixed, `workflow.restart(ctx, workflowId)` replays the run again, with the fixed migrations.
+A run that can't replay on the current code pauses instead of failing, with the `reason`:
+
+- `mismatch`: a call doesn't match the step at its position of the migrated history, or the code returns before it has called every step: a change without a migration, or a wrong one;
+- `args`: the workflow's args, as the migrations leave them, don't pass its `args` validator;
+- `threw`: the handler threw where a migration may be the cause (below);
+- `migration`: a migration threw;
+- `migrations`: the ids applied to the run aren't the start of the code's list: a migration was removed, renamed or reordered, or the code was rolled back;
+- `record`: the run's record edits a journal entry that something outside the `WorkflowManager` deleted.
+
+The pause commits nothing of the handler run: no step starts, and the migrations it applied in memory are dropped, so the next attempt migrates again on whatever code is deployed then. The run stays `inProgress` in upstream, and `onComplete` doesn't run.
+
+**When a throw pauses.** A handler that throws is either reacting to the run, which fails it as upstream would, or tripping over a migration, which pauses it. These rules decide, in order:
+
+1. The handler run started a step past the history: the run fails. That step's writes commit, so the throw is the handler's reaction to it.
+2. A recorded step is left that the handler hasn't replayed: it pauses.
+3. The last step the handler got is a stand-in, or has a result a migration changed: it pauses.
+4. The newest recorded steps (those started together by the last handler run that started any) include one still in the history that failed or was canceled, and that no migration renamed or gave other args or another result: the run fails. The handler is passing that failure on, even if migrations edited the history in this handler run.
+5. Migrations edited the history in this handler run: it pauses.
+6. Otherwise, the run fails.
+
+**Retries.** A paused run is retried after about 1 minute, 10 minutes, 1 hour, then every 6 hours, each ±20%, until it gets past its pause; it never gives up on its own. A retry counts its attempt and schedules the next one before it calls the workflow mutation, so an attempt that dies, even on a Convex limit, still leaves the next retry scheduled, and `lastError` says why it didn't complete. Every handler run that pauses logs a warning.
+
+**`onPause`** is a required option of the manager, since nothing else reports a paused run; `null` opts out. It's called in the transaction that pauses the run, with `{ workflowId, reason, detail, step?, attempts, previousReason? }`, and again when a retry pauses it for another reason or at another step. `step` is the position in the history, for a mismatch and the throw rules 2 and 3. `detail` says why, cut to 8,192 characters (a mismatch's call and step each), and can hold step args. An error `onPause` throws is logged, and the run stays paused.
+
+| Method                                           | Effect                                                                                                                                                                                              |
+| ------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `paused(ctx, { workflow?, cursor?, numItems? })` | A page of paused runs, the one that paused first first: each with `workflowId`, `workflow`, `reason`, `detail`, `step`, `at`, `attempts`, `nextAttemptAt` and `lastError`.                          |
+| `resume(ctx, workflowId)`                        | Retries the run now, in one transaction, and returns whether it got past its pause. Throws if it isn't paused.                                                                                      |
+| `fail(ctx, workflowId, reason?)`                 | From a mutation: completes the run as failed, with `reason` or why it paused as the error, and ends the pause, in the caller's transaction. For a run upstream already finished, it ends the pause. |
+| `cancel(ctx, workflowId)`                        | Upstream's cancel, which also ends the pause. `cleanup` deletes it with the record.                                                                                                                 |
+
+The usual fix is code: deploy a release with the missing or corrected migration, then wait for the retry, or resume the run. After a rollback, roll forward. Expose the methods as internal functions to call them after a deploy, or from the dashboard:
+
+```ts
+// convex/admin.ts
+export const resume = internalMutation({
+  args: { workflowId: vWorkflowId },
+  handler: (ctx, { workflowId }) => workflow.resume(ctx, workflowId),
+});
+```
+
+```sh
+npx convex deploy && npx convex run --prod admin:resume '{"workflowId": "..."}'
+```
 
 ## Testing
 
@@ -148,15 +196,16 @@ test('runs from every older release replay on the current code', async () => {
 
 - **`history(steps, { args, applied, workflowId })`** builds a history: `{ step: ref, args, result }` (or `error`, or `canceled: true`), `{ workflow: ref, ... }`, `{ event: name, result }` and `{ sleep: name }`, each with `status: 'running'` if the run is waiting there ([what migrations do to it](#the-history-h)), `startedAt` for its start time (default: its position), and `name` for a custom name. An `awaitEvent({ id })` step records `{ eventId }` as its args, so give it `args: { eventId }`; without a `name`, it's named by its id. A step without an outcome succeeded with `null`.
 - **`applied`**: for a run started on a release that already used this package, pass the ids that release listed, whether or not the run has steps yet. Leave it out only for a run from before adoption and for a child workflow, which have no record: with steps, every migration applies; with none, the args decide: if they pass the current validator, no migration applies; otherwise all do.
-- **`await expectReplays(workflow, histories)`** replays each history, with the migrations, against the current handler, and throws for each one that doesn't replay: a mismatch, args that don't validate, a migration that can't apply, an `updateResult` or `updateWorkflowArgs` that changes its own output, and a handler that throws, unless the history's last step failed or was canceled. A throw after migrations applied in this handler run is reported as `(migration)`, as at runtime. Replay stops where the history ends or at a running step, and checks ids only as strings.
+- **`await expectReplays(workflow, histories)`** replays each history, with the migrations, against the current handler, and throws for each one that doesn't replay, with the reason the run would pause, as at runtime, and `(fails)` for a handler that throws and would fail the run, unless it's passing on a failure (throw rule 4). An `updateResult` or `updateWorkflowArgs` that changes its own output fails too. Replay stops where the history ends or at a running step, and checks ids only as strings.
 - **`migrate(workflow, history)`** returns the history `h` after the migrations, to check what they did. It throws if they can't be applied.
 
 To run the current code from scratch with convex-test, `@dev-marzahn/convex-workflow-migrations/test` has `register(t)`, which registers both components; the helpers above come from `/replay`. It uses `import.meta.glob`, so configure Vitest as for upstream's test helpers: the `edge-runtime` environment, and `convex-test`, `@convex-dev/workflow`, `@convex-dev/workpool` and this package in `server.deps.inline`.
 
 ## Limits
 
-- **Migrations are checked by tests, not by the deploy.** A release with a missing or wrong migration fails the runs it can't replay. `expectReplays` is what catches it before the deploy.
-- **One linear list.** A migration's input is the history the previous ones left. A rollback below the migrations a run has applied fails that run when it next replays: roll forward instead.
+- **Migrations are checked by tests, not by the deploy.** A release with a missing or wrong migration pauses the runs it can't replay, until a fix is deployed. `expectReplays` is what catches it before the deploy.
+- **One linear list.** A migration's input is the history the previous ones left. A rollback below the migrations a run has applied pauses that run when it next replays: roll forward instead.
+- **A paused child stalls its parent**, whose `runWorkflow` step runs until the child finishes; `fail` or `cancel` on the child releases it. A paused run canceled past the manager, with its parent or by upstream's `cancel`, keeps its pause until its next retry, which ends it.
 - **Migrations reach only the history.** Queued steps and waiting events need [compatible signatures and names](#writing-migrations).
 - **A queued child's args decide.** A child workflow, or a queued run from before adoption, has no record of the migrations its creator knew, so its args pick: if they pass the current validator, no migration applies; otherwise every one does, so an `updateWorkflowArgs` must leave args already in a later shape unchanged. A release that changes the meaning of args that still pass, rather than their shape, isn't seen.
 - **`restart({ from })`** isn't supported yet on a run whose migrations edited its history: it throws. Without `from`, `restart` replays the whole history.
@@ -166,9 +215,8 @@ To run the current code from scratch with convex-test, `@dev-marzahn/convex-work
 
 ## What's next
 
-- **Pausing instead of failing:** a run that can't replay pauses, so a fix can resume it.
 - **Exporting histories:** a CLI that exports running runs' histories from a deployment, for `expectReplays`.
-- **More recovery methods:** `restart({ from })` on migrated histories, and cleanup of child workflows' records.
+- **More recovery methods:** `resumeAll` after a deploy, `restartFrom` a position of a paused run's history, `restart({ from })` on migrated histories, and cleanup of child workflows' records.
 
 ## @convex-dev/workflow versions
 
