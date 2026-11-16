@@ -4,11 +4,11 @@
 import { createFunctionHandle, type GenericDataModel, type GenericMutationCtx, makeFunctionReference } from 'convex/server';
 
 import type { ComponentApi } from './component/_generated/component.js';
-import { isWorkflowNotFound } from './component/schema.ts';
+import { capDetail, DETAIL_LIMIT } from './component/schema.ts';
 import { type History, HistoryView, json, type OverlayOp, type RecordedStep } from './history.ts';
 import { argsValid, message, ReplayError, type ReplayReason } from './replay.ts';
 import type { WorkflowId } from './vendor/workflow/publicTypes.ts';
-import type { JournalEntry, WorkflowComponent } from './vendor/workflow/types.ts';
+import type { JournalEntry } from './vendor/workflow/types.ts';
 
 /** The installed migrations component, `components.workflowMigrations`. */
 export type MigrationsComponent = ComponentApi;
@@ -51,8 +51,6 @@ export type PauseInfo = {
   step?: number;
   /** How many attempts the run has had: the first pause, and every scheduled retry, each counted when it starts. 1 the first time. */
   attempts: number;
-  /** Why the run was paused before, if it was: `onPause` is called again when the reason, the step or the detail changes. */
-  previousReason?: ReplayReason;
 };
 
 /** What the vendored workflow mutation gets from the manager: the migrations component, the workflow's migrations, its `args` validator and `onPause`. */
@@ -171,22 +169,18 @@ export async function loadRecord(ctx: MutationCtx, migrations: WorkflowMigration
   const pause = async (generationNumber: number, cause: ReplayError, console: Logger) => {
     const workflow = (await ctx.meta.getFunctionMetadata()).name;
     const handle = await createFunctionHandle(makeFunctionReference<'mutation'>(workflow));
-    const at = cause.position === undefined ? {} : { step: cause.position };
-    const stepId = cause.position === undefined ? undefined : prepared?.history.idAt(cause.position);
-    const appliedCount = prepared?.applied.length ?? row?.applied.length ?? 0;
-    const fields = { reason: cause.reason, detail: cause.message, ...at, ...(stepId === undefined ? {} : { stepId }), appliedCount, handle, generationNumber };
-    const { notify, attempts, previousReason } = await ctx.runMutation(migrations.component.runs.pause, { workflowId, workflow, ...fields });
-    console.warn(`Workflow ${workflow} (${workflowId}) paused (${cause.reason}): ${cause.message}`);
+    // The only cut of the whole detail, so huge args or errors can't make the pause too
+    // big to store. A mismatch's call and step are cut to DETAIL_LIMIT each already.
+    const info = {
+      reason: cause.reason,
+      detail: capDetail(cause.message, 3 * DETAIL_LIMIT),
+      ...(cause.position === undefined ? {} : { step: cause.position }),
+    };
+    const { notify, attempts } = await ctx.runMutation(migrations.component.runs.pause, { workflowId, workflow, ...info, handle, generationNumber });
+    console.warn(`Workflow ${workflow} (${workflowId}) paused (${cause.reason}): ${info.detail}`);
     if (!notify || !migrations.onPause) return;
     try {
-      await migrations.onPause(ctx, {
-        workflowId,
-        reason: cause.reason,
-        detail: cause.message,
-        ...at,
-        attempts,
-        ...(previousReason ? { previousReason } : {}),
-      });
+      await migrations.onPause(ctx, { workflowId, ...info, attempts });
     } catch (error) {
       console.error(`onPause threw for workflow ${workflowId}:`, error);
     }
@@ -204,22 +198,4 @@ export async function loadRecord(ctx: MutationCtx, migrations: WorkflowMigration
 /** For the vendored workflow mutation, in the transaction that creates a run: its record, with every migration applied. */
 export async function recordStart(ctx: MutationCtx, migrations: WorkflowMigrations, workflowId: WorkflowId): Promise<void> {
   await ctx.runMutation(migrations.component.runs.save, { workflowId, applied: migrations.list.map((m) => m.id), overlay: [] });
-}
-
-/**
- * Upstream's `journal.load`, for the vendored workflow mutation. If the
- * workflow is gone but the run has a record or a pause, for example a paused
- * child workflow its parent's cleanup deleted, deletes the record and returns
- * undefined: its retries would otherwise fail forever. The retry or `resume`
- * that called the workflow mutation ends the pause, as for a finished run.
- * Throws upstream's error for a workflow this package never saw.
- */
-export async function loadJournal(ctx: MutationCtx, component: WorkflowComponent, migrations: WorkflowMigrations, workflowId: WorkflowId) {
-  try {
-    return await ctx.runQuery(component.journal.load, { workflowId, shortCircuit: true });
-  } catch (error) {
-    if (!isWorkflowNotFound(error, workflowId) || !(await ctx.runMutation(migrations.component.runs.cleanup, { workflowId, keepPause: true }))) throw error;
-    console.warn(`Workflow ${workflowId} is gone, so its record in the migrations component was deleted.`);
-    return undefined;
-  }
 }

@@ -22,17 +22,15 @@ export type ReplayReason = Infer<typeof vPauseReason>;
 
 /**
  * The run can't replay on the current code: it pauses. `position` is where in
- * the history, if somewhere. The message is cut to `DETAIL_LIMIT` characters
- * (`limit`), so huge args or errors can't make the pause too big to store.
+ * the history, if somewhere. The pause cuts the message (`loadRecord`).
  */
 export class ReplayError extends Error {
   public constructor(
     public readonly reason: ReplayReason,
     message: string,
     public readonly position?: number,
-    limit?: number,
   ) {
-    super(capDetail(message, limit));
+    super(message);
     this.name = 'ReplayError';
   }
 }
@@ -42,7 +40,7 @@ const MISMATCH = (position: number) => `Journal entry mismatch at step ${positio
 /** The code made a different call at `position` of the history than the step there. Each is cut to `DETAIL_LIMIT`. */
 export class ReplayMismatch extends ReplayError {
   public constructor(position: number, call: string, step: string) {
-    super('mismatch', `${MISMATCH(position)}: the code calls ${capDetail(call)}, the history has ${capDetail(step)}`, position, Infinity);
+    super('mismatch', `${MISMATCH(position)}: the code calls ${capDetail(call)}, the history has ${capDetail(step)}`, position);
   }
 }
 
@@ -104,33 +102,23 @@ export const RULE = {
 
 /**
  * Whether a handler that threw pauses the run instead of failing it, by the
- * rules in the README's "Pausing and recovery", in their order. The run:
- *
- * 1. fails if the handler run started a step past the history, since that
- *    step's writes commit;
- * 2. pauses if a recorded step is left that the handler hasn't replayed;
- * 3. pauses if the last step it got is a stand-in or has a changed result;
- * 4. fails if the newest recorded steps include a failure still in the
- *    history, renamed or re-argued or not: the handler is passing it on;
- * 5. pauses if migrations edited its history in this handler run (`edited`);
- * 6. fails otherwise.
- *
- * A pause's message names its rule (`RULE`).
+ * throw rules in the README's "Pausing and recovery", in their order. A
+ * pause's message names its rule (`RULE`).
  */
 export function threwEarly(history: HistoryView, progress: ReplayProgress, error: unknown, edited: readonly string[]): ReplayError | undefined {
   if (error instanceof ReplayError) return error;
-  if (progress.started) return undefined;
+  if (progress.started) return undefined; // rule 1
   const next = progress.next?.position ?? history.length;
   if (history.recordedFrom(next)) return new ReplayError('threw', `The handler threw before step ${next} of its history (${RULE[2]}): ${message(error)}`, next);
   if (next > 0 && history.fromMigration(next - 1)) {
     return new ReplayError('threw', `The handler threw after step ${next - 1} of its history (${RULE[3]}): ${message(error)}`, next - 1);
   }
-  if (history.endsInFailure()) return undefined;
+  if (history.endsInFailure()) return undefined; // rule 4
   if (edited.length > 0) {
     const ids = edited.map((id) => `"${id}"`).join(', ');
     return new ReplayError('threw', `The handler threw after migrations ${ids} changed its history (${RULE[5]}): ${message(error)}`);
   }
-  return undefined;
+  return undefined; // rule 6
 }
 
 /**

@@ -1,16 +1,17 @@
 // The migrations component's functions. They're internal to this package: the
-// workflow mutation calls `load`, `save`, `pause` and `cleanup`; a pause
-// schedules `retry`, which schedules `attempt`; the `WorkflowManager` calls
-// `load`, `list`, `resume`, `end` and `cleanup`. Rows and scheduled `retry`
-// and `attempt` calls outlive a deploy: keep them readable from one version of
-// this package to the next (CONTRIBUTING.md).
+// workflow mutation calls `load`, `save` and `pause`; a pause schedules
+// `retry`, which schedules `attempt`; the `WorkflowManager` calls `load`,
+// `list`, `resume`, `end` and `cleanup`. Rows and scheduled `retry` and
+// `attempt` calls outlive a deploy: keep them readable from one version of
+// this package to the next (CONTRIBUTING.md, which also describes the retry
+// protocol).
 import { type FunctionHandle, paginationOptsValidator } from 'convex/server';
 import { v } from 'convex/values';
 
 import { api } from './_generated/api.js';
 import type { Doc } from './_generated/dataModel.js';
 import { mutation, type MutationCtx, query, type QueryCtx } from './_generated/server.js';
-import { capDetail, DETAIL_LIMIT, vPausedRun, vPauseReason, vRecord } from './schema.js';
+import { capDetail, vPausedRun, vPauseReason, vRecord } from './schema.js';
 
 /** Milliseconds before each retry of a paused run: 1 minute, 10 minutes, 1 hour, then every 6 hours, each ±`JITTER`. */
 export const BACKOFF_MS = [60_000, 600_000, 3_600_000, 21_600_000] as const;
@@ -19,6 +20,8 @@ export const JITTER = 0.2;
 const backoff = (attempts: number) => Math.round(BACKOFF_MS[Math.min(attempts, BACKOFF_MS.length) - 1]! * (1 - JITTER + 2 * JITTER * Math.random()));
 /** What a retry records as `lastError` when it starts its attempt; the attempt clears or replaces it. */
 export const UNFINISHED = "The attempt didn't complete: its workflow mutation may have hit a Convex limit, such as its execution time.";
+
+const message = (error: unknown) => (error instanceof Error ? error.message : String(error));
 
 const row = (ctx: QueryCtx, workflowId: string) =>
   ctx.db
@@ -32,30 +35,40 @@ const pauseRow = (ctx: QueryCtx, workflowId: string) =>
     .withIndex('workflowId', (q) => q.eq('workflowId', workflowId))
     .first();
 
+/** Deletes a run's record and its pause, and returns whether it had either. */
+async function deleteRun(ctx: MutationCtx, workflowId: string): Promise<boolean> {
+  const [current, paused] = [await row(ctx, workflowId), await pauseRow(ctx, workflowId)];
+  if (current) await ctx.db.delete('runs', current._id);
+  if (paused) await ctx.db.delete('pauses', paused._id);
+  return current !== null || paused !== null;
+}
+
 /**
- * Calls a paused run's workflow mutation with the generation it paused at, as
- * upstream's workpool calls it after every step. Returns `resumed` if the run
- * replayed past its pause (its `save` ended the pause), `paused` if it paused
- * again, and `ended` if the workflow mutation returned without replaying and
- * left the pause as it was: the run had finished or was canceled past the
- * manager, is at another generation, or is gone (`cleanup` with `keepPause`).
- * That ends the pause here.
+ * Calls a paused run's workflow mutation at the generation it paused at, and
+ * returns whether the run replayed past its pause, paused again, or ended
+ * without a replay (it finished, is at another generation, or is gone), which
+ * ends the pause.
  */
 async function callHandle(ctx: MutationCtx, paused: Doc<'pauses'>): Promise<'resumed' | 'paused' | 'ended'> {
+  const { workflowId, generationNumber } = paused;
   const handle = paused.handle as FunctionHandle<'mutation', { workflowId: string; generationNumber: number }>;
-  await ctx.runMutation(handle, { workflowId: paused.workflowId, generationNumber: paused.generationNumber });
-  const after = await pauseRow(ctx, paused.workflowId);
+  try {
+    await ctx.runMutation(handle, { workflowId, generationNumber });
+  } catch (error) {
+    // Upstream's `journal.load` throws this for a workflow it deleted, like a child its parent's cleanup removed.
+    if (!message(error).includes(`Workflow not found: ${workflowId}`)) throw error;
+    console.warn(`Workflow ${workflowId} is gone, so its record and pause in the migrations component were deleted.`);
+    await deleteRun(ctx, workflowId);
+    return 'ended';
+  }
+  const after = await pauseRow(ctx, workflowId);
   if (!after) return 'resumed';
   if (after.pausedRuns !== paused.pausedRuns) return 'paused';
   await ctx.db.delete('pauses', after._id);
   return 'ended';
 }
 
-/**
- * A run's record, or null if it has none: a child workflow before its first
- * handler run, or a run from before the app adopted this package. `paused`
- * if the run has a pause.
- */
+/** A run's record, or null if it has none (a child workflow before its first handler run, or a run from before adoption), with `paused` if it has a pause. */
 export const load = query({
   args: { workflowId: v.string() },
   returns: v.union(v.object({ ...vRecord.fields, paused: v.optional(v.literal(true)) }), v.null()),
@@ -67,11 +80,7 @@ export const load = query({
   },
 });
 
-/**
- * Writes a run's record: in the transaction that creates the run, and after a
- * handler run that changed it, or got past a pause, in its transaction. Ends
- * the run's pause.
- */
+/** Writes a run's record, in the transaction that creates the run or of a handler run that replayed, and ends its pause. */
 export const save = mutation({
   args: { workflowId: v.string(), ...vRecord.fields },
   returns: v.null(),
@@ -85,32 +94,14 @@ export const save = mutation({
   },
 });
 
-/**
- * Deletes a run's record and its pause: for `WorkflowManager.cleanup`, after
- * upstream's, and for a paused run whose workflow is gone. That one passes
- * `keepPause`: only a retry or `resume` calls its workflow mutation, and
- * `callHandle` ends the pause, so it can tell that the run didn't replay.
- * Returns whether the run had a record or a pause.
- */
+/** For `WorkflowManager.cleanup`, after upstream's: deletes a run's record and its pause, and returns whether it had either. */
 export const cleanup = mutation({
-  args: { workflowId: v.string(), keepPause: v.optional(v.boolean()) },
+  args: { workflowId: v.string() },
   returns: v.boolean(),
-  handler: async (ctx, { workflowId, keepPause }) => {
-    const [current, paused] = [await row(ctx, workflowId), await pauseRow(ctx, workflowId)];
-    if (current) await ctx.db.delete('runs', current._id);
-    if (paused && !keepPause) await ctx.db.delete('pauses', paused._id);
-    return current !== null || paused !== null;
-  },
+  handler: async (ctx, { workflowId }) => await deleteRun(ctx, workflowId),
 });
 
-/**
- * Pauses a run, in the handler run's transaction, which saves nothing else.
- * The first pause counts the first attempt and schedules a retry. A run paused
- * again, by a retry or `resume`, keeps its attempts and its scheduled retry.
- * Returns whether to call `onPause`: on the first pause, and when the reason,
- * the step or the detail changed. The detail is the same for the same code,
- * and a `migration`, `migrations`, `args` or `record` pause has no step.
- */
+/** Pauses a run, scheduling a retry if it wasn't paused, and returns whether to call `onPause`: when the reason, step or detail is new. */
 export const pause = mutation({
   args: {
     workflowId: v.string(),
@@ -118,44 +109,26 @@ export const pause = mutation({
     reason: vPauseReason,
     detail: v.string(),
     step: v.optional(v.number()),
-    stepId: v.optional(v.string()),
-    appliedCount: v.number(),
     handle: v.string(),
     generationNumber: v.number(),
   },
-  returns: v.object({ notify: v.boolean(), attempts: v.number(), previousReason: v.optional(vPauseReason) }),
+  returns: v.object({ notify: v.boolean(), attempts: v.number() }),
   handler: async (ctx, { workflowId, ...pause }) => {
-    // The caller cut it already (a mismatch's to about twice DETAIL_LIMIT); this only bounds the row.
-    const fields = { ...pause, detail: capDetail(pause.detail, 3 * DETAIL_LIMIT) };
     const before = await pauseRow(ctx, workflowId);
     if (before) {
-      // Fields left out (a step, the last attempt's error) are cleared.
-      await ctx.db.patch('pauses', before._id, {
-        ...fields,
-        step: fields.step,
-        stepId: fields.stepId,
-        lastError: undefined,
-        pausedRuns: before.pausedRuns + 1,
-      });
-      const notify = before.reason !== pause.reason || before.step !== pause.step || before.detail !== fields.detail;
-      return { notify, attempts: before.attempts, previousReason: before.reason };
+      // A step left out is cleared, and so is the last attempt's error.
+      await ctx.db.patch('pauses', before._id, { ...pause, step: pause.step, lastError: undefined, pausedRuns: before.pausedRuns + 1 });
+      const notify = before.reason !== pause.reason || before.step !== pause.step || before.detail !== pause.detail;
+      return { notify, attempts: before.attempts };
     }
-    const at = Date.now();
-    const nextAttemptAt = at + backoff(1);
-    await ctx.db.insert('pauses', { workflowId, ...fields, at, attempts: 1, nextAttemptAt, pausedRuns: 1 });
+    const nextAttemptAt = Date.now() + backoff(1);
+    await ctx.db.insert('pauses', { workflowId, ...pause, attempts: 1, nextAttemptAt, pausedRuns: 1 });
     await ctx.scheduler.runAt(nextAttemptAt, api.runs.retry, { workflowId });
     return { notify: true, attempts: 1 };
   },
 });
 
-/**
- * A scheduled retry of a paused run. It's write-ahead: it counts the attempt,
- * records `UNFINISHED` as `lastError`, schedules the next retry with backoff,
- * and then schedules `attempt`, which calls the workflow mutation in a
- * transaction of its own. So an attempt that dies, even on a Convex limit,
- * leaves the next retry scheduled. Does nothing for a run that isn't paused,
- * or whose next attempt isn't due: a retry left over from an earlier pause.
- */
+/** A scheduled retry: counts the attempt and schedules the next retry before it schedules `attempt`, if the run is paused and the retry is due. */
 export const retry = mutation({
   args: { workflowId: v.string() },
   returns: v.null(),
@@ -171,12 +144,7 @@ export const retry = mutation({
   },
 });
 
-/**
- * The attempt a retry started: calls the paused run's workflow mutation. If
- * it pauses again, the pause clears `lastError`; if the workflow mutation
- * throws, the error is `lastError`. Does nothing if the run isn't paused any
- * more, or a later attempt started.
- */
+/** The attempt a retry started: calls the run's workflow mutation, recording an error it throws as `lastError`, unless the run's pause ended or a later attempt started. */
 export const attempt = mutation({
   args: { workflowId: v.string(), attempts: v.number() },
   returns: v.null(),
@@ -186,20 +154,14 @@ export const attempt = mutation({
     try {
       await callHandle(ctx, paused);
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      console.warn(`Retrying paused workflow ${workflowId}: its workflow mutation threw, so it stays paused until the next retry: ${message}`);
-      await ctx.db.patch('pauses', paused._id, { lastError: capDetail(`The workflow mutation threw: ${message}`) });
+      console.warn(`Retrying paused workflow ${workflowId}: its workflow mutation threw, so it stays paused until the next retry: ${message(error)}`);
+      await ctx.db.patch('pauses', paused._id, { lastError: capDetail(`The workflow mutation threw: ${message(error)}`) });
     }
     return null;
   },
 });
 
-/**
- * For `WorkflowManager.resume`: calls a paused run's workflow mutation now, in
- * this transaction, so its errors reach the caller. It doesn't count an
- * attempt, and leaves the scheduled retry as it was. Throws if the run isn't
- * paused. Returns whether the run replayed past its pause (`callHandle`).
- */
+/** For `WorkflowManager.resume`: calls a paused run's workflow mutation now, in this transaction, and returns whether it replayed past its pause. */
 export const resume = mutation({
   args: { workflowId: v.string() },
   returns: v.boolean(),
@@ -230,13 +192,13 @@ export const list = query({
     const rows = workflow === undefined ? ctx.db.query('pauses') : ctx.db.query('pauses').withIndex('workflow', (q) => q.eq('workflow', workflow));
     const { page, isDone, continueCursor } = await rows.paginate(paginationOpts);
     const runs = page.map((paused) => {
-      const { workflowId, workflow, reason, detail, step, at, attempts, nextAttemptAt, lastError } = paused;
+      const { workflowId, workflow, reason, detail, step, attempts, nextAttemptAt, lastError } = paused;
       return {
         workflowId,
         workflow,
         reason,
         detail,
-        at,
+        at: paused._creationTime,
         attempts,
         nextAttemptAt,
         ...(step === undefined ? {} : { step }),

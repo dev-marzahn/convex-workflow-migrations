@@ -479,7 +479,7 @@ test('a retry is write-ahead: an attempt whose workflow mutation throws, or that
   expect(await status(t, id)).toEqual(completed);
 });
 
-test('onPause is called again when the reason, the step or the detail changes, with the attempts and the reason before; one that throws is logged', async () => {
+test('onPause is called again when the reason, the step or the detail changes, with the attempts; one that throws is logged', async () => {
   const t = setup();
   const id = await start(t);
   deploy('unguarded');
@@ -490,7 +490,7 @@ test('onPause is called again when the reason, the step or the detail changes, w
   expect(logged.mock.calls.some((args) => args.join(' ').includes(`onPause threw for workflow ${id}`))).toBe(true);
   logged.mockRestore();
   expect(await resume(t, id)).toBe(false); // the same pause again: no alert
-  expect(pauses.map((p) => [p.reason, p.step, p.attempts, p.previousReason])).toEqual([['mismatch', 1, 1, undefined]]);
+  expect(pauses.map((p) => [p.reason, p.step, p.attempts])).toEqual([['mismatch', 1, 1]]);
   deploy('hugeArgs'); // another step
   await resume(t, id);
   deploy('badStandIn'); // another reason and step
@@ -500,12 +500,12 @@ test('onPause is called again when the reason, the step or the detail changes, w
   deploy('brokenOtherwise'); // the same reason, no step, another detail
   await resume(t, id);
   await resume(t, id); // the same detail again: no alert
-  expect(pauses.map((p) => [p.reason, p.step, p.attempts, p.previousReason])).toEqual([
-    ['mismatch', 1, 1, undefined],
-    ['mismatch', 0, 1, 'mismatch'],
-    ['threw', undefined, 1, 'mismatch'],
-    ['migration', undefined, 1, 'threw'],
-    ['migration', undefined, 1, 'migration'],
+  expect(pauses.map((p) => [p.reason, p.step, p.attempts])).toEqual([
+    ['mismatch', 1, 1],
+    ['mismatch', 0, 1],
+    ['threw', undefined, 1],
+    ['migration', undefined, 1],
+    ['migration', undefined, 1],
   ]);
   expect(pauses.slice(-2).map((p) => p.detail)).toEqual(['Migration "broken" threw: oops', 'Migration "broken" threw: still broken']);
   expect(await status(t, id)).toMatchObject({ type: 'inProgress' });
@@ -619,7 +619,7 @@ test('the record and pause of a paused run whose workflow is gone are deleted at
   await settle(t, 73_000);
   expect([await record(t, gone), await paused(t, gone)]).toEqual([null, undefined]);
   expect(await paused(t, kept)).toMatchObject({ attempts: 2 });
-  // A workflow that is gone and has no record still fails as upstream's does.
+  // Called directly, the workflow mutation of a gone workflow still fails as upstream's does.
   const retryGone = { workflowId: gone, generationNumber: 0 } as unknown as { args: Record<string, unknown> };
   await expect(t.mutation(flows.pipeline as Ref, retryGone)).rejects.toThrow('Workflow not found');
 });

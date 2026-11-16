@@ -55,13 +55,14 @@ export const vPausedRun = v.object({
   reason: vPauseReason,
   detail: v.string(),
   step: v.optional(v.number()),
+  // When the run first paused: its pause row's `_creationTime`.
   at: v.number(),
   attempts: v.number(),
   nextAttemptAt: v.number(),
   lastError: v.optional(v.string()),
 });
 
-/** The longest pause detail, in characters. A mismatch's call and step are each cut to this. */
+/** The longest part of a pause detail, in characters: a mismatch's call and step, or an attempt's `lastError`. */
 export const DETAIL_LIMIT = 8192;
 
 /** `text`, cut to `limit` characters with an ellipsis, never inside a surrogate pair. */
@@ -73,20 +74,12 @@ export function capDetail(text: string, limit = DETAIL_LIMIT): string {
   return `${text.slice(0, end)}…`;
 }
 
-/** Whether `error` is upstream's for a workflow that doesn't exist, as its `journal.load` throws it. */
-export function isWorkflowNotFound(error: unknown, workflowId: string): boolean {
-  return (error instanceof Error ? error.message : String(error)).includes(`Workflow not found: ${workflowId}`);
-}
-
 export default defineSchema({
   runs: defineTable({ workflowId: v.string(), ...vRecord.fields }).index('workflowId', ['workflowId']),
   // One row per paused run, written by its pause and deleted when the pause
   // ends. Kept apart from `runs`, so listing and retrying never read an overlay.
   pauses: defineTable({
-    ...vPausedRun.fields,
-    // The id of the step at `step`, and how many migration ids were applied: where the run paused.
-    stepId: v.optional(v.string()),
-    appliedCount: v.number(),
+    ...vPausedRun.omit('at').fields,
     // How many handler runs paused the run: a retry compares it to tell one that paused again from one that didn't replay.
     pausedRuns: v.number(),
     // What a retry calls: the workflow mutation's function handle, with the generation the run paused at.

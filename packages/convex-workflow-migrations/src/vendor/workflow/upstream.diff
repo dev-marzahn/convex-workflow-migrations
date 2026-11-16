@@ -212,7 +212,7 @@
  import type {
 --- upstream/workflowMutation.ts
 +++ vendor/workflowMutation.ts
-@@ -16,20 +16,30 @@
+@@ -16,20 +16,29 @@
    type PropertyValidators,
    type Validator,
  } from "convex/values";
@@ -239,7 +239,6 @@
  } from "./types.js";
  import { createWorkflowCtx } from "./workflowContext.js";
 +import {
-+  loadJournal,
 +  loadRecord,
 +  recordStart,
 +  type WorkflowMigrations,
@@ -248,7 +247,7 @@
  
  export type WorkflowArgs<V extends PropertyValidators, Context = unknown> = {
    /**
-@@ -108,6 +118,8 @@
+@@ -108,6 +117,8 @@
    ReturnsValidator extends Validator<any, "required", any> | void,
  >(
    component: WorkflowComponent,
@@ -257,7 +256,7 @@
    registered: WorkflowDefinition<ArgsValidator, ReturnsValidator> & {
      handler: WorkflowHandler<ArgsValidator, ReturnsValidator>;
    },
-@@ -175,6 +187,8 @@
+@@ -175,6 +186,8 @@
            startAsync: args.startAsync ?? undefined,
            createOnly: !args.startAsync, // either start async or run inline here
          })) as WorkflowId;
@@ -266,23 +265,7 @@
          if (args.startAsync) {
            return workflowId;
          }
-@@ -184,10 +198,11 @@
-         generationNumber = args.generationNumber;
-       }
- 
--      const { workflow, logLevel, journalEntries, ok } = await ctx.runQuery(
--        component.journal.load,
--        { workflowId, shortCircuit: true },
--      );
-+      // PATCHES: a paused run whose workflow is gone, like a child its
-+      // parent's cleanup deleted, loses its record (src/migrations.ts).
-+      const loaded = await loadJournal(ctx, component, migrations, workflowId);
-+      if (!loaded) return workflowId;
-+      const { workflow, logLevel, journalEntries, ok } = loaded;
-       const inProgress = journalEntries.filter(({ step }) => step.inProgress);
-       const console = createLogger(logLevel);
-       if (!ok) {
-@@ -205,7 +220,9 @@
+@@ -205,7 +218,9 @@
          );
          return workflowId;
        }
@@ -293,7 +276,7 @@
          console.log(`Workflow ${workflowId} completed, returning.`);
          return workflowId;
        }
-@@ -224,6 +241,13 @@
+@@ -224,6 +239,13 @@
            `Assertion failed: not blocked but have in-progress journal entry`,
          );
        }
@@ -307,7 +290,7 @@
        const channel = new BaseChannel<StepRequest>(
          workpoolOptions.maxParallelism ?? 10,
        );
-@@ -237,55 +261,28 @@
+@@ -237,55 +259,28 @@
          channel,
          Date.now(),
          workpoolOptions,
@@ -379,7 +362,7 @@
          switch (result.type) {
            case "handlerDone": {
              await ctx.runMutation(component.workflow.complete, {
-@@ -305,6 +302,10 @@
+@@ -305,6 +300,10 @@
          }
        } finally {
          restoreEnvironment();

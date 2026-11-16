@@ -34,7 +34,6 @@ import {
 } from "./types.js";
 import { createWorkflowCtx } from "./workflowContext.js";
 import {
-  loadJournal,
   loadRecord,
   recordStart,
   type WorkflowMigrations,
@@ -198,11 +197,10 @@ export function workflowMutation<
         generationNumber = args.generationNumber;
       }
 
-      // PATCHES: a paused run whose workflow is gone, like a child its
-      // parent's cleanup deleted, loses its record (src/migrations.ts).
-      const loaded = await loadJournal(ctx, component, migrations, workflowId);
-      if (!loaded) return workflowId;
-      const { workflow, logLevel, journalEntries, ok } = loaded;
+      const { workflow, logLevel, journalEntries, ok } = await ctx.runQuery(
+        component.journal.load,
+        { workflowId, shortCircuit: true },
+      );
       const inProgress = journalEntries.filter(({ step }) => step.inProgress);
       const console = createLogger(logLevel);
       if (!ok) {

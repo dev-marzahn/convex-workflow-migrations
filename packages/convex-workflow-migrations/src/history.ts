@@ -251,11 +251,6 @@ export class HistoryView implements History {
     return this.nodes.length;
   }
 
-  /** The id of the step at `position`, or undefined past the end. */
-  public idAt(position: number): string | undefined {
-    return this.nodes[position]?.id;
-  }
-
   /** Whether the step at `position` or a later one is a journal entry. */
   public recordedFrom(position: number): boolean {
     return this.nodes.slice(position).some((node) => node.recorded);

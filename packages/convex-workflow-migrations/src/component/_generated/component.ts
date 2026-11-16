@@ -34,7 +34,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
       cleanup: FunctionReference<
         "mutation",
         "internal",
-        { keepPause?: boolean; workflowId: string },
+        { workflowId: string },
         boolean,
         Name
       >;
@@ -127,7 +127,6 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         "mutation",
         "internal",
         {
-          appliedCount: number;
           detail: string;
           generationNumber: number;
           handle: string;
@@ -139,21 +138,10 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
             | "migrations"
             | "record";
           step?: number;
-          stepId?: string;
           workflow: string;
           workflowId: string;
         },
-        {
-          attempts: number;
-          notify: boolean;
-          previousReason?:
-            | "mismatch"
-            | "args"
-            | "threw"
-            | "migration"
-            | "migrations"
-            | "record";
-        },
+        { attempts: number; notify: boolean },
         Name
       >;
       resume: FunctionReference<
