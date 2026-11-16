@@ -34,17 +34,38 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
       list: FunctionReference<
         "query",
         "internal",
-        { limit?: number },
-        Array<{
-          at: number;
-          attempts: number;
-          detail: string;
-          nextAttemptAt: number;
-          reason: "mismatch" | "migration" | "migrations" | "error";
-          step?: number;
-          workflow: string;
-          workflowId: string;
-        }>,
+        {
+          paginationOpts?: {
+            cursor: string | null;
+            endCursor?: string | null;
+            id?: number;
+            maximumBytesRead?: number;
+            maximumRowsRead?: number;
+            numItems: number;
+          };
+          workflow?: string;
+        },
+        {
+          continueCursor: string;
+          isDone: boolean;
+          page: Array<{
+            at: number;
+            attempts: number;
+            detail: string;
+            nextAttemptAt: number;
+            reason:
+              | "mismatch"
+              | "args"
+              | "threw"
+              | "migration"
+              | "migrations"
+              | "overlay"
+              | "error";
+            step?: number;
+            workflow: string;
+            workflowId: string;
+          }>;
+        },
         Name
       >;
       load: FunctionReference<
@@ -53,6 +74,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         { workflowId: string },
         {
           applied: Array<string>;
+          format?: number;
           overlay: Array<
             | {
                 anchor: string;
@@ -65,7 +87,15 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
                 where: "after" | "before";
               }
             | { op: "remove"; target: string }
-            | { args?: any; name?: string; op: "rewrite"; target: string }
+            | { from: string; op: "truncate"; through: string }
+            | {
+                args?: any;
+                name?: string;
+                op: "rewrite";
+                result?: any;
+                target: string;
+              }
+            | { args: any; op: "workflowArgs" }
           >;
           paused?: {
             at: number;
@@ -74,7 +104,14 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
             generationNumber: number;
             handle: string;
             nextAttemptAt: number;
-            reason: "mismatch" | "migration" | "migrations" | "error";
+            reason:
+              | "mismatch"
+              | "args"
+              | "threw"
+              | "migration"
+              | "migrations"
+              | "overlay"
+              | "error";
             step?: number;
           };
           restart?: number;
@@ -89,7 +126,14 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           detail: string;
           generationNumber: number;
           handle: string;
-          reason: "mismatch" | "migration" | "migrations" | "error";
+          reason:
+            | "mismatch"
+            | "args"
+            | "threw"
+            | "migration"
+            | "migrations"
+            | "overlay"
+            | "error";
           step?: number;
           workflow: string;
           workflowId: string;
@@ -97,10 +141,22 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         { first: boolean },
         Name
       >;
+      resumeAll: FunctionReference<
+        "mutation",
+        "internal",
+        { cursor?: string | null; workflow?: string },
+        null,
+        Name
+      >;
       retry: FunctionReference<
         "mutation",
         "internal",
-        { now?: boolean; restartFrom?: number; workflowId: string },
+        {
+          due?: boolean;
+          now?: boolean;
+          restartFrom?: number;
+          workflowId: string;
+        },
         boolean,
         Name
       >;
@@ -121,7 +177,15 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
                 where: "after" | "before";
               }
             | { op: "remove"; target: string }
-            | { args?: any; name?: string; op: "rewrite"; target: string }
+            | { from: string; op: "truncate"; through: string }
+            | {
+                args?: any;
+                name?: string;
+                op: "rewrite";
+                result?: any;
+                target: string;
+              }
+            | { args: any; op: "workflowArgs" }
           >;
           workflow: string;
           workflowId: string;

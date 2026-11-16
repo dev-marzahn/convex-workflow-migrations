@@ -27,16 +27,31 @@ export const vOverlayOp = v.union(
     result: v.any(),
   }),
   v.object({ op: v.literal('remove'), target: v.string() }),
-  // What the current code calls instead: the step ran with its recorded name and args.
-  v.object({ op: v.literal('rewrite'), target: v.string(), name: v.optional(v.string()), args: v.optional(v.any()) }),
+  // Removes the journal entries from `from` through `through`, in journal
+  // order: what `restartFrom` drops. Entries recorded later stay.
+  v.object({ op: v.literal('truncate'), from: v.string(), through: v.string() }),
+  // What the current code calls instead, and the result replay gives the
+  // call: the step ran with its recorded name and args, and returned its
+  // recorded result.
+  v.object({ op: v.literal('rewrite'), target: v.string(), name: v.optional(v.string()), args: v.optional(v.any()), result: v.optional(v.any()) }),
+  // The workflow's args as the current code expects them. The run keeps its own.
+  v.object({ op: v.literal('workflowArgs'), args: v.any() }),
 );
 
-export const vPauseReason = v.union(v.literal('mismatch'), v.literal('migration'), v.literal('migrations'), v.literal('error'));
+export const vPauseReason = v.union(
+  v.literal('mismatch'),
+  v.literal('args'),
+  v.literal('threw'),
+  v.literal('migration'),
+  v.literal('migrations'),
+  v.literal('overlay'),
+  v.literal('error'),
+);
 
 export const vPaused = v.object({
   reason: vPauseReason,
   detail: v.string(),
-  // For a mismatch: the position in the history where replay stopped matching.
+  // For a mismatch or a throw: the position in the history where replay stopped matching.
   step: v.optional(v.number()),
   // When the run first paused, and how many attempts have paused it since.
   at: v.number(),
@@ -47,6 +62,9 @@ export const vPaused = v.object({
   handle: v.string(),
   generationNumber: v.number(),
 });
+
+/** The format of the rows this version writes. A row with a higher one is from a newer version. */
+export const FORMAT = 1;
 
 export default defineSchema({
   runs: defineTable({
@@ -60,7 +78,10 @@ export default defineSchema({
     // Set by `restartFrom` for the handler run it starts: remove every step
     // from this position of the migrated history on.
     restart: v.optional(v.number()),
+    // FORMAT when this version wrote the row; missing means 1.
+    format: v.optional(v.number()),
   })
     .index('workflowId', ['workflowId'])
-    .index('paused', ['paused.nextAttemptAt']),
+    .index('paused', ['paused.nextAttemptAt'])
+    .index('workflowPaused', ['workflow', 'paused.nextAttemptAt']),
 });

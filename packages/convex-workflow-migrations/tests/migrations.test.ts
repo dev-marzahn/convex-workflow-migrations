@@ -28,7 +28,7 @@ const manager = new WorkflowManager(components.workflow, {
   },
 });
 
-type Ref = FunctionReference<'mutation', 'internal', { args: Record<string, never> }, WorkflowId>;
+type Ref = FunctionReference<'mutation', 'internal', { args: Record<string, unknown> }, WorkflowId>;
 const flows = anyApi.flows!;
 const pipeline = flows.pipeline as Ref;
 
@@ -49,6 +49,11 @@ const m2 = migration('import-gets-notified-at', (h) =>
   h.updateArgs(flows.importFiles, (args) => ({ ...args, notifiedAt: (h.result(flows.notify) as { at: number | null } | undefined)?.at ?? null })),
 );
 const m3 = migration('prepare-becomes-transcode', (h) => h.rename(flows.prepare, flows.transcode));
+// A stand-in of the wrong shape for release 2's handler, which reads `at`, and the migration that fixes its result.
+const badStandIn = migration('notify-after-grab', (h) => h.insertAfter(flows.grab, flows.notify, { result: null }));
+const fixStandIn = migration('notify-result-has-at', (h) => h.updateResult(flows.notify, () => ({ at: null })));
+// Release 0 plus a required `channel` arg, which publish gets.
+const channelArg = migration('channel-arg', (h) => h.updateWorkflowArgs((args) => ({ ...args, channel: 'default' })));
 
 type Shape = { notify?: boolean; notifiedAt?: boolean; transcode?: boolean };
 function release(shape: Shape, migrations: Migration[]) {
@@ -62,6 +67,19 @@ function release(shape: Shape, migrations: Migration[]) {
       await step.runMutation(flows.importFiles, shape.notifiedAt ? { notifiedAt: notified!.at } : {});
       await step.runMutation(shape.transcode ? flows.transcode : flows.prepare, {});
       await step.runMutation(flows.publish, {});
+    },
+  });
+}
+function withChannel(migrations: Migration[]) {
+  return manager.define({
+    args: { channel: v.string() },
+    migrations,
+    handler: async (step: WorkflowCtx, { channel }): Promise<void> => {
+      await step.runMutation(flows.grab, {});
+      await step.awaitEvent({ name: 'downloadDone' });
+      await step.runMutation(flows.importFiles, {});
+      await step.runMutation(flows.prepare, {});
+      await step.runMutation(flows.publish, { channel });
     },
   });
 }
@@ -79,6 +97,30 @@ const releases = {
       throw new Error('oops');
     }),
   ]),
+  badStandIn: release({ notify: true, notifiedAt: true }, [badStandIn]),
+  fixedStandIn: release({ notify: true, notifiedAt: true }, [badStandIn, fixStandIn]),
+  channelUnguarded: withChannel([]),
+  channel: withChannel([channelArg]),
+  // Code that stops after grab: shorter than the histories of runs past it.
+  short: manager.define({
+    args: {},
+    handler: async (step: WorkflowCtx): Promise<void> => {
+      await step.runMutation(flows.grab, {});
+    },
+  }),
+  // After the wait, a step that fails: the run fails, as before.
+  failing: manager.define({
+    args: {},
+    handler: async (step: WorkflowCtx): Promise<void> => {
+      await step.runMutation(flows.grab, {});
+      await step.awaitEvent({ name: 'downloadDone' });
+      await step.runMutation(flows.boom, {});
+    },
+  }),
+  // A stand-in too big to store.
+  huge: release({ notify: true }, [
+    migration('huge-stand-in', (h) => h.insertAfter(flows.grab, flows.notify, { result: { at: null, padding: 'x'.repeat(600_000) } })),
+  ]),
 };
 
 const functions: Record<string, unknown> = {
@@ -88,6 +130,11 @@ const functions: Record<string, unknown> = {
   prepare: stepFn('prepare'),
   transcode: stepFn('transcode'),
   publish: stepFn('publish'),
+  boom: internalMutationGeneric({
+    handler: async () => {
+      throw new Error('the download is corrupt');
+    },
+  }),
   onComplete: internalMutationGeneric({
     args: { workflowId: v.string(), result: v.any(), context: v.any() },
     handler: async (_ctx, { workflowId, result }) => void completions.push({ workflowId, result }),
@@ -114,8 +161,8 @@ async function settle(t: T, ms = 30_000) {
   }
   await t.finishInProgressScheduledFunctions();
 }
-async function start(t: T) {
-  const id = await t.run((ctx) => manager.start(ctx, pipeline, {}, { onComplete: flows.onComplete, context: null }));
+async function start(t: T, args: Record<string, unknown> = {}) {
+  const id = await t.run((ctx) => manager.start(ctx, pipeline, args, { onComplete: flows.onComplete, context: null }));
   await settle(t);
   return id;
 }
@@ -126,7 +173,7 @@ async function downloadDone(t: T, workflowId: WorkflowId) {
 const completed = { type: 'completed', result: null };
 const status = (t: T, workflowId: WorkflowId) => t.run((ctx) => manager.status(ctx, workflowId));
 const record = (t: T, workflowId: WorkflowId) => t.run((ctx) => ctx.runQuery(components.workflowMigrations.runs.load, { workflowId }));
-const paused = async (t: T, workflowId: WorkflowId) => (await t.run((ctx) => manager.paused(ctx))).find((run) => run.workflowId === workflowId);
+const paused = async (t: T, workflowId: WorkflowId) => (await t.run((ctx) => manager.paused(ctx))).page.find((run) => run.workflowId === workflowId);
 const steps = (t: T, workflowId: WorkflowId) => t.run(async (ctx) => (await manager.listSteps(ctx, workflowId)).page.map((s) => s.name.replace('flows:', '')));
 
 beforeEach(() => {
@@ -175,6 +222,7 @@ test('a new run starts with every migration applied and never migrates', async (
     workflow: 'flows:pipeline',
     applied: ['notify-after-grab', 'import-gets-notified-at', 'prepare-becomes-transcode'],
     overlay: [],
+    format: 1,
   });
   await downloadDone(t, id);
   expect(ran).toEqual(['grab', 'notify', 'import {"notifiedAt":1234}', 'transcode', 'publish']);
@@ -223,6 +271,82 @@ test('a replay that does not match pauses the run instead of failing it, and ale
   expect(completions).toEqual([{ workflowId: id, result: { kind: 'success', returnValue: null } }]);
 });
 
+test("changed workflow args pause a run with history; updateWorkflowArgs resumes it; a new run's bad args still fail it", async () => {
+  const t = setup();
+  const id = await start(t);
+  deploy('channelUnguarded');
+  await downloadDone(t, id);
+  const run = await paused(t, id);
+  expect(run).toMatchObject({ reason: 'args' });
+  expect(run?.detail).toContain("The workflow's args don't match its args validator");
+  expect(completions).toEqual([]);
+
+  deploy('channel');
+  expect(await t.run((ctx) => manager.resume(ctx, id))).toBe(true);
+  await settle(t);
+  expect(await status(t, id)).toEqual(completed);
+  // The handler got the migrated args; the run keeps its own.
+  expect(ran).toEqual(['grab', 'import', 'prepare', 'publish {"channel":"default"}']);
+  expect((await record(t, id))?.overlay).toEqual([{ op: 'workflowArgs', args: { channel: 'default' } }]);
+  expect(await t.run(async (ctx) => (await ctx.runQuery(components.workflow.workflow.getStatus, { workflowId: id })).workflow.args)).toEqual({});
+
+  // A new run without the arg is refused when it starts, as upstream's is.
+  deploy('channelUnguarded');
+  await expect(start(t)).rejects.toThrow('Missing required field `channel`');
+});
+
+test('a stand-in result the handler throws on pauses the run; updateResult in a later migration resumes it', async () => {
+  const t = setup();
+  const id = await start(t);
+  deploy('badStandIn');
+  await downloadDone(t, id);
+  const run = await paused(t, id);
+  // It throws reading notify's `at` after the wait, the last recorded step: the migration that just applied is suspect.
+  expect(run).toMatchObject({ reason: 'threw' });
+  expect(run?.detail).toContain('The handler threw after migrations "notify-after-grab" changed its history: ');
+  expect(completions).toEqual([]);
+  expect(await steps(t, id)).toEqual(['grab', 'downloadDone']); // nothing new started
+
+  deploy('fixedStandIn');
+  expect(await t.run((ctx) => manager.resume(ctx, id))).toBe(true);
+  await settle(t);
+  expect(await status(t, id)).toEqual(completed);
+  expect(ran).toEqual(['grab', 'import {"notifiedAt":null}', 'prepare', 'publish']);
+});
+
+test('a handler that returns before the end of its history pauses the run', async () => {
+  const t = setup();
+  const id = await start(t);
+  deploy('short');
+  await downloadDone(t, id);
+  const run = await paused(t, id);
+  expect(run).toMatchObject({ reason: 'mismatch', step: 1 });
+  expect(run?.detail).toBe('Journal entry mismatch at step 1: the code returned before it, the history has {"args":{},"kind":"event","name":"downloadDone"}');
+  expect(await status(t, id)).toMatchObject({ type: 'inProgress' });
+});
+
+test("a step's failure after the history fails the run, as before", async () => {
+  const t = setup();
+  const id = await start(t);
+  deploy('failing');
+  await downloadDone(t, id);
+  const result = await status(t, id);
+  expect(result.type === 'failed' && result.error).toContain('the download is corrupt');
+  expect(completions.map((c) => c.result.kind)).toEqual(['failed']);
+  expect(await paused(t, id)).toBeUndefined();
+});
+
+test('an overlay over the size limit pauses the run, naming the migration, and saves nothing', async () => {
+  const t = setup();
+  const id = await start(t);
+  deploy('huge');
+  await downloadDone(t, id);
+  const run = await paused(t, id);
+  expect(run).toMatchObject({ reason: 'overlay' });
+  expect(run?.detail).toMatch(/^The run's overlay would be \d+ KiB, over the 512 KiB limit\. Migration "huge-stand-in" added the most, \d+ KiB\.$/);
+  expect((await record(t, id))?.overlay).toEqual([]);
+});
+
 test('a retry whose workflow mutation throws counts as another failed attempt', async () => {
   const t = setup();
   const id = await start(t);
@@ -255,9 +379,10 @@ test('an onPause that throws is logged, and the run stays paused', async () => {
   expect(await status(t, id)).toMatchObject({ type: 'inProgress' });
 });
 
-test('resume retries now, and says whether the run got past its pause', async () => {
+test('resume retries now, says whether the run got past its pause, and throws for a run that is not paused', async () => {
   const t = setup();
   const id = await start(t);
+  await expect(t.run((ctx) => manager.resume(ctx, id))).rejects.toThrow(`resume: workflow ${id} isn't paused.`);
   deploy('unguarded');
   await downloadDone(t, id);
   expect(await t.run((ctx) => manager.resume(ctx, id))).toBe(false);
@@ -269,6 +394,30 @@ test('resume retries now, and says whether the run got past its pause', async ()
   // The retry the pause scheduled finds nothing to do.
   await settle(t, 700_000);
   expect(ran).toEqual(['grab', 'import', 'prepare', 'publish']);
+});
+
+test('resumeAll retries every paused run of a workflow now; paused() pages and filters', async () => {
+  const t = setup();
+  const ids = [await start(t), await start(t)];
+  deploy('unguarded');
+  for (const workflowId of ids) await t.run((ctx) => manager.sendEvent(ctx, { workflowId, name: 'downloadDone' }));
+  await settle(t, 10_000);
+  const first = await t.run((ctx) => manager.paused(ctx, { numItems: 1 }));
+  expect(first.page).toHaveLength(1);
+  expect(first.isDone).toBe(false);
+  const second = await t.run((ctx) => manager.paused(ctx, { numItems: 1, cursor: first.continueCursor }));
+  expect([...first.page, ...second.page].map((run) => run.workflowId).sort()).toEqual([...ids].sort());
+  expect((await t.run((ctx) => manager.paused(ctx, { workflow: 'flows:other' }))).page).toEqual([]);
+  expect((await t.run((ctx) => manager.paused(ctx, { workflow: 'flows:pipeline' }))).page).toHaveLength(2);
+
+  deploy('r1');
+  await t.run((ctx) => manager.resumeAll(ctx, { workflow: 'flows:other' }));
+  await settle(t, 1_000);
+  expect((await t.run((ctx) => manager.paused(ctx))).page).toHaveLength(2);
+  await t.run((ctx) => manager.resumeAll(ctx, { workflow: 'flows:pipeline' }));
+  await settle(t, 10_000); // well before the next scheduled retry, a minute after the pause
+  for (const id of ids) expect(await status(t, id)).toEqual(completed);
+  expect((await t.run((ctx) => manager.paused(ctx))).page).toEqual([]);
 });
 
 test('a migration that throws pauses the run', async () => {
@@ -307,7 +456,7 @@ test('a migration list with an id removed or reordered pauses the run', async ()
   expect(await paused(t, id)).toMatchObject({ reason: 'migrations' });
 });
 
-test('restartFrom drops the history from a step on, and those steps run again', async () => {
+test('restartFrom drops the history from a step on, in one operation, and those steps run again', async () => {
   const t = setup();
   const id = await start(t);
   deploy('unguarded');
@@ -321,11 +470,15 @@ test('restartFrom drops the history from a step on, and those steps run again', 
   await settle(t);
   expect(await paused(t, id)).toBeUndefined();
   expect(ran).toEqual(['grab', 'notify']);
+  expect((await record(t, id))?.overlay.map((op) => op.op)).toEqual(['truncate']);
   expect(await status(t, id)).toMatchObject({ type: 'inProgress' }); // waiting for the download again
   await downloadDone(t, id);
   expect(await status(t, id)).toEqual(completed);
   expect(ran).toEqual(['grab', 'notify', 'import', 'prepare', 'publish']);
+  // The old wait stays in upstream's journal, hidden; the new steps come after it.
+  expect(await steps(t, id)).toEqual(['grab', 'downloadDone', 'notify', 'downloadDone', 'importFiles', 'prepare', 'publish']);
   expect(pauses).toHaveLength(1);
+  await expect(t.run((ctx) => manager.restartFrom(ctx, id, 0))).rejects.toThrow('restartFrom: workflow');
 });
 
 test('fail completes a paused run as failed, and onComplete runs', async () => {
@@ -356,27 +509,48 @@ test('cancel ends a paused run and its pause', async () => {
   expect(completions.map((c) => c.result.kind)).toEqual(['canceled']);
 });
 
-test("upstream's restart drops the edits of deleted steps and keeps the applied ids", async () => {
+test('restart takes a position in the migrated history, and steps from there run again, stand-ins included', async () => {
   const t = setup();
   const id = await start(t);
   deploy('r3');
   await downloadDone(t, id);
-  expect((await record(t, id))?.overlay).toHaveLength(1); // notify's stand-in, after grab
+  // grab, notify (a stand-in), downloadDone, importFiles, transcode, publish
+  expect((await record(t, id))?.overlay).toHaveLength(1);
+  await expect(t.run((ctx) => manager.restart(ctx, id, { from: 'nothing' }))).rejects.toThrow('has no step "nothing"');
 
   ran.length = 0;
-  await t.run((ctx) => manager.restart(ctx, id, { from: 1 })); // keeps grab, so the stand-in stays
+  await t.run((ctx) => manager.restart(ctx, id, { from: 2 })); // the wait: grab and the stand-in stay
   await settle(t);
-  expect(ran).toEqual([]); // grab and notify replay; the wait starts again
+  expect(ran).toEqual([]);
   await downloadDone(t, id);
   expect(ran).toEqual(['import {"notifiedAt":null}', 'transcode', 'publish']);
 
   ran.length = 0;
-  await t.run((ctx) => manager.restart(ctx, id, { from: 0 })); // deletes grab, so the stand-in goes
+  await t.run((ctx) => manager.restart(ctx, id, { from: 1 })); // the stand-in: notify runs for real now
   await settle(t);
-  expect(ran).toEqual(['grab', 'notify']);
-  const saved = await record(t, id);
-  expect(saved?.overlay).toEqual([]);
-  expect(saved?.applied).toHaveLength(3);
+  expect(ran).toEqual(['notify']);
+  expect((await record(t, id))?.overlay).toEqual([]);
+  await downloadDone(t, id);
+  expect(ran).toEqual(['notify', 'import {"notifiedAt":1234}', 'transcode', 'publish']);
+  expect((await record(t, id))?.applied).toHaveLength(3);
+
+  ran.length = 0;
+  await t.run((ctx) => manager.restart(ctx, id, { from: flows.transcode })); // its last call, by reference
+  await settle(t);
+  expect(ran).toEqual(['transcode', 'publish']);
+  ran.length = 0;
+  await t.run((ctx) => manager.restart(ctx, id, { from: 'downloadDone' })); // by name
+  await settle(t);
+  expect(ran).toEqual([]);
+});
+
+test('restart throws for a running run, and points a paused one to restartFrom', async () => {
+  const t = setup();
+  const id = await start(t);
+  await expect(t.run((ctx) => manager.restart(ctx, id, { from: 0 }))).rejects.toThrow(`restart: workflow ${id} is still running.`);
+  deploy('unguarded');
+  await downloadDone(t, id);
+  await expect(t.run((ctx) => manager.restart(ctx, id, { from: 0 }))).rejects.toThrow('It is paused: use restartFrom.');
 });
 
 test('cleanup deletes the run with its record', async () => {

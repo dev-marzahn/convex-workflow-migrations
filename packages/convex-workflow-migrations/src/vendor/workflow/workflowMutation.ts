@@ -33,7 +33,7 @@ import {
   type WorkflowMutationResult,
 } from "./types.js";
 import { createWorkflowCtx } from "./workflowContext.js";
-import { ReplayMismatch } from "../../history.js";
+import { ReplayPause } from "../../history.js";
 import { RunRecord, type WorkflowMigrations } from "../../migrations.js";
 import { replayRequest } from "../../testing.js";
 
@@ -250,6 +250,7 @@ export function workflowMutation<
         migrations,
         workflowId,
         journalEntries as JournalEntry[],
+        workflow.args,
       );
       if (run.blocked) {
         await run.pause(ctx, generationNumber, run.blocked, console);
@@ -276,19 +277,25 @@ export function workflowMutation<
         workflowId,
       );
       // PATCHES:
-      let mismatch: ReplayMismatch | undefined;
+      let paused: ReplayPause | undefined;
       try {
         const handlerWorker = async (): Promise<WorkerResult> => {
           let runResult: RunResult;
+          // PATCHES:
+          let validated = false;
           try {
+            // PATCHES: the args as the migrations left them.
             if (registered.args) {
-              validate(asObjectValidator(registered.args), workflow.args, {
+              validate(asObjectValidator(registered.args), run.args, {
                 throw: true,
                 db: ctx.db,
               });
             }
+            validated = true;
             const returnValue =
-              (await registered.handler(step, workflow.args)) ?? null;
+              (await registered.handler(step, run.args)) ?? null;
+            // PATCHES: returning before the end of the history pauses the run.
+            run.returned(executor.progress());
             runResult = { kind: "success", returnValue };
             if (registered.returns) {
               try {
@@ -311,6 +318,10 @@ export function workflowMutation<
               }
             }
           } catch (error) {
+            // PATCHES: rethrows to pause the run instead of failing it: on
+            // invalid args of a run with history, or a throw before the
+            // handler replayed its history (see threwEarly in history.ts).
+            run.threw(error, validated, executor.progress());
             const message = formatErrorWithStack(error);
             console.error(message);
             runResult = { kind: "failed", error: message };
@@ -327,8 +338,8 @@ export function workflowMutation<
         try {
           result = await Promise.race([handlerWorker(), executorWorker()]);
         } catch (error) {
-          if (!(error instanceof ReplayMismatch)) throw error;
-          mismatch = error;
+          if (!(error instanceof ReplayPause)) throw error;
+          paused = error;
           return workflowId;
         }
         // PATCHES: save what this handler run applied, in its transaction.
@@ -354,8 +365,8 @@ export function workflowMutation<
         restoreEnvironment();
         // PATCHES: outside the replay's deterministic Date and console. The
         // environment can only be restored once.
-        if (mismatch) {
-          await run.pause(ctx, generationNumber, mismatch, console);
+        if (paused) {
+          await run.pause(ctx, generationNumber, paused, console);
         }
       }
       return workflowId;

@@ -4,9 +4,10 @@ import type { TestConvex } from 'convex-test';
 import type { FunctionReference, GenericSchema, SchemaDefinition } from 'convex/server';
 
 import schema from './component/schema.ts';
-import type { History, HistoryStep, RecordedHistory, RecordedStep, RunResult, StepKind } from './history.ts';
+import type { History, HistoryStep, RecordedHistory, RecordedStep, StepKind } from './history.ts';
 import { openReplay, type ReplayOutcome } from './testing.ts';
 import { safeFunctionName } from './vendor/workflow/safeFunctionName.ts';
+import type { RunResult } from './vendor/workflow/types.ts';
 
 // Matches the sources when run from src/ and the build when run from dist/.
 const modules = import.meta.glob(['./component/**/*.{ts,js}', '!./component/**/*.d.ts']);
@@ -33,6 +34,9 @@ export type StepSpec =
   | ({ event: string } & Outcome)
   | { sleep: string; status?: 'done' | 'running' };
 
+/** Options of `history()`: the workflow's `args` (default `{}`), the migrations `applied` to the run, its `workflowId` for messages, and its `outcome` if it finished. */
+export type HistoryOptions = { args?: unknown; applied?: string[]; workflowId?: string; outcome?: RunResult['kind'] };
+
 /**
  * Builds a history by hand, as older code recorded it:
  *
@@ -40,15 +44,16 @@ export type StepSpec =
  * history([{ step: internal.pipeline.grab, args: { grabId }, result: null }, { event: 'downloadDone', status: 'running' }], { args: { grabId } });
  * ```
  *
- * `args` are the workflow's arguments. Without `applied`, every migration
- * applies to it, as to a run from before the first one.
+ * Steps get ids `h0`, `h1`, … and start times 0, 1, …. Without `applied`,
+ * every migration applies to it, as to a run from before the first one.
  */
-export function history(steps: readonly StepSpec[], options: { args?: unknown; applied?: string[]; workflowId?: string } = {}): RecordedHistory {
+export function history(steps: readonly StepSpec[], options: HistoryOptions = {}): RecordedHistory {
   return {
     ...(options.workflowId === undefined ? {} : { workflowId: options.workflowId }),
     args: options.args ?? {},
     steps: steps.map((spec, i) => recordedStep(spec, i)),
     ...(options.applied === undefined ? {} : { applied: options.applied }),
+    ...(options.outcome === undefined ? {} : { outcome: options.outcome }),
   };
 }
 
@@ -83,10 +88,13 @@ async function run(
 
 /**
  * Replays each history, with the workflow's migrations, against its current
- * handler, in convex-test. Runs no steps: replay stops where the history
- * ends or at a running step.
- * Throws if a history doesn't replay, with the history, the position, and the
- * call the code made and the step the history has there.
+ * handler, in convex-test, by the rules a handler run follows: a mismatch, an
+ * early return, a throw before the history is used up, and args that don't
+ * validate all fail. Runs no steps: replay stops where the history ends or at
+ * a running step. A throw after the history is used up passes, unless the
+ * history says the run succeeded. A truncated history fails. Throws if a
+ * history doesn't replay, with the history, the position, and the call the
+ * code made and the step the history has there.
  */
 export async function expectReplays(
   t: TestConvex<any>,
@@ -98,7 +106,7 @@ export async function expectReplays(
     const outcome = await run(t, workflow, recorded, true);
     if (outcome.ok) continue;
     const label = `history ${i}${recorded.workflowId ? ` (${recorded.workflowId})` : ''}`;
-    failures.push(`${label}: ${outcome.detail}\n  migrated history: ${summary(outcome.history.steps)}`);
+    failures.push(`${label} (${outcome.reason}): ${outcome.detail}\n  migrated history: ${summary(outcome.history.steps)}`);
   }
   if (failures.length > 0) {
     throw new Error(`${failures.length} of ${histories.length} histories don't replay on ${safeFunctionName(workflow)}:\n${failures.join('\n')}`);
@@ -110,6 +118,28 @@ export async function migrate(t: TestConvex<any>, workflow: FunctionReference<'m
   const outcome = await run(t, workflow, recorded, false);
   if (!outcome.ok) throw new Error(outcome.detail);
   return outcome.history;
+}
+
+/**
+ * Throws unless the migrations that `migrate()` applied each changed the
+ * history, or, with `ids`, unless those ones ran and did. Catches a migration
+ * that names a step by a name the history doesn't have, which does nothing:
+ *
+ * ```ts
+ * await expectEdits(migrate(t, internal.pipeline.run, release2Done), ['prepare-becomes-transcode']);
+ * ```
+ */
+export async function expectEdits(migrated: History | Promise<History>, ids?: readonly string[]): Promise<void> {
+  const history = await migrated;
+  const editsBy = (history as { editsBy?: () => ReadonlyMap<string, number> }).editsBy?.();
+  if (!editsBy) throw new Error('expectEdits takes the history migrate() returns.');
+  const problems = (ids ?? [...editsBy.keys()]).flatMap((id) => {
+    const edits = editsBy.get(id);
+    if (edits === undefined) return [`"${id}" didn't run: it isn't in the workflow's list, or the history has it applied already`];
+    return edits === 0 ? [`"${id}" changed nothing: the steps it names aren't in the history by those names`] : [];
+  });
+  if (ids === undefined && editsBy.size === 0) problems.push('no migration ran: the history has them all applied');
+  if (problems.length > 0) throw new Error(`Migrations didn't edit the history: ${problems.join('; ')}.\n  migrated history: ${summary(history.steps)}`);
 }
 
 export type { History, HistoryStep, RecordedHistory, RecordedStep } from './history.ts';

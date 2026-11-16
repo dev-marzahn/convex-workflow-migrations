@@ -1,14 +1,17 @@
 #!/usr/bin/env node
-// convex-workflow-migrations histories: exports a workflow's run histories from a
-// deployment as JSON, for expectReplays() in /test. Run it from the app's
-// directory; it reads through `convex run`.
+// convex-workflow-migrations histories: exports a workflow's run histories
+// from a deployment as JSON, for expectReplays() in /test. Run it from the
+// app's directory; it reads through `convex run`.
 import { spawnSync } from 'node:child_process';
 import { writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 
-import type { OverlayOp, RecordedHistory, RecordedStep, RunResult, StepKind } from './history.ts';
+import type { OverlayOp, RecordedHistory, RecordedStep, StepKind } from './history.ts';
+import { type Redact, redactHistory } from './redact.ts';
+import type { RunResult } from './vendor/workflow/types.ts';
 
 const USAGE = `Usage: convex-workflow-migrations histories <workflow> [options] [-- <convex options>]
 
@@ -17,17 +20,28 @@ finished ones, as JSON: the input for expectReplays() from
 @dev-marzahn/convex-workflow-migrations/test. <workflow> is the workflow's
 function name, like pipeline:run. Run it from your app's directory.
 
-  --recent <n>                 Finished runs to export too, newest first. Default: 10
-  --max-runs <n>               Runs to look through, newest first. Default: 1000
-  --max-steps <n>              Steps to export per run. A longer run is
-                               exported up to there, with "truncated": true.
-                               Default: 1000
-  --out <file>                 Write the JSON to <file> instead of stdout.
-  --workflow-component <name>  Where @convex-dev/workflow is mounted. Default: workflow
-  --migrations-component <name>   Where this package's component is mounted. Default: workflowMigrations
+The export holds production data: every run's args, and every step's args,
+result and error. Check it, or scrub it with --redact, before you commit it.
 
-Options after -- go to every \`convex\` command it runs, e.g. -- --prod.
+  --recent <n>                     Finished runs to export too, newest first. Default: 10
+  --max-runs <n>                   Runs to look through, newest first. Default: 1000
+  --max-steps <n>                  Steps to export per run, at least 1. A longer
+                                   run is exported up to there, with
+                                   "truncated": true. Default: 1000
+  --redact <module>                A module whose default export takes each step
+                                   and each run's args, { kind, name, args,
+                                   result?, error? }, and returns them scrubbed.
+                                   kind is "run" for a run's args.
+  --out <file>                     Write the JSON to <file> instead of stdout.
+  --workflow-component <name>      Where @convex-dev/workflow is mounted. Default: workflow
+  --migrations-component <name>    Where this package's component is mounted. Default: workflowMigrations
+
+Options after -- go to every \`convex\` command it runs, e.g. -- --prod. It
+runs two \`convex run\` commands per exported run, so it's slow for many runs.
 Exit codes: 0 exported, 2 usage or deployment error.`;
+
+const WARNING =
+  "The export holds production data: every run's args, and every step's args, result and error. Check it before you commit it, or scrub it with --redact.";
 
 class UsageError extends Error {}
 
@@ -69,7 +83,7 @@ function isDeployed(component: string, convexArgs: string[]): boolean {
 }
 
 type Page<T> = { page: T[]; isDone: boolean; continueCursor: string };
-type PublicWorkflow = { workflowId: string; name?: string; args: unknown; runResult?: unknown };
+type PublicWorkflow = { workflowId: string; name?: string; args: unknown; runResult?: RunResult };
 type WorkflowStep = { stepId: string; name: string; kind: StepKind; args: unknown; runResult?: RunResult; startedAt: number };
 type RunRecord = { applied: string[]; overlay: OverlayOp[] } | null;
 
@@ -79,7 +93,13 @@ const count = (value: string, option: string) => {
   return n;
 };
 
-function histories(argv: string[]): number {
+async function loadRedact(path: string): Promise<Redact> {
+  const module = (await import(pathToFileURL(resolve(path)).href)) as { default?: unknown };
+  if (typeof module.default !== 'function') throw new UsageError(`--redact ${path}: the module's default export must be a function.`);
+  return module.default as Redact;
+}
+
+async function histories(argv: string[]): Promise<number> {
   const split = argv.indexOf('--');
   const { values, positionals } = parseArgs({
     args: split < 0 ? argv : argv.slice(0, split),
@@ -88,6 +108,7 @@ function histories(argv: string[]): number {
       recent: { type: 'string', default: '10' },
       'max-runs': { type: 'string', default: '1000' },
       'max-steps': { type: 'string', default: '1000' },
+      redact: { type: 'string' },
       out: { type: 'string' },
       'workflow-component': { type: 'string', default: 'workflow' },
       'migrations-component': { type: 'string', default: 'workflowMigrations' },
@@ -103,6 +124,7 @@ function histories(argv: string[]): number {
   const recent = count(values.recent, 'recent');
   const maxRuns = count(values['max-runs'], 'max-runs');
   const maxSteps = Math.max(1, count(values['max-steps'], 'max-steps'));
+  const redact = values.redact === undefined ? undefined : await loadRedact(values.redact);
   const convexArgs = split < 0 ? [] : argv.slice(split + 1);
   const query = cliQuery(convexArgs);
   const workflowComponent = values['workflow-component'];
@@ -129,14 +151,16 @@ function histories(argv: string[]): number {
   }
 
   const records = isDeployed(migrationsComponent, convexArgs);
-  const exported = runs.map((run): RecordedHistory => {
+  const exported: RecordedHistory[] = [];
+  for (const run of runs) {
+    // Two `convex run`s per run: its steps, and its record.
     const steps: Page<WorkflowStep> = query(workflowComponent, 'workflow:listSteps', {
       workflowId: run.workflowId,
       order: 'asc',
       paginationOpts: { numItems: maxSteps, cursor: null },
     });
     const record: RunRecord = records ? query(migrationsComponent, 'runs:load', { workflowId: run.workflowId }) : null;
-    return {
+    const history: RecordedHistory = {
       workflowId: run.workflowId,
       workflow: name,
       args: run.args,
@@ -149,9 +173,11 @@ function histories(argv: string[]): number {
         startedAt: step.startedAt,
       })),
       ...(record ? { applied: record.applied, overlay: record.overlay } : {}),
+      ...(run.runResult ? { outcome: run.runResult.kind } : {}),
       ...(steps.isDone ? {} : { truncated: true }),
     };
-  });
+    exported.push(redact ? await redactHistory(history, redact) : history);
+  }
   const json = `${JSON.stringify(exported, null, 2)}\n`;
   if (values.out) {
     writeFileSync(values.out, json);
@@ -159,10 +185,11 @@ function histories(argv: string[]): number {
   } else {
     process.stdout.write(json);
   }
+  console.error(redact ? `Scrubbed with ${values.redact}. Check the export before you commit it.` : WARNING);
   return 0;
 }
 
-function main(argv: string[]): number {
+async function main(argv: string[]): Promise<number> {
   const [command, ...rest] = argv;
   if (command === undefined || command === '--help' || command === '-h') {
     console.log(USAGE);
@@ -170,7 +197,7 @@ function main(argv: string[]): number {
   }
   try {
     if (command !== 'histories') throw new UsageError(`Unknown command "${command}".`);
-    return histories(rest);
+    return await histories(rest);
   } catch (error) {
     console.error(error instanceof Error ? error.message : String(error));
     if (error instanceof UsageError || (error as { code?: string }).code?.startsWith('ERR_PARSE_ARGS')) console.error(`\n${USAGE}`);
@@ -178,4 +205,4 @@ function main(argv: string[]): number {
   }
 }
 
-process.exitCode = main(process.argv.slice(2));
+process.exitCode = await main(process.argv.slice(2));

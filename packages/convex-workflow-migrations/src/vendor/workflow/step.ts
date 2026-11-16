@@ -73,6 +73,7 @@ type Recorded = {
   step: Pick<Step, "name" | "kind" | "args" | "inProgress" | "runResult">;
   argsKnown?: boolean;
   position?: number;
+  standIn?: boolean;
 };
 
 export class StepExecutor {
@@ -80,6 +81,8 @@ export class StepExecutor {
   // PATCHES: replay matches calls against the run's history, the journal
   // with its migrations' edits, instead of the raw journal.
   private journalEntries: ReplayEntry[];
+  // PATCHES: whether this handler run started a step past the history.
+  private started = false;
 
   constructor(
     private workflowId: string,
@@ -128,6 +131,8 @@ export class StepExecutor {
         const message = await this.receiver.get();
         messages.push(message);
       }
+      // PATCHES:
+      this.started = true;
       const entries = await this.startSteps(messages);
       if (entries.every((entry) => entry.step.runResult)) {
         for (let i = 0; i < entries.length; i++) {
@@ -153,6 +158,18 @@ export class StepExecutor {
       // started executing.
       now: this.journalEntries[this.receiver.bufferSize].step.startedAt,
       latest: false,
+    };
+  }
+
+  // PATCHES: how far replay got, for a handler that threw or returned: the
+  // first history step it hasn't called (calls the executor hasn't taken yet
+  // count as called), and whether it started, or is about to start, a step
+  // past the history.
+  progress(): { next?: ReplayEntry; started: boolean } {
+    const queued = this.receiver.bufferSize;
+    return {
+      next: this.journalEntries[queued],
+      started: this.started || queued > this.journalEntries.length,
     };
   }
 
@@ -192,7 +209,12 @@ export class StepExecutor {
     const messageJson = JSON.stringify(convexToJson(messageFields));
     if (stepJson !== messageJson) {
       if (entry.position !== undefined) {
-        throw new ReplayMismatch(entry.position, messageJson, stepJson);
+        throw new ReplayMismatch(
+          entry.position,
+          messageJson,
+          stepJson,
+          entry.standIn,
+        );
       }
       throw new Error(
         `Journal entry mismatch:\n\n${stepJson}\n\n!==\n\n${messageJson}`,

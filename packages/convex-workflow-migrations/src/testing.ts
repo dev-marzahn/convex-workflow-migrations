@@ -9,9 +9,11 @@
 // sources for the app), and both must see the same requests.
 import type { WorkpoolOptions } from '@convex-dev/workpool';
 import { BaseChannel } from 'async-channel';
+import { validate } from 'convex-helpers/validators';
 import type { GenericDataModel, GenericMutationCtx } from 'convex/server';
+import { asObjectValidator, type PropertyValidators, type Validator } from 'convex/values';
 
-import { type HistoryView, type RecordedHistory, ReplayMismatch } from './history.ts';
+import { type HistoryView, type PauseReason, type RecordedHistory, ReplayPause, returnedEarly, threwEarly } from './history.ts';
 import { prepareHistory, type WorkflowMigrations } from './migrations.ts';
 import { setupEnvironment } from './vendor/workflow/environment.ts';
 import type { WorkflowId } from './vendor/workflow/publicTypes.ts';
@@ -22,10 +24,11 @@ import { createWorkflowCtx } from './vendor/workflow/workflowContext.ts';
 /** How replaying a history against the current handler went. */
 export type ReplayOutcome =
   | { ok: true; history: HistoryView }
-  | { ok: false; reason: 'mismatch' | 'migration' | 'migrations' | 'threw'; detail: string; position?: number; history: HistoryView };
+  | { ok: false; reason: PauseReason | 'truncated'; detail: string; position?: number; history: HistoryView };
 
 type Request = { history: RecordedHistory; replay: boolean; outcome?: ReplayOutcome };
 type Handler = (step: ReturnType<typeof createWorkflowCtx>, args: any) => Promise<unknown>;
+type Registered = { args?: PropertyValidators | Validator<any, 'required', any> | null; handler: Handler };
 
 const PREFIX = 'convex-workflow-migrations-replay:';
 const key = Symbol.for('@dev-marzahn/convex-workflow-migrations/replay');
@@ -53,17 +56,12 @@ export function openReplay(history: RecordedHistory, replay: boolean): { workflo
 export function replayRequest(
   workflowId: string,
 ):
-  | ((
-      ctx: GenericMutationCtx<GenericDataModel>,
-      migrations: WorkflowMigrations,
-      registered: { handler: Handler },
-      workpoolOptions?: WorkpoolOptions,
-    ) => Promise<void>)
+  | ((ctx: GenericMutationCtx<GenericDataModel>, migrations: WorkflowMigrations, registered: Registered, workpoolOptions?: WorkpoolOptions) => Promise<void>)
   | undefined {
   const request = workflowId.startsWith(PREFIX) ? state.requests.get(workflowId) : undefined;
   if (!request) return undefined;
   return async (ctx, migrations, registered, workpoolOptions) => {
-    request.outcome = await replay(ctx, migrations, registered.handler, request, workpoolOptions);
+    request.outcome = await replay(ctx, migrations, registered, request, workpoolOptions);
   };
 }
 
@@ -76,18 +74,37 @@ class ReplayOnly extends StepExecutor {
   }
 }
 
+/**
+ * Replays the history as the workflow mutation would, by the same rules for
+ * mismatches, throws, early returns and args. The differences: the args are
+ * checked without the database, so ids are checked only as strings; a throw
+ * that would fail the run passes unless the history says the run succeeded;
+ * and for a run that failed, only a throw before its last recorded step
+ * fails, since its own failure came after it.
+ */
 async function replay(
   ctx: GenericMutationCtx<GenericDataModel>,
   migrations: WorkflowMigrations,
-  handler: Handler,
+  registered: Registered,
   request: Request,
   workpoolOptions?: WorkpoolOptions,
 ): Promise<ReplayOutcome> {
   const { history: recorded } = request;
-  const prepared = prepareHistory(recorded.steps, { applied: recorded.applied ?? [], overlay: recorded.overlay ?? [] }, migrations.list);
+  const prepared = prepareHistory(recorded.steps, { applied: recorded.applied ?? [], overlay: recorded.overlay ?? [] }, migrations.list, recorded.args ?? {});
   const { history } = prepared;
-  if (prepared.blocked) return { ok: false, ...prepared.blocked, history };
+  const failed = (pause: ReplayPause): ReplayOutcome => ({
+    ok: false,
+    reason: pause.reason,
+    detail: pause.detail,
+    ...(pause.position === undefined ? {} : { position: pause.position }),
+    history,
+  });
+  if (prepared.blocked) return failed(prepared.blocked);
   if (!request.replay) return { ok: true, history };
+  if (recorded.truncated) {
+    const detail = `The history is truncated: the export stopped at ${recorded.steps.length} steps, so the rest of the run can't be checked. Export it with a larger --max-steps.`;
+    return { ok: false, reason: 'truncated', detail, history };
+  }
 
   const workflowId = (recorded.workflowId ?? 'history') as WorkflowId;
   const channel = new BaseChannel<StepRequest>(workpoolOptions?.maxParallelism ?? 10);
@@ -98,21 +115,36 @@ async function replay(
   const executor = new ReplayOnly(workflowId, 0, ctx, component, [], channel, now, workpoolOptions, history);
   const restoreEnvironment = setupEnvironment(executor.getGenerationState.bind(executor), workflowId);
   try {
-    // The handler's error, if it throws; replay that matched to its end otherwise.
+    // The handler's error, if it throws and the run would fail; replay that matched to its end otherwise.
     const handlerWorker = async (): Promise<{ threw?: string }> => {
+      let validated = false;
       try {
-        await handler(step, recorded.args ?? {});
+        if (registered.args) validate(asObjectValidator(registered.args), history.workflowArgs, { throw: true });
+        validated = true;
+        await registered.handler(step, history.workflowArgs);
+        const early = returnedEarly(history, executor.progress());
+        if (early) throw early;
         return {};
       } catch (error) {
+        const pause = threwEarly(history, executor.progress(), error, {
+          validated,
+          hasHistory: recorded.steps.length > 0,
+          editedNow: prepared.ran.filter((m) => m.edits > 0).map((m) => m.id),
+          // The run failed: a throw after its recorded steps is the one it failed with.
+          recordedOnly: recorded.outcome === 'failed' || recorded.outcome === 'canceled',
+        });
+        if (pause) throw pause;
         return { threw: error instanceof Error ? error.message : JSON.stringify(error) };
       }
     };
     const result = await Promise.race([handlerWorker(), executor.run()]);
-    if ('threw' in result && result.threw !== undefined) return { ok: false, reason: 'threw', detail: `The handler threw: ${result.threw}`, history };
+    if ('threw' in result && result.threw !== undefined && recorded.outcome === 'success') {
+      return failed(new ReplayPause('threw', `The run succeeded, but the handler now throws after replaying its history: ${result.threw}`));
+    }
     return { ok: true, history };
   } catch (error) {
     if (error instanceof Frontier) return { ok: true, history };
-    if (error instanceof ReplayMismatch) return { ok: false, reason: 'mismatch', detail: error.message, position: error.position, history };
+    if (error instanceof ReplayPause) return failed(error);
     throw error;
   } finally {
     restoreEnvironment();

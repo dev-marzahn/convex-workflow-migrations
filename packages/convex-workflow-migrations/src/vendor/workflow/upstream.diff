@@ -28,7 +28,7 @@
  
  export type WorkerResult =
    | { type: "handlerDone"; runResult: RunResult }
-@@ -58,18 +66,32 @@
+@@ -58,18 +66,35 @@
    resolve: (result: RunResult) => void;
  };
  
@@ -39,6 +39,7 @@
 +  step: Pick<Step, "name" | "kind" | "args" | "inProgress" | "runResult">;
 +  argsKnown?: boolean;
 +  position?: number;
++  standIn?: boolean;
 +};
 +
  export class StepExecutor {
@@ -46,6 +47,8 @@
 +  // PATCHES: replay matches calls against the run's history, the journal
 +  // with its migrations' edits, instead of the raw journal.
 +  private journalEntries: ReplayEntry[];
++  // PATCHES: whether this handler run started a step past the history.
++  private started = false;
  
    constructor(
      private workflowId: string,
@@ -62,7 +65,7 @@
    ) {
      this.journalEntrySize = journalEntries.reduce(
        (size, entry) => size + getConvexSize(entry),
-@@ -80,6 +102,8 @@
+@@ -80,6 +105,8 @@
        // This should never happen, but we'll throw an error just in case.
        throw new Error(journalSizeError(this.journalEntrySize, this.workflowId));
      }
@@ -71,7 +74,7 @@
    }
    async run(): Promise<WorkerResult> {
      while (true) {
-@@ -87,6 +111,13 @@
+@@ -87,6 +114,13 @@
        // In the future we can correlate the calls to entries by handle, args,
        // etc. instead of just ordering. As is, the fn order can't change.
        const entry = this.journalEntries.shift();
@@ -85,11 +88,32 @@
        if (entry) {
          this.completeMessage(message, entry);
          continue;
-@@ -125,36 +156,48 @@
+@@ -97,6 +131,8 @@
+         const message = await this.receiver.get();
+         messages.push(message);
+       }
++      // PATCHES:
++      this.started = true;
+       const entries = await this.startSteps(messages);
+       if (entries.every((entry) => entry.step.runResult)) {
+         for (let i = 0; i < entries.length; i++) {
+@@ -125,36 +161,65 @@
      };
    }
  
 -  completeMessage(message: StepRequest, entry: JournalEntry) {
++  // PATCHES: how far replay got, for a handler that threw or returned: the
++  // first history step it hasn't called (calls the executor hasn't taken yet
++  // count as called), and whether it started, or is about to start, a step
++  // past the history.
++  progress(): { next?: ReplayEntry; started: boolean } {
++    const queued = this.receiver.bufferSize;
++    return {
++      next: this.journalEntries[queued],
++      started: this.started || queued > this.journalEntries.length,
++    };
++  }
++
 +  // PATCHES: takes a step of the history, and the comparison is in checkMessage.
 +  completeMessage(message: StepRequest, entry: Recorded) {
      if (entry.step.inProgress) {
@@ -129,7 +153,12 @@
      const messageJson = JSON.stringify(convexToJson(messageFields));
      if (stepJson !== messageJson) {
 +      if (entry.position !== undefined) {
-+        throw new ReplayMismatch(entry.position, messageJson, stepJson);
++        throw new ReplayMismatch(
++          entry.position,
++          messageJson,
++          stepJson,
++          entry.standIn,
++        );
 +      }
        throw new Error(
          `Journal entry mismatch:\n\n${stepJson}\n\n!==\n\n${messageJson}`,
@@ -235,7 +264,7 @@
    type WorkflowMutationResult,
  } from "./types.js";
  import { createWorkflowCtx } from "./workflowContext.js";
-+import { ReplayMismatch } from "../../history.js";
++import { ReplayPause } from "../../history.js";
 +import { RunRecord, type WorkflowMigrations } from "../../migrations.js";
 +import { replayRequest } from "../../testing.js";
  
@@ -267,11 +296,10 @@
        let workflowId: WorkflowId, generationNumber: number;
  
        // Direct call { args: {...}, onComplete?, context?, startAsync? }
-@@ -223,6 +241,19 @@
-           !journalEntry.step.inProgress,
+@@ -224,6 +242,20 @@
            `Assertion failed: not blocked but have in-progress journal entry`,
          );
-+      }
+       }
 +      // PATCHES: load the run's record and apply its pending migrations, in
 +      // memory. A run they can't be applied to pauses, and returns normally
 +      // so the workpool doesn't fail it.
@@ -280,14 +308,16 @@
 +        migrations,
 +        workflowId,
 +        journalEntries as JournalEntry[],
++        workflow.args,
 +      );
 +      if (run.blocked) {
 +        await run.pause(ctx, generationNumber, run.blocked, console);
 +        return workflowId;
-       }
++      }
        const channel = new BaseChannel<StepRequest>(
          workpoolOptions.maxParallelism ?? 10,
-@@ -237,11 +268,15 @@
+       );
+@@ -237,23 +269,33 @@
          channel,
          Date.now(),
          workpoolOptions,
@@ -299,11 +329,42 @@
          workflowId,
        );
 +      // PATCHES:
-+      let mismatch: ReplayMismatch | undefined;
++      let paused: ReplayPause | undefined;
        try {
          const handlerWorker = async (): Promise<WorkerResult> => {
            let runResult: RunResult;
-@@ -285,7 +320,19 @@
++          // PATCHES:
++          let validated = false;
+           try {
++            // PATCHES: the args as the migrations left them.
+             if (registered.args) {
+-              validate(asObjectValidator(registered.args), workflow.args, {
++              validate(asObjectValidator(registered.args), run.args, {
+                 throw: true,
+                 db: ctx.db,
+               });
+             }
++            validated = true;
+             const returnValue =
+-              (await registered.handler(step, workflow.args)) ?? null;
++              (await registered.handler(step, run.args)) ?? null;
++            // PATCHES: returning before the end of the history pauses the run.
++            run.returned(executor.progress());
+             runResult = { kind: "success", returnValue };
+             if (registered.returns) {
+               try {
+@@ -276,6 +318,10 @@
+               }
+             }
+           } catch (error) {
++            // PATCHES: rethrows to pause the run instead of failing it: on
++            // invalid args of a run with history, or a throw before the
++            // handler replayed its history (see threwEarly in history.ts).
++            run.threw(error, validated, executor.progress());
+             const message = formatErrorWithStack(error);
+             console.error(message);
+             runResult = { kind: "failed", error: message };
+@@ -285,7 +331,19 @@
          const executorWorker = async (): Promise<WorkerResult> => {
            return await executor.run();
          };
@@ -315,8 +376,8 @@
 +        try {
 +          result = await Promise.race([handlerWorker(), executorWorker()]);
 +        } catch (error) {
-+          if (!(error instanceof ReplayMismatch)) throw error;
-+          mismatch = error;
++          if (!(error instanceof ReplayPause)) throw error;
++          paused = error;
 +          return workflowId;
 +        }
 +        // PATCHES: save what this handler run applied, in its transaction.
@@ -324,14 +385,14 @@
          switch (result.type) {
            case "handlerDone": {
              await ctx.runMutation(component.workflow.complete, {
-@@ -305,6 +352,11 @@
+@@ -305,6 +363,11 @@
          }
        } finally {
          restoreEnvironment();
 +        // PATCHES: outside the replay's deterministic Date and console. The
 +        // environment can only be restored once.
-+        if (mismatch) {
-+          await run.pause(ctx, generationNumber, mismatch, console);
++        if (paused) {
++          await run.pause(ctx, generationNumber, paused, console);
 +        }
        }
        return workflowId;

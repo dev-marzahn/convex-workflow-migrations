@@ -2,8 +2,9 @@
 import { anyApi } from 'convex/server';
 import { expect, test } from 'vite-plus/test';
 
-import { HistoryView, type RecordedStep } from '../src/history.ts';
-import { recordedStep } from '../src/migrations.ts';
+import { HistoryView, type RecordedStep, ReplayMismatch, ReplayPause, returnedEarly, threwEarly } from '../src/history.ts';
+import { migration, OVERLAY_LIMIT, prepareHistory, recordedStep } from '../src/migrations.ts';
+import { redactHistory } from '../src/redact.ts';
 import type { JournalEntry } from '../src/vendor/workflow/types.ts';
 
 const fn = anyApi.flows!;
@@ -159,13 +160,166 @@ test('operations on steps a restart deleted are dropped', () => {
   expect(restarted.overlay().map((op) => op.op)).toEqual(['insert']);
 });
 
-test('truncate removes every step from a position on', () => {
+test('truncate removes every step from a position on, in one operation that spares steps recorded later', () => {
   const h = new HistoryView(journal());
   h.insertAfter({ event: 'downloadDone' }, fn.check, { result: null });
   h.truncate(1);
   expect(names(h)).toEqual(['grab']);
+  expect(h.overlay().slice(1)).toEqual([
+    { op: 'truncate', from: 'j1', through: 'j2' },
+    { op: 'remove', target: '+1' },
+  ]);
+  // The steps that run again are appended to the journal, and stay.
+  const later = new HistoryView([...journal(), done('j3', 'notify'), event('j4', 'downloadDone')], h.overlay());
+  expect(names(later)).toEqual(['grab', 'notify', 'downloadDone']);
   const running = new HistoryView([done('j0', 'grab'), event('j1', 'downloadDone', true)]);
   expect(() => running.truncate(0)).toThrow("Can't restart from step 0: downloadDone (j1) is still running.");
+});
+
+test('updateResult changes what replay gives a call, for a recorded step or a stand-in', () => {
+  const h = new HistoryView(journal());
+  h.updateResult(fn.grab, (result) => ({ was: result }));
+  h.insertAfter(fn.grab, fn.notify, { result: null });
+  h.updateResult(fn.notify, () => ({ at: null }));
+  expect(h.result(fn.grab)).toEqual({ was: 'grabbed' });
+  expect(h.result(fn.notify)).toEqual({ at: null });
+  const replay = new HistoryView(journal(), h.overlay()).replay(0);
+  expect(replay[0]!.step.runResult).toEqual({ kind: 'success', returnValue: { was: 'grabbed' } });
+  expect(replay[1]!.step.runResult).toEqual({ kind: 'success', returnValue: { at: null } });
+  expect(h.fromMigration(0)).toBe(true);
+  expect(h.fromMigration(2)).toBe(false);
+
+  const failed = new HistoryView([{ ...done('j0', 'grab'), runResult: { kind: 'failed', error: 'no' } }]);
+  expect(() => failed.updateResult(fn.grab, () => 1)).toThrow("updateResult(flows:grab): the step didn't succeed");
+  const running = new HistoryView([event('j0', 'downloadDone', true)]);
+  expect(() => running.updateResult({ event: 'downloadDone' }, () => 1)).toThrow('still running');
+  expect(() => h.updateResult(fn.grab, () => undefined)).toThrow('the update must return the new result');
+});
+
+test('updateWorkflowArgs gives replay new workflow args, and keeps one operation', () => {
+  const h = new HistoryView(journal(), [], { grabId: 'g' });
+  expect(h.workflowArgs).toEqual({ grabId: 'g' });
+  h.updateWorkflowArgs((args) => ({ ...args, quality: 'sd' }));
+  h.updateWorkflowArgs((args) => ({ ...args, quality: 'hd' }));
+  expect(h.workflowArgs).toEqual({ grabId: 'g', quality: 'hd' });
+  expect(h.overlay()).toEqual([{ op: 'workflowArgs', args: { grabId: 'g', quality: 'hd' } }]);
+  expect(new HistoryView(journal(), h.overlay(), { grabId: 'g' }).workflowArgs).toEqual({ grabId: 'g', quality: 'hd' });
+  expect(() => h.updateWorkflowArgs(() => undefined)).toThrow('updateWorkflowArgs: the update must return the new args.');
+});
+
+test('cut gives the journal entry a restart deletes from, and an overlay for the steps before it', () => {
+  const h = new HistoryView(journal(), [], { grabId: 'g' });
+  h.updateWorkflowArgs(() => ({ grabId: 'g', quality: 'hd' }));
+  h.insertBefore({ event: 'downloadDone' }, fn.notify, { result: { at: null } }); // anchored to the wait
+  h.rename(fn.grab, fn.fetch);
+  h.insertAfter({ event: 'downloadDone' }, fn.check, { result: 1, args: { x: 1 } });
+
+  // From the wait: it and import are deleted, so notify is anchored again, after fetch.
+  const cut = h.cut(2);
+  expect(cut.from).toBe('j1');
+  const kept = new HistoryView(journal().slice(0, 1), cut.overlay, { grabId: 'g' });
+  expect(names(kept)).toEqual(['fetch', 'notify']);
+  expect(kept.result(fn.notify)).toEqual({ at: null });
+  expect(kept.workflowArgs).toEqual({ grabId: 'g', quality: 'hd' });
+
+  // From the stand-in after the wait: import is deleted, and the stand-in goes.
+  const late = h.cut(3);
+  expect(late.from).toBe('j2');
+  expect(names(new HistoryView(journal().slice(0, 2), late.overlay))).toEqual(['fetch', 'notify', 'downloadDone']);
+
+  // Past the end: nothing is deleted, and the overlay gives the same history.
+  const all = h.cut(h.length);
+  expect(all.from).toBeUndefined();
+  expect(names(new HistoryView(journal(), all.overlay))).toEqual(names(h));
+});
+
+test('cut keeps journal entries the history hides hidden, as ranges', () => {
+  const steps = [done('j0', 'grab'), done('j1', 'a'), done('j2', 'b'), done('j3', 'c'), done('j4', 'd'), done('j5', 'e')];
+  const h = new HistoryView(steps);
+  h.truncate(1); // hides j1..j5
+  const later = new HistoryView([...steps, done('j6', 'f'), done('j7', 'g')], h.overlay());
+  expect(names(later)).toEqual(['grab', 'f', 'g']);
+  later.remove(later.steps[1]!);
+  const cut = later.cut(1); // from g
+  expect(cut.from).toBe('j7');
+  expect(cut.overlay).toEqual([{ op: 'truncate', from: 'j1', through: 'j6' }]);
+  expect(names(new HistoryView([...steps, done('j6', 'f')], cut.overlay))).toEqual(['grab']);
+});
+
+test('cut throws when every step before the position is a stand-in', () => {
+  const h = new HistoryView(journal());
+  h.insertBefore(fn.grab, fn.first, { result: null });
+  expect(h.cut(0)).toEqual({ from: 'j0', overlay: [] });
+  expect(() => h.cut(1)).toThrow("Can't restart from step 1: every step before it was inserted by a migration.");
+});
+
+test('lastPosition finds the last step by name or reference', () => {
+  const h = new HistoryView([done('j0', 'grab'), event('j1', 'downloadDone'), done('j2', 'grab')]);
+  expect(h.lastPosition(fn.grab)).toBe(2);
+  expect(h.lastPosition('downloadDone')).toBe(1);
+  expect(h.lastPosition({ event: 'downloadDone' })).toBe(1);
+  expect(h.lastPosition('missing')).toBe(-1);
+});
+
+test('migrateAs counts each migration’s edits, and size attributes the overlay to them', () => {
+  const h = new HistoryView(journal());
+  expect(h.migrateAs('small', () => h.insertAfter(fn.grab, fn.notify, { result: null }))).toBe(1);
+  expect(h.migrateAs('none', () => h.remove(fn.missing))).toBe(0);
+  expect(h.migrateAs('big', () => h.updateArgs(fn.importFiles, () => ({ blob: 'x'.repeat(1000) })))).toBe(1);
+  expect([...h.editsBy()]).toEqual([
+    ['small', 1],
+    ['none', 0],
+    ['big', 1],
+  ]);
+  const { bytes, largest } = h.size();
+  expect(largest?.id).toBe('big');
+  expect(largest!.bytes).toBeGreaterThan(1000);
+  expect(bytes).toBeGreaterThan(largest!.bytes);
+});
+
+test('a mismatch on a stand-in inserted as a function and called as a workflow says so', () => {
+  const call = '{"args":{},"kind":"workflow","name":"flows:child"}';
+  const step = '{"args":{},"kind":"function","name":"flows:child"}';
+  expect(new ReplayMismatch(1, call, step, true).message).toContain('It was inserted as a function, and called as a workflow');
+  expect(new ReplayMismatch(1, call, step, false).message).not.toContain('inserted');
+  expect(new ReplayMismatch(1, call, step).reason).toBe('mismatch');
+});
+
+test('returnedEarly: returning before the end of the history is a mismatch', () => {
+  const h = new HistoryView(journal());
+  expect(returnedEarly(h, { started: false })).toBeUndefined();
+  expect(returnedEarly(h, { next: { position: 1 }, started: false })?.detail).toBe(
+    'Journal entry mismatch at step 1: the code returned before it, the history has {"args":{},"kind":"event","name":"downloadDone"}',
+  );
+});
+
+test('threwEarly: which throws pause the run and which fail it', () => {
+  const ctx = { validated: true, hasHistory: true, editedNow: [] as string[] };
+  const error = new Error('boom');
+  const h = new HistoryView(journal());
+  // Before a recorded step: pause.
+  expect(threwEarly(h, { next: { position: 1 }, started: false }, error, ctx)).toMatchObject({ reason: 'threw', position: 1 });
+  // After the last recorded step: a real failure.
+  expect(threwEarly(h, { started: false }, error, ctx)).toBeUndefined();
+  // After it, but this handler run's migrations edited the history: pause.
+  expect(threwEarly(h, { started: false }, error, { ...ctx, editedNow: ['m'] })?.detail).toBe(
+    'The handler threw after migrations "m" changed its history: boom',
+  );
+  // After a step past the history started: fail, since that step is committed.
+  expect(threwEarly(h, { next: { position: 1 }, started: true }, error, ctx)).toBeUndefined();
+  // Right after a stand-in, with only stand-ins left: pause; before them, after a recorded step: fail.
+  const standIns = new HistoryView([done('j0', 'grab')]);
+  standIns.insertAfter(fn.grab, fn.notify, { result: null });
+  expect(threwEarly(standIns, { started: false }, error, ctx)).toMatchObject({ reason: 'threw', position: 1 });
+  expect(threwEarly(standIns, { next: { position: 1 }, started: false }, error, ctx)).toBeUndefined();
+  // For a run that failed, only a recorded step left counts.
+  expect(threwEarly(standIns, { started: false }, error, { ...ctx, recordedOnly: true, editedNow: ['m'] })).toBeUndefined();
+  // Args that don't validate: pause a run with history, fail a new one.
+  expect(threwEarly(h, { next: { position: 0 }, started: false }, error, { ...ctx, validated: false })).toMatchObject({ reason: 'args' });
+  expect(threwEarly(new HistoryView([]), { started: false }, error, { ...ctx, validated: false, hasHistory: false })).toBeUndefined();
+  // A pause passes through.
+  const pause = new ReplayPause('mismatch', 'x');
+  expect(threwEarly(h, { started: false }, pause, ctx)).toBe(pause);
 });
 
 test('journal entries from old upstream versions without a kind count as functions', () => {
@@ -178,4 +332,42 @@ test('journal entries from old upstream versions without a kind count as functio
     runResult: { kind: 'success', returnValue: null },
     startedAt: 5,
   });
+});
+
+test('prepareHistory refuses a record from a newer format, and an overlay over the limit', () => {
+  const stored = { applied: [], overlay: [] };
+  const newer = prepareHistory(journal(), { ...stored, format: 2 }, [], {});
+  expect(newer.blocked).toMatchObject({ reason: 'migrations' });
+  expect(newer.blocked?.detail).toContain('format 2, from a newer version');
+  expect(prepareHistory(journal(), { ...stored, format: 1 }, [], {}).blocked).toBeUndefined();
+
+  const huge = migration('huge', (h) => h.insertAfter(fn.grab, fn.notify, { result: 'x'.repeat(OVERLAY_LIMIT) }));
+  const small = migration('small', (h) => h.insertAfter(fn.grab, fn.log, { result: null }));
+  const prepared = prepareHistory(journal(), stored, [small, huge], {});
+  expect(prepared.blocked).toMatchObject({ reason: 'overlay' });
+  expect(prepared.blocked?.detail).toContain('Migration "huge" added the most');
+  expect(prepareHistory(journal(), stored, [small], {}).ran).toEqual([{ id: 'small', edits: 1 }]);
+});
+
+test('redactHistory passes every step and the run args through redact', async () => {
+  const recorded = {
+    workflow: 'flows:pipeline',
+    args: { email: 'a@b.c' },
+    steps: [
+      done('j0', 'grab', { secret: 1 }, { email: 'a@b.c' }),
+      { ...done('j1', 'notify'), runResult: { kind: 'failed' as const, error: 'mail to a@b.c bounced' } },
+      event('j2', 'downloadDone', true),
+    ],
+  };
+  const seen: string[] = [];
+  const scrubbed = await redactHistory(recorded, (value) => {
+    seen.push(`${value.kind} ${value.name}`);
+    return { ...value, args: { email: 'x' }, ...(value.result === undefined ? {} : { result: 'r' }), ...(value.error === undefined ? {} : { error: 'e' }) };
+  });
+  expect(seen).toEqual(['function flows:grab', 'function flows:notify', 'event downloadDone', 'run flows:pipeline']);
+  expect(scrubbed.args).toEqual({ email: 'x' });
+  expect(scrubbed.steps[0]).toMatchObject({ args: { email: 'x' }, runResult: { kind: 'success', returnValue: 'r' } });
+  expect(scrubbed.steps[1]!.runResult).toEqual({ kind: 'failed', error: 'e' });
+  expect(scrubbed.steps[2]).not.toHaveProperty('runResult');
+  expect(recorded.args).toEqual({ email: 'a@b.c' });
 });

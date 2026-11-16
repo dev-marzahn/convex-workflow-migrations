@@ -1,12 +1,26 @@
 // Migrations, and what a handler run does with a run's record: apply the
 // pending migrations in memory, then save the result if replay succeeds or
-// pause the run if it doesn't.
+// pause the run if it doesn't. A pause commits nothing but the pause.
 import { createFunctionHandle, type GenericDataModel, type GenericMutationCtx, makeFunctionReference } from 'convex/server';
 
 import type { ComponentApi } from './component/_generated/component.js';
-import { type History, HistoryView, type OverlayOp, type RecordedStep, type ReplayMismatch, sameOverlay } from './history.ts';
+import { FORMAT } from './component/schema.ts';
+import {
+  type History,
+  HistoryView,
+  type OverlayOp,
+  type PauseReason,
+  type RecordedStep,
+  ReplayPause,
+  type ReplayProgress,
+  returnedEarly,
+  sameOverlay,
+  threwEarly,
+} from './history.ts';
 import type { WorkflowId } from './vendor/workflow/publicTypes.ts';
 import type { JournalEntry } from './vendor/workflow/types.ts';
+
+export type { PauseReason } from './history.ts';
 
 /** The installed migrations component, `components.workflowMigrations`. */
 export type MigrationsComponent = ComponentApi;
@@ -18,7 +32,8 @@ export type Migration = { readonly id: string; readonly migrate: (h: History) =>
  * A migration: `migrate` rewrites a run's history into the shape the current
  * handler expects. `id` is permanent: a run stores the ids applied to it.
  * `migrate` must be synchronous and pure, and work on any history, including
- * one that hasn't reached the steps it edits.
+ * one that hasn't reached the steps it edits. It names steps as they were at
+ * the release that added it.
  */
 export function migration(id: string, migrate: (h: History) => void): Migration {
   if (typeof id !== 'string' || id === '') throw new Error('migration(id, migrate): the id must be a non-empty string.');
@@ -40,8 +55,6 @@ export function checkMigrations(migrations: readonly Migration[] | undefined): r
   return list;
 }
 
-export type PauseReason = 'mismatch' | 'migration' | 'migrations' | 'error';
-
 /** What `onPause` is told about a run that paused. */
 export type PauseInfo = { workflowId: WorkflowId; workflow: string; reason: PauseReason; detail: string };
 
@@ -52,11 +65,21 @@ export type WorkflowMigrations = {
   onPause?: (ctx: GenericMutationCtx<GenericDataModel>, info: PauseInfo) => void | Promise<void>;
 };
 
-type Blocked = { reason: 'migration' | 'migrations'; detail: string };
+/** The largest overlay a run may store, in bytes: half of Convex's 1 MiB document limit, which the row's other fields share. */
+export const OVERLAY_LIMIT = 512 * 1024;
 
-export type Prepared = { history: HistoryView; applied: string[]; blocked?: Blocked };
+export type Prepared = {
+  history: HistoryView;
+  applied: string[];
+  /** The migrations applied now, with how many edits each made. */
+  ran: { id: string; edits: number }[];
+  /** Why the run can't replay: it pauses without replaying. */
+  blocked?: ReplayPause;
+};
 
 const list = (ids: readonly string[]) => (ids.length === 0 ? 'none' : ids.map((id) => `"${id}"`).join(', '));
+const message = (error: unknown) => (error instanceof Error ? error.message : String(error));
+const kib = (bytes: number) => `${Math.ceil(bytes / 1024)} KiB`;
 
 /**
  * Builds the history from the journal and the stored overlay and applies the
@@ -65,34 +88,38 @@ const list = (ids: readonly string[]) => (ids.length === 0 ? 'none' : ids.map((i
  */
 export function prepareHistory(
   journal: readonly RecordedStep[],
-  stored: { applied: readonly string[]; overlay: readonly OverlayOp[]; restart?: number },
+  stored: { applied: readonly string[]; overlay: readonly OverlayOp[]; restart?: number; format?: number },
   migrations: readonly Migration[],
+  args: unknown,
 ): Prepared {
-  const history = new HistoryView(journal, stored.overlay);
-  const ids = migrations.map((m) => m.id);
   const applied = [...stored.applied];
+  const ran: Prepared['ran'] = [];
+  if ((stored.format ?? 1) > FORMAT) {
+    // Don't read an overlay this version may not understand.
+    const detail = `The run's record has format ${stored.format}, from a newer version of @dev-marzahn/convex-workflow-migrations; this one reads format ${FORMAT}. Deploy the newer version again.`;
+    return { history: new HistoryView(journal, [], args), applied, ran, blocked: new ReplayPause('migrations', detail) };
+  }
+  const history = new HistoryView(journal, stored.overlay, args);
+  const ids = migrations.map((m) => m.id);
+  const blocked = (pause: ReplayPause): Prepared => ({ history, applied, ran, blocked: pause });
   if (applied.length > ids.length || applied.some((id, i) => ids[i] !== id)) {
-    return {
-      history,
-      applied,
-      blocked: {
-        reason: 'migrations',
-        detail:
-          `The run has migrations ${list(applied)} applied, but this code lists ${list(ids)}. ` +
+    return blocked(
+      new ReplayPause(
+        'migrations',
+        `The run has migrations ${list(applied)} applied, but this code lists ${list(ids)}. ` +
           'Its applied ids must start the list, in order: a migration was removed, renamed or reordered, or this code is older than the code the run ran on.',
-      },
-    };
+      ),
+    );
   }
   for (const m of migrations.slice(applied.length)) {
     try {
-      const returned: unknown = m.migrate(history);
-      if (returned instanceof Promise) throw new Error('it returned a promise; migrations are synchronous');
+      const edits = history.migrateAs(m.id, () => {
+        const returned: unknown = m.migrate(history);
+        if (returned instanceof Promise) throw new Error('it returned a promise; migrations are synchronous');
+      });
+      ran.push({ id: m.id, edits });
     } catch (error) {
-      return {
-        history,
-        applied,
-        blocked: { reason: 'migration', detail: `Migration "${m.id}" threw: ${error instanceof Error ? error.message : String(error)}` },
-      };
+      return blocked(new ReplayPause('migration', `Migration "${m.id}" threw: ${message(error)}`));
     }
     applied.push(m.id);
   }
@@ -100,10 +127,18 @@ export function prepareHistory(
     try {
       history.truncate(stored.restart);
     } catch (error) {
-      return { history, applied, blocked: { reason: 'migration', detail: error instanceof Error ? error.message : String(error) } };
+      return blocked(new ReplayPause('migration', message(error)));
     }
   }
-  return { history, applied };
+  // The stored overlay fit; only what this handler run added can make it too big to save.
+  if (ran.length > 0 || stored.restart !== undefined) {
+    const { bytes, largest } = history.size();
+    if (bytes > OVERLAY_LIMIT) {
+      const cause = largest ? `Migration "${largest.id}" added the most, ${kib(largest.bytes)}.` : 'Most of it was stored before.';
+      return blocked(new ReplayPause('overlay', `The run's overlay would be ${kib(bytes)}, over the ${kib(OVERLAY_LIMIT)} limit. ${cause}`));
+    }
+  }
+  return { history, applied, ran };
 }
 
 export function recordedStep(entry: JournalEntry): RecordedStep {
@@ -130,10 +165,18 @@ export class RunRecord {
     private readonly workflow: string,
     private readonly stored: { applied: readonly string[]; overlay: readonly OverlayOp[]; dirty: boolean },
     private readonly prepared: Prepared,
+    /** Whether the run has journal entries: it isn't new. */
+    private readonly hasHistory: boolean,
   ) {}
 
   /** Loads the run's record and applies pending migrations. Call once per handler run, before replay. */
-  public static async load(ctx: MutationCtx, migrations: WorkflowMigrations, workflowId: WorkflowId, journal: readonly JournalEntry[]): Promise<RunRecord> {
+  public static async load(
+    ctx: MutationCtx,
+    migrations: WorkflowMigrations,
+    workflowId: WorkflowId,
+    journal: readonly JournalEntry[],
+    args: unknown,
+  ): Promise<RunRecord> {
     const workflow = (await ctx.meta.getFunctionMetadata()).name;
     const row = await ctx.runQuery(migrations.component.runs.load, { workflowId });
     // A run without a record is new, or from before the app adopted this
@@ -143,11 +186,12 @@ export class RunRecord {
     const overlay = row?.overlay ?? [];
     const prepared = prepareHistory(
       journal.map(recordedStep),
-      { applied, overlay, ...(row?.restart === undefined ? {} : { restart: row.restart }) },
+      { applied, overlay, ...(row?.restart === undefined ? {} : { restart: row.restart }), ...(row?.format === undefined ? {} : { format: row.format }) },
       migrations.list,
+      args,
     );
-    const dirty = !row || row.workflow !== workflow || row.paused !== undefined || row.restart !== undefined;
-    return new RunRecord(migrations, workflowId, workflow, { applied, overlay, dirty }, prepared);
+    const dirty = !row || row.workflow !== workflow || row.paused !== undefined || row.restart !== undefined || row.format !== FORMAT;
+    return new RunRecord(migrations, workflowId, workflow, { applied, overlay, dirty }, prepared, journal.length > 0);
   }
 
   /** The history to replay against. */
@@ -155,9 +199,30 @@ export class RunRecord {
     return this.prepared.history;
   }
 
-  /** Why the migrations couldn't be applied, if they couldn't: the run pauses without replaying. */
-  public get blocked(): Blocked | undefined {
+  /** The workflow's args, as the migrations left them, for the handler. */
+  public get args(): any {
+    return this.prepared.history.workflowArgs;
+  }
+
+  /** Why the run can't replay, if it can't: it pauses without replaying. */
+  public get blocked(): ReplayPause | undefined {
     return this.prepared.blocked;
+  }
+
+  /** For a handler that returned: throws the pause if it returned before the end of its history. */
+  public returned(progress: ReplayProgress): void {
+    const pause = returnedEarly(this.history, progress);
+    if (pause) throw pause;
+  }
+
+  /**
+   * For a handler that threw, or args that didn't validate: throws the pause
+   * if the run should pause instead of failing. Returns if it should fail.
+   */
+  public threw(error: unknown, validated: boolean, progress: ReplayProgress): void {
+    const editedNow = this.prepared.ran.filter((m) => m.edits > 0).map((m) => m.id);
+    const pause = threwEarly(this.history, progress, error, { validated, hasHistory: this.hasHistory, editedNow });
+    if (pause) throw pause;
   }
 
   /** After a replay that matched: saves the applied ids and overlay, and ends a pause. Writes nothing if nothing changed. */
@@ -172,11 +237,11 @@ export class RunRecord {
   /**
    * Pauses the run: records why, schedules a retry through this workflow
    * mutation's function handle, and calls `onPause` if the run wasn't paused
-   * already. Saves nothing else, so the next attempt migrates again.
+   * already. Saves nothing else, so the next attempt migrates again. Logs a
+   * warning on every attempt that pauses.
    */
-  public async pause(ctx: MutationCtx, generationNumber: number, cause: Blocked | ReplayMismatch, console: Logger): Promise<void> {
-    const pause =
-      'position' in cause ? { reason: 'mismatch' as const, detail: cause.message, step: cause.position } : { reason: cause.reason, detail: cause.detail };
+  public async pause(ctx: MutationCtx, generationNumber: number, cause: ReplayPause, console: Logger): Promise<void> {
+    const pause = { reason: cause.reason, detail: cause.detail, ...(cause.position === undefined ? {} : { step: cause.position }) };
     const handle = await createFunctionHandle(makeFunctionReference<'mutation'>(this.workflow));
     const { first } = await ctx.runMutation(this.migrations.component.runs.pause, {
       workflowId: this.workflowId,
